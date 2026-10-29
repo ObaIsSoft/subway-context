@@ -900,6 +900,38 @@ def detect_self() -> Optional[Dict[str, Any]]:
 # Tools
 # --------------------------------------------------------------------------
 
+def _get_last_entry_preview(chat: Dict[str, Any]) -> str:
+    """Return a 1-2 sentence snippet of the last user prompt and assistant response."""
+    src = chat.get("source")
+    cid = chat.get("id")
+    try:
+        if src == "claude":
+            lp = chat.get("last_prompt") or ""
+            if lp:
+                return f"Last: {one_line(lp, 110)}"
+            data = claude_read(chat["path"], "recent", 1)
+        elif src == "opencode":
+            data = opencode_read(cid)
+        else:
+            data = agy_read(cid)
+
+        ex = to_exchanges(data)
+        if not ex:
+            return chat.get("title") or "(no messages)"
+        last = ex[-1]
+        u = one_line(last.get("user") or "", 65)
+        a = one_line(last.get("assistant")[0] if last.get("assistant") else "", 75)
+        if u and a:
+            return f"User: \"{u}\" -> Agent: \"{a}\""
+        elif u:
+            return f"User: \"{u}\""
+        elif a:
+            return f"Agent: \"{a}\""
+        return chat.get("title") or ""
+    except Exception:
+        return chat.get("title") or ""
+
+
 def t_list_chats(source: str = "all", project: str = "", query: str = "", limit: int = 15,
                  include_subagents: bool = False) -> str:
     chats = all_chats(source, include_subagents)
@@ -919,7 +951,7 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
     if not chats:
         return "No chats found across Antigravity, Claude Code, or OpenCode."
     me = detect_self()
-    lines = ["| line (agent) | station id | alias / open tab | project | last active | title / last prompt |",
+    lines = ["| line (agent) | station id | alias / open tab | project | last active | last exchange / highlight |",
              "|---|---|---|---|---|---|"]
     for c in chats:
         labels = []
@@ -930,11 +962,9 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
         if me and me.get("id") == c["id"]:
             labels.append("(current line)")
         label_str = ", ".join(labels)
-        desc = c.get("title") or ""
-        if c.get("last_prompt"):
-            desc += f" — last: {one_line(c['last_prompt'], 70)}"
+        highlight = _get_last_entry_preview(c)
         lines.append(f"| {c['source']} | `{c['id'][:8]}` | {label_str} | {os.path.basename(c.get('project') or '')} | "
-                     f"{fmt_ts(c.get('updated'))} | {one_line(desc, 140).replace('|', '/')} |")
+                     f"{fmt_ts(c.get('updated'))} | {one_line(highlight, 160).replace('|', '/')} |")
     lines.append("\nTip: Board any chat by ID, prefix, @alias, or search with search_chat.")
     return "\n".join(lines)
 
