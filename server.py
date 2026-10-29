@@ -1019,8 +1019,17 @@ def t_search_chat(quote: str, source: str = "all", project: str = "", limit: int
     return "\n".join(lines)
 
 
-def t_tag_chat(chat_id: str, alias: str) -> str:
-    c = resolve(chat_id)
+def t_tag_chat(alias: str, chat_id: str = "") -> str:
+    """Assign a memorable sticky alias to a chat. If chat_id is omitted, tags the current active session."""
+    target_id = chat_id
+    if not target_id:
+        me = detect_self()
+        if me:
+            target_id = me["id"]
+        else:
+            # Fallback to the newest active chat in the caller's environment
+            target_id = "latest"
+    c = resolve(target_id)
     save_alias(alias, c["id"])
     return f"Station alias '@{alias.lower().lstrip('@')}' now points to {c['source'].upper()} `{c['id'][:8]}` ({c.get('title')})."
 
@@ -1168,11 +1177,12 @@ TOOLS = {
         }},
     }),
     "tag_chat": (t_tag_chat, {
-        "description": "Assign a sticky station alias to a chat (e.g. tag_chat(chat_id='78879399', alias='claude-main')). "
-                       "You can then use '@claude-main' directly without remembering IDs.",
-        "inputSchema": {"type": "object", "required": ["chat_id", "alias"], "properties": {
-            "chat_id": {"type": "string", "description": "Chat ID or prefix."},
+        "description": "Assign a sticky station alias to a chat (e.g. tag_chat(alias='claude-main')). "
+                       "If chat_id is omitted, it automatically tags the current active session. "
+                       "You can then use '@alias' directly without remembering IDs.",
+        "inputSchema": {"type": "object", "required": ["alias"], "properties": {
             "alias": {"type": "string", "description": "Memorable nickname, e.g. 'claude-main' or 'terminal-coder'."},
+            "chat_id": {"type": "string", "description": "Optional Chat ID or prefix. Omit to tag current chat."},
         }},
     }),
     "read_chat": (t_read_chat, {
