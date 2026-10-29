@@ -94,7 +94,24 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
         "args": [server_py]
     }
     _atomic_write_json(config_path, data)
-    return True, f"Connected in {config_path}"
+
+    # Keyboard / slash command listeners (~/.claude/commands/)
+    try:
+        cmds_dir = os.path.expanduser("~/.claude/commands")
+        os.makedirs(cmds_dir, exist_ok=True)
+        with open(os.path.join(cmds_dir, "opencode.md"), "w", encoding="utf-8") as f:
+            f.write("Read the latest decisions and files modified by OpenCode terminal agent via Subway Context:\n"
+                    "Call MCP tool `read_chat(chat_id=\"@opencode\", mode=\"decisions\", since=\"last\")` and summarize the results.\n")
+        with open(os.path.join(cmds_dir, "gemini.md"), "w", encoding="utf-8") as f:
+            f.write("Read the latest decisions and files modified by the Antigravity/Gemini session via Subway Context:\n"
+                    "Call MCP tool `read_chat(chat_id=\"@agy-latest\", mode=\"decisions\", since=\"last\")` and summarize the results.\n")
+        with open(os.path.join(cmds_dir, "subway.md"), "w", encoding="utf-8") as f:
+            f.write("List all active agent stations and highlights across Claude Code, Antigravity, and OpenCode:\n"
+                    "Call MCP tool `list_chats()` and present the active lines.\n")
+    except Exception:
+        pass
+
+    return True, f"Connected in {config_path} & commands synced"
 
 
 def install_antigravity(server_py: str, py_bin: str) -> Tuple[bool, str]:
@@ -106,7 +123,25 @@ def install_antigravity(server_py: str, py_bin: str) -> Tuple[bool, str]:
         "args": [server_py]
     }
     _atomic_write_json(config_path, data)
-    return True, f"Connected in {config_path}"
+
+    # Antigravity visual @ skills (~/.gemini/config/skills/)
+    try:
+        skills_base = os.path.expanduser("~/.gemini/config/skills")
+        for s_name, s_desc, s_call in (
+            ("opencode", "Subway Context connector to OpenCode terminal agent.", 'read_chat(chat_id="@opencode", mode="decisions", since="last")'),
+            ("claude", "Subway Context connector to Claude Code.", 'read_chat(chat_id="@claude-latest", mode="decisions", since="last")'),
+            ("subway", "Subway Context multi-window agent transit system.", "list_chats()"),
+        ):
+            s_dir = os.path.join(skills_base, s_name)
+            os.makedirs(s_dir, exist_ok=True)
+            with open(os.path.join(s_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+                f.write(f"---\nname: {s_name}\ndescription: {s_desc}\n---\n\n"
+                        f"# {s_name.capitalize()} Transit Connector\n\n"
+                        f"When mentioned or invoked with `@{s_name}`, call Subway Context MCP tool `{s_call}`.\n")
+    except Exception:
+        pass
+
+    return True, f"Connected in {config_path} & @ skills synced"
 
 
 def install_opencode(server_py: str, py_bin: str) -> Tuple[bool, str]:
