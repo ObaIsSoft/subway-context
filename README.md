@@ -37,15 +37,48 @@ When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude 
 ### 1. Clone Repository
 ```bash
 git clone https://github.com/ObaIsSoft/subway-context.git ~/Documents/dev/subway-context
+cd ~/Documents/dev/subway-context
 ```
 
-### 2. Register in Claude Code
+### 2. Universal 1-Click Auto-Connect ⚡
+Run the universal installer to automatically detect and register Subway Context across all installed agents (**Claude Code**, **Antigravity**, and **OpenCode**) in one step:
+
+```bash
+python3 install.py
+```
+*(Or simply tell Gemini / Claude: **"Connect Subway Context to my coding agents"**)*
+
+Output:
+```text
+🚇 Subway Context Universal Connector
+
+Server binary: /Users/.../Documents/dev/subway-context/server.py
+Python runner: /usr/bin/python3
+
+  ✓ Claude Code           : Connected in ~/.claude.json
+  ✓ Antigravity (Gemini)  : Connected in ~/.gemini/config/mcp_config.json
+  ✓ OpenCode (Terminal)   : Connected in ~/.config/opencode/opencode.json & stubs synced
+
+✓ Completed. 3 of 3 agent lines connected.
+```
+
+Check connection status at any time:
+```bash
+python3 install.py --status
+```
+
+---
+
+<details>
+<summary><b>Manual Registration (Optional)</b></summary>
+
+#### Claude Code CLI
 ```bash
 claude mcp add --scope user subway-context -- /usr/bin/python3 ~/Documents/dev/subway-context/server.py
 ```
 
-### 3. Register in Antigravity
-Add to your `~/.gemini/config/mcp_config.json`:
+#### Antigravity IDE
+Add to `~/.gemini/config/mcp_config.json`:
 ```json
 {
   "mcpServers": {
@@ -57,12 +90,8 @@ Add to your `~/.gemini/config/mcp_config.json`:
 }
 ```
 
-### 4. Register in OpenCode (CLI / Terminal)
-Run:
-```bash
-opencode2 mcp add --global subway-context -- /usr/bin/python3 ~/Documents/dev/subway-context/server.py
-```
-Or add directly to `~/.config/opencode/opencode.json`:
+#### OpenCode CLI / Terminal
+Add to `~/.config/opencode/opencode.json`:
 ```json
 {
   "mcp": {
@@ -78,11 +107,7 @@ Or add directly to `~/.config/opencode/opencode.json`:
   }
 }
 ```
-Verify with:
-```bash
-opencode2 mcp list
-# ✓ subway-context connected
-```
+</details>
 
 ---
 

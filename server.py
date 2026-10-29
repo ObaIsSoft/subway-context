@@ -1466,7 +1466,20 @@ def main() -> None:
     except Exception:
         pass
     if len(sys.argv) > 1 and sys.argv[1] != "--stdio":
-        name = sys.argv[1]
+        arg = sys.argv[1]
+        if arg in ("--install", "-i", "install"):
+            from install import install_all
+            install_all()
+            return
+        if arg in ("--status", "status"):
+            from install import check_status
+            check_status()
+            return
+        if arg in ("--uninstall", "--remove", "uninstall"):
+            from install import remove_all
+            remove_all()
+            return
+        name = arg
         args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
         print(TOOLS[name][0](**args))
         return
