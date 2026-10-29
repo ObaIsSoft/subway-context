@@ -57,17 +57,31 @@ Add to your `~/.gemini/config/mcp_config.json`:
 }
 ```
 
-### 4. Register in OpenCode
-Add to your `~/.config/opencode/cli.json` or MCP configuration:
+### 4. Register in OpenCode (CLI / Terminal)
+Run:
+```bash
+opencode2 mcp add --global subway-context -- /usr/bin/python3 ~/Documents/dev/subway-context/server.py
+```
+Or add directly to `~/.config/opencode/opencode.json`:
 ```json
 {
-  "mcpServers": {
-    "subway-context": {
-      "command": "/usr/bin/python3",
-      "args": ["/Users/obafemi/Documents/dev/subway-context/server.py"]
+  "mcp": {
+    "servers": {
+      "subway-context": {
+        "type": "local",
+        "command": [
+          "/usr/bin/python3",
+          "/Users/obafemi/Documents/dev/subway-context/server.py"
+        ]
+      }
     }
   }
 }
+```
+Verify with:
+```bash
+opencode2 mcp list
+# ✓ subway-context connected
 ```
 
 ---
