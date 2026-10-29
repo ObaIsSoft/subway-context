@@ -148,8 +148,123 @@ def _save_json(filename: str, data: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def slugify_topic(title: str, max_words: int = 3) -> str:
+    """Extract a clean, readable topic slug from a conversation title."""
+    if not title:
+        return "chat"
+    text = re.sub(r"[^\w\s-]", "", title).strip().lower()
+    words = [w for w in re.split(r"[\s_-]+", text)
+             if w and w not in ("to", "the", "a", "an", "and", "in", "on", "for", "of", "with", "at", "by", "from")]
+    if not words:
+        return "chat"
+    return "-".join(words[:max_words])
+
+
 def load_aliases() -> Dict[str, str]:
     return _load_json("aliases.json")
+
+
+def _sync_opencode_agent_stubs() -> None:
+    """Keep OpenCode's ~/.config/opencode/agents/ in sync with all 4 Subway alias tiers:
+    1. Pinned aliases from aliases.json
+    2. Floating latest stubs (@agy-latest, @claude-latest, @opencode-latest)
+    3. Dynamic workspace heads for active projects (@agy-<proj>, @claude-<proj>)
+    4. Top recent topic slugs (@agy-<topic>)
+    """
+    ag_dir = os.path.expanduser("~/.config/opencode/agents")
+    try:
+        os.makedirs(ag_dir, exist_ok=True)
+    except Exception:
+        return
+
+    aliases = load_aliases()
+    chats: List[Dict[str, Any]] = []
+    try:
+        chats = all_chats(include_subagents=False)
+    except Exception:
+        pass
+
+    desired_stubs: Dict[str, Dict[str, str]] = {}
+
+    # 1. Pinned aliases
+    for alias, cid in aliases.items():
+        clean = alias.strip().lower().lstrip("@")
+        desired_stubs[clean] = {
+            "desc": f"Subway Context pinned transit connector to @{clean}.",
+            "type": "pinned"
+        }
+
+    # 2. Floating latest
+    for a in ("claude-latest", "agy-latest", "opencode-latest"):
+        src_name = "Claude Code" if "claude" in a else ("Antigravity" if "agy" in a else "OpenCode")
+        desired_stubs[a] = {
+            "desc": f"Subway Context transit connector to latest {src_name} session.",
+            "type": "latest"
+        }
+
+    # 3. Dynamic workspace heads
+    projects = set()
+    for c in chats:
+        p = (c.get("project") or "").strip().lower()
+        if p and p != "unknown":
+            projects.add(p)
+    for p in projects:
+        desired_stubs[f"claude-{p}"] = {
+            "desc": f"Subway Context transit connector to latest Claude Code in {p}.",
+            "type": "ws"
+        }
+        desired_stubs[f"agy-{p}"] = {
+            "desc": f"Subway Context transit connector to latest Antigravity chat in {p}.",
+            "type": "ws"
+        }
+
+    # 4. Top recent Antigravity topic slugs
+    agy_chats = [c for c in chats if c.get("source") == "antigravity"]
+    agy_chats.sort(key=lambda c: sort_key_ts(c.get("updated")), reverse=True)
+    for c in agy_chats[:6]:
+        title = c.get("title") or ""
+        slug = slugify_topic(title)
+        if slug and slug != "chat":
+            desired_stubs[f"agy-{slug}"] = {
+                "desc": f"Subway Context transit to @agy-{slug} ({one_line(title, 60)}).",
+                "type": "topic"
+            }
+
+    # Write desired stubs
+    for stub_name, info in desired_stubs.items():
+        fpath = os.path.join(ag_dir, f"{stub_name}.md")
+        content = (
+            f"---\n"
+            f"description: {info['desc']}\n"
+            f"mode: subagent\n"
+            f"---\n"
+            f"<!-- subway-auto-stub -->\n"
+            f"You are the Subway Context transit connector for @{stub_name}.\n"
+            f"When invoked, call MCP tool `read_chat(chat_id=\"@{stub_name}\", mode=\"decisions\", since=\"last\")` "
+            f"to pull the latest context, decisions, and files touched into this session.\n"
+        )
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
+    # Prune outdated subway-auto-stubs (preserve manual stubs and current desired stubs)
+    try:
+        for fname in os.listdir(ag_dir):
+            if fname.endswith(".md"):
+                sname = fname[:-3]
+                if sname not in desired_stubs:
+                    fpath = os.path.join(ag_dir, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            hdr = f.read(500)
+                        if "<!-- subway-auto-stub -->" in hdr:
+                            os.remove(fpath)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 def save_alias(alias: str, target_id: str) -> None:
@@ -157,56 +272,7 @@ def save_alias(alias: str, target_id: str) -> None:
     aliases = load_aliases()
     aliases[clean_alias] = target_id.strip()
     _save_json("aliases.json", aliases)
-    _sync_station_stubs()
-
-
-def _sync_station_stubs() -> None:
-    """Generate virtual station stubs in ~/.subway-context/stations/ and active projects.
-    This allows terminal/IDE file autoselectors (@) in Claude, OpenCode, and Antigravity
-    to immediately show and autocomplete @station aliases."""
-    aliases = load_aliases()
-    st_dir = os.path.join(SUBWAY_DIR, "stations")
-    os.makedirs(st_dir, exist_ok=True)
-
-    # Gather known project directories
-    active_dirs = set()
-    cwd = os.getcwd()
-    if os.path.isdir(cwd):
-        active_dirs.add(cwd)
-
-    # Check opencode project directories
-    try:
-        con = _opencode_db()
-        if con:
-            for row in con.execute("select worktree from project where worktree is not null"):
-                if os.path.isdir(row[0]):
-                    active_dirs.add(row[0])
-            con.close()
-    except Exception:
-        pass
-
-    for alias, cid in aliases.items():
-        fname = f"@{alias}.md"
-        content = (
-            f"# Subway Context Transit Station: @{alias}\n\n"
-            f"- **Target Chat ID**: `{cid}`\n"
-            f"- **Instructions for Agent**: When this file or @mention is referenced, "
-            f"call MCP tool `read_chat(chat_id='@{alias}', mode='decisions', since='last')` "
-            f"to board this chat's context.\n"
-        )
-        # Write to central station registry
-        with open(os.path.join(st_dir, fname), "w", encoding="utf-8") as f:
-            f.write(content)
-
-        # Write to active project .subway/ dirs for instant @ selector discovery
-        for pdir in active_dirs:
-            try:
-                p_subway = os.path.join(pdir, ".subway")
-                os.makedirs(p_subway, exist_ok=True)
-                with open(os.path.join(p_subway, fname), "w", encoding="utf-8") as pf:
-                    pf.write(content)
-            except Exception:
-                continue
+    _sync_opencode_agent_stubs()
 
 
 def _checkpoint_key(c1: str, c2: str) -> str:
@@ -895,23 +961,82 @@ def resolve(ident: str, source: str = "all", project: str = "") -> Dict[str, Any
     ident = (ident or "").strip()
     aliases = load_aliases()
     clean_alias = ident.lower().lstrip("@")
+
+    # 1. Explicit pinned aliases (highest precedence, never drifts)
     if clean_alias in aliases:
-        ident = aliases[clean_alias]
+        target = aliases[clean_alias]
+        chats = all_chats(source, include_subagents=True)
+        for c in chats:
+            if c["id"].lower() == target.lower():
+                return c
+        ident = target
+        clean_alias = ident.lower().lstrip("@")
 
     chats = all_chats(source, include_subagents=True)
     if project:
         chats = [c for c in chats if project.lower() in (c.get("project") or "").lower()]
-    if ident.lower() in ("", "latest", "last", "newest"):
-        if not chats:
-            raise ValueError("no chats found across active agents")
-        return max(chats, key=lambda c: sort_key_ts(c.get("updated")))
+    if not chats:
+        raise ValueError(f"no chats found across active agents (source={source}, project={project})")
 
-    low = ident.lower()
+    # 2. Floating Latest (@latest, @agy-latest, @claude-latest, @opencode-latest)
+    if clean_alias in ("", "latest", "last", "newest"):
+        return max(chats, key=lambda c: sort_key_ts(c.get("updated")))
+    if clean_alias in ("agy-latest", "gemini-latest", "agy", "gemini"):
+        agy_matches = [c for c in chats if c.get("source") == "antigravity"]
+        if agy_matches:
+            return max(agy_matches, key=lambda c: sort_key_ts(c.get("updated")))
+    if clean_alias in ("claude-latest", "claude"):
+        claude_matches = [c for c in chats if c.get("source") == "claude"]
+        if claude_matches:
+            return max(claude_matches, key=lambda c: sort_key_ts(c.get("updated")))
+    if clean_alias in ("opencode-latest", "opencode"):
+        opencode_matches = [c for c in chats if c.get("source") == "opencode"]
+        if opencode_matches:
+            return max(opencode_matches, key=lambda c: sort_key_ts(c.get("updated")))
+
+    # 3. Dynamic Workspace Heads & Topic Slugs (<agent>-<target>)
+    m = re.match(r"^(agy|gemini|claude|opencode)-([a-z0-9_-]+)$", clean_alias)
+    if m:
+        agent_prefix, rest = m.group(1), m.group(2)
+        src = "antigravity" if agent_prefix in ("agy", "gemini") else agent_prefix
+        agent_chats = [c for c in chats if c.get("source") == src]
+        if agent_chats:
+            # 3a. Workspace head match (e.g. @agy-dziner, @claude-portfolio)
+            ws_matches = [c for c in agent_chats if rest in (c.get("project") or "").lower()]
+            if ws_matches:
+                return max(ws_matches, key=lambda c: sort_key_ts(c.get("updated")))
+
+            # 3b. Topic slug search within this agent (e.g. @agy-subway-stations, @agy-gitignore)
+            tokens = [t for t in re.split(r"[\s_-]+", rest) if len(t) >= 2]
+            scored = []
+            for c in agent_chats:
+                title_low = (c.get("title") or "").lower()
+                score = sum(1 for t in tokens if t in title_low)
+                if score > 0:
+                    scored.append((score, sort_key_ts(c.get("updated")), c))
+            if scored:
+                scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                return scored[0][2]
+
+    # 4. Fallback: ID prefix, tab_name, or title match
+    low = clean_alias
     hits = [c for c in chats if c["id"].lower().startswith(low)]
     if not hits:
         hits = [c for c in chats if (c.get("tab_name") or "").lower() == low]
     if not hits:
         hits = [c for c in chats if low in (c.get("title") or "").lower()]
+    if not hits:
+        # Cross-agent topic slug match
+        tokens = [t for t in re.split(r"[\s_-]+", low) if len(t) >= 2]
+        scored = []
+        for c in chats:
+            title_low = (c.get("title") or "").lower()
+            score = sum(1 for t in tokens if t in title_low)
+            if score > 0:
+                scored.append((score, sort_key_ts(c.get("updated")), c))
+        if scored:
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            hits = [scored[0][2]]
     if not hits:
         raise ValueError(f"no chat matches '{ident}'. Use list_chats or search_chat.")
     if len(hits) > 1:
@@ -1010,13 +1135,23 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
             labels.append(c.get("tab_name") or "open")
         if c["id"] in id_to_aliases:
             labels.extend(f"@{a}" for a in id_to_aliases[c["id"]])
+        else:
+            # Show readable auto-alias hint if no explicit pin
+            slug = slugify_topic(c.get("title") or "")
+            prefix = "agy" if c["source"] == "antigravity" else c["source"]
+            if slug and slug != "chat":
+                labels.append(f"(@{prefix}-{slug})")
         if me and me.get("id") == c["id"]:
             labels.append("(current line)")
         label_str = ", ".join(labels)
         highlight = _get_last_entry_preview(c)
         lines.append(f"| {c['source']} | `{c['id'][:8]}` | {label_str} | {os.path.basename(c.get('project') or '')} | "
                      f"{fmt_ts(c.get('updated'))} | {one_line(highlight, 160).replace('|', '/')} |")
-    lines.append("\nTip: Board any chat by ID, prefix, @alias, or search with search_chat.")
+    lines.append("\nTip: Board any chat by ID, prefix, @pinned-alias, dynamic workspace head (e.g. @agy-dziner), or topic slug (e.g. @agy-subway).")
+    try:
+        _sync_opencode_agent_stubs()
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -1326,6 +1461,10 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def main() -> None:
+    try:
+        _sync_opencode_agent_stubs()
+    except Exception:
+        pass
     if len(sys.argv) > 1 and sys.argv[1] != "--stdio":
         name = sys.argv[1]
         args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}

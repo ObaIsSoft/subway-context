@@ -12,8 +12,12 @@
    - When resuming an ongoing loop between two windows, use `since="last"` to read **only the incremental delta**.
    - If looking for a specific topic, use `search_chat(quote=...)` or `anchor_text=...` to start reading exactly from that point.
 3. **No Hex Serial Numbers**:
-   - Use `tag_chat` to assign sticky `@aliases` (e.g. `@claude-main`, `@terminal-coder`).
-   - Refer to chats by alias, open tab name, or search query.
+   - Subway resolves stations through a 4-tier naming hierarchy:
+     1. **Explicit Pins**: `@<alias>` set via `tag_chat` (e.g. `@claude-main`, `@agy-live`).
+     2. **Floating Latest**: `@<agent>-latest` or `@latest` for the most recently active session.
+     3. **Workspace Heads**: `@<agent>-<project>` (e.g. `@agy-dziner`, `@claude-portfolio`).
+     4. **Topic Slugs**: `@<agent>-<topic>` (e.g. `@agy-subway`, `@agy-gitignore`).
+   - Refer to chats by alias, open tab name, or search query. Never require human users to copy hex UUIDs.
 
 ---
 
@@ -73,3 +77,4 @@ check_notes()
 
 `subway-context` is designed to transmit **intent, decisions, and coordinates**. 
 When another agent mentions that it modified a file, **do not ask it to print the full file contents**. Use your own native file-reading tools (`read_file`, `git diff`) to inspect the local disk directly.
+
