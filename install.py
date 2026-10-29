@@ -45,7 +45,7 @@ def _load_json(path: str) -> Dict[str, Any]:
 def get_default_paths() -> Tuple[str, str]:
     server_dir = os.path.dirname(os.path.abspath(__file__))
     server_py = os.path.join(server_dir, "server.py")
-    py_bin = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    py_bin = sys.executable or shutil.which("python3") or "/usr/bin/python3"
     return server_py, py_bin
 
 

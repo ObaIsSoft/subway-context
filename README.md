@@ -97,8 +97,8 @@ Add to `~/.gemini/config/mcp_config.json`:
 {
   "mcpServers": {
     "subway-context": {
-      "command": "/usr/bin/python3",
-      "args": ["/Users/obafemi/Documents/dev/subway-context/server.py"]
+      "command": "python3",
+      "args": ["/path/to/subway-context/server.py"]
     }
   }
 }
@@ -113,8 +113,8 @@ Add to `~/.config/opencode/opencode.json`:
       "subway-context": {
         "type": "local",
         "command": [
-          "/usr/bin/python3",
-          "/Users/obafemi/Documents/dev/subway-context/server.py"
+          "python3",
+          "/path/to/subway-context/server.py"
         ]
       }
     }
