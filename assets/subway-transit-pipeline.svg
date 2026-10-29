@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 480" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="claude-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+    <linearGradient id="gemini-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="open-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="hub-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#38bdf8" flood-opacity="0.2"/>
+    </filter>
+  </defs>
+
+  <rect width="960" height="480" fill="url(#bg)" rx="16"/>
+
+  <!-- Title -->
+  <text x="480" y="44" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="22" font-weight="700" text-anchor="middle">SUBWAY CONTEXT TRANSIT PIPELINE</text>
+  <text x="480" y="70" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="13" text-anchor="middle">On-Demand Bidirectional Multi-Agent Coordination via stdio MCP</text>
+
+  <!-- Left: Agents -->
+  <!-- Claude Code -->
+  <g transform="translate(60, 110)">
+    <rect width="220" height="90" rx="12" fill="#1e293b" stroke="#d97706" stroke-width="2"/>
+    <rect x="14" y="14" width="10" height="62" rx="4" fill="url(#claude-grad)"/>
+    <text x="36" y="38" fill="#f8fafc" font-family="sans-serif" font-size="16" font-weight="700">Claude Code</text>
+    <text x="36" y="58" fill="#cbd5e1" font-family="sans-serif" font-size="12">IDE Tab &amp; CLI Terminal</text>
+    <text x="36" y="74" fill="#d97706" font-family="monospace" font-size="11">~/.claude/projects/*.jsonl</text>
+  </g>
+
+  <!-- Antigravity / Gemini -->
+  <g transform="translate(60, 220)">
+    <rect width="220" height="90" rx="12" fill="#1e293b" stroke="#3b82f6" stroke-width="2"/>
+    <rect x="14" y="14" width="10" height="62" rx="4" fill="url(#gemini-grad)"/>
+    <text x="36" y="38" fill="#f8fafc" font-family="sans-serif" font-size="16" font-weight="700">Antigravity (Gemini)</text>
+    <text x="36" y="58" fill="#cbd5e1" font-family="sans-serif" font-size="12">IDE Sidebar &amp; Multi-Chat</text>
+    <text x="36" y="74" fill="#60a5fa" font-family="monospace" font-size="11">~/.gemini/.../brain/ &amp; db</text>
+  </g>
+
+  <!-- OpenCode -->
+  <g transform="translate(60, 330)">
+    <rect width="220" height="90" rx="12" fill="#1e293b" stroke="#10b981" stroke-width="2"/>
+    <rect x="14" y="14" width="10" height="62" rx="4" fill="url(#open-grad)"/>
+    <text x="36" y="38" fill="#f8fafc" font-family="sans-serif" font-size="16" font-weight="700">OpenCode</text>
+    <text x="36" y="58" fill="#cbd5e1" font-family="sans-serif" font-size="12">Terminal Process (opencode2)</text>
+    <text x="36" y="74" fill="#34d399" font-family="monospace" font-size="11">~/.local/share/opencode/db</text>
+  </g>
+
+  <!-- Transit Lines (Arrows) -->
+  <path d="M 280 155 L 380 230" stroke="#d97706" stroke-width="3" stroke-dasharray="6,4" fill="none"/>
+  <path d="M 280 265 L 380 265" stroke="#3b82f6" stroke-width="3" stroke-dasharray="6,4" fill="none"/>
+  <path d="M 280 375 L 380 300" stroke="#10b981" stroke-width="3" stroke-dasharray="6,4" fill="none"/>
+
+  <!-- Center Hub: Subway Context Server -->
+  <g transform="translate(380, 110)" filter="url(#glow)">
+    <rect width="300" height="310" rx="16" fill="url(#hub-grad)" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="20" y="18" width="260" height="36" rx="8" fill="#0369a1"/>
+    <text x="150" y="42" fill="#ffffff" font-family="sans-serif" font-size="15" font-weight="700" text-anchor="middle">🚇 SUBWAY CONTEXT CORE</text>
+    
+    <!-- Engine Modules -->
+    <g transform="translate(20, 68)">
+      <rect width="260" height="48" rx="8" fill="#0f172a" stroke="#334155"/>
+      <text x="16" y="24" fill="#38bdf8" font-family="sans-serif" font-size="12" font-weight="700">1. Station Resolver</text>
+      <text x="16" y="40" fill="#94a3b8" font-family="monospace" font-size="11">@pinned | @latest | @ws | @topic</text>
+    </g>
+
+    <g transform="translate(20, 126)">
+      <rect width="260" height="48" rx="8" fill="#0f172a" stroke="#334155"/>
+      <text x="16" y="24" fill="#a855f7" font-family="sans-serif" font-size="12" font-weight="700">2. Delta Watermarking</text>
+      <text x="16" y="40" fill="#94a3b8" font-family="monospace" font-size="11">since="last" | since="bridge -N"</text>
+    </g>
+
+    <g transform="translate(20, 184)">
+      <rect width="260" height="48" rx="8" fill="#0f172a" stroke="#334155"/>
+      <text x="16" y="24" fill="#f59e0b" font-family="sans-serif" font-size="12" font-weight="700">3. Decision Extractor</text>
+      <text x="16" y="40" fill="#94a3b8" font-family="monospace" font-size="11">Intent · Rationale · Touch Manifest</text>
+    </g>
+
+    <g transform="translate(20, 242)">
+      <rect width="260" height="48" rx="8" fill="#0f172a" stroke="#334155"/>
+      <text x="16" y="24" fill="#10b981" font-family="sans-serif" font-size="12" font-weight="700">4. Inter-Agent Dispatch</text>
+      <text x="16" y="40" fill="#94a3b8" font-family="monospace" font-size="11">send_note() | check_notes()</text>
+    </g>
+  </g>
+
+  <!-- Right Output: High-Density Context -->
+  <path d="M 680 265 L 740 265" stroke="#38bdf8" stroke-width="3" fill="none"/>
+  <polygon points="740,260 750,265 740,270" fill="#38bdf8"/>
+
+  <g transform="translate(750, 140)">
+    <rect width="160" height="250" rx="12" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+    <text x="80" y="32" fill="#38bdf8" font-family="sans-serif" font-size="13" font-weight="700" text-anchor="middle">TOKEN SAVINGS</text>
+    
+    <text x="80" y="80" fill="#f8fafc" font-family="sans-serif" font-size="34" font-weight="800" text-anchor="middle">-90%</text>
+    <text x="80" y="104" fill="#94a3b8" font-family="sans-serif" font-size="11" text-anchor="middle">Context Window Saved</text>
+
+    <line x1="20" y1="125" x2="140" y2="125" stroke="#334155"/>
+
+    <text x="24" y="150" fill="#10b981" font-family="sans-serif" font-size="11">✓ Zero copy-paste</text>
+    <text x="24" y="174" fill="#10b981" font-family="sans-serif" font-size="11">✓ No UUID lookup</text>
+    <text x="24" y="198" fill="#10b981" font-family="sans-serif" font-size="11">✓ Incremental sync</text>
+    <text x="24" y="222" fill="#10b981" font-family="sans-serif" font-size="11">✓ 100% offline stdio</text>
+  </g>
+</svg>

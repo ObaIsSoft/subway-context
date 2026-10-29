@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <filter id="glow-orange" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#f59e0b" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <rect width="960" height="440" fill="url(#bg)" rx="16"/>
+
+  <text x="480" y="44" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="22" font-weight="700" text-anchor="middle">DECISION EXTRACTION PIPELINE (mode="decisions")</text>
+  <text x="480" y="70" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="13" text-anchor="middle">Distilling Massive Conversation Logs into 90% Dense Actionable Context</text>
+
+  <!-- Left: Raw Dump -->
+  <g transform="translate(60, 110)">
+    <rect width="220" height="280" rx="12" fill="#1e293b" stroke="#ef4444" stroke-width="2"/>
+    <text x="110" y="36" fill="#f87171" font-family="sans-serif" font-size="14" font-weight="700" text-anchor="middle">RAW TRANSCRIPT</text>
+    <text x="110" y="58" fill="#94a3b8" font-family="sans-serif" font-size="11" text-anchor="middle">~20,000 - 50,000 tokens</text>
+    <line x1="20" y1="72" x2="200" y2="72" stroke="#334155"/>
+    
+    <g transform="translate(20, 90)">
+      <text x="0" y="20" fill="#64748b" font-family="monospace" font-size="11">✗ Tool output spam</text>
+      <text x="0" y="44" fill="#64748b" font-family="monospace" font-size="11">✗ Intermediate bugs</text>
+      <text x="0" y="68" fill="#64748b" font-family="monospace" font-size="11">✗ Huge file dumps</text>
+      <text x="0" y="92" fill="#64748b" font-family="monospace" font-size="11">✗ Repetitive chat turns</text>
+      <text x="0" y="116" fill="#64748b" font-family="monospace" font-size="11">✗ Syntax retry loops</text>
+      <text x="0" y="140" fill="#64748b" font-family="monospace" font-size="11">✗ Context window death</text>
+    </g>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M 280 250 L 350 250" stroke="#f59e0b" stroke-width="3" fill="none"/>
+  <polygon points="350,245 360,250 350,255" fill="#f59e0b"/>
+
+  <!-- Center: Subway Filter -->
+  <g transform="translate(360, 110)" filter="url(#glow-orange)">
+    <rect width="260" height="280" rx="14" fill="#1e293b" stroke="#f59e0b" stroke-width="2"/>
+    <rect x="16" y="14" width="228" height="32" rx="6" fill="#b45309"/>
+    <text x="130" y="35" fill="#ffffff" font-family="sans-serif" font-size="13" font-weight="700" text-anchor="middle">SUBWAY FILTER ENGINE</text>
+
+    <!-- 3 Tiers -->
+    <g transform="translate(16, 62)">
+      <rect width="228" height="56" rx="6" fill="#0f172a" stroke="#334155"/>
+      <text x="12" y="22" fill="#38bdf8" font-family="sans-serif" font-size="11" font-weight="700">1. User Intent Extraction</text>
+      <text x="12" y="40" fill="#94a3b8" font-family="sans-serif" font-size="10">Strips prompts down to goals</text>
+    </g>
+
+    <g transform="translate(16, 128)">
+      <rect width="228" height="56" rx="6" fill="#0f172a" stroke="#334155"/>
+      <text x="12" y="22" fill="#a855f7" font-family="sans-serif" font-size="11" font-weight="700">2. Thought Rationale</text>
+      <text x="12" y="40" fill="#94a3b8" font-family="sans-serif" font-size="10">Architectural reasoning &amp; choices</text>
+    </g>
+
+    <g transform="translate(16, 194)">
+      <rect width="228" height="56" rx="6" fill="#0f172a" stroke="#334155"/>
+      <text x="12" y="22" fill="#10b981" font-family="sans-serif" font-size="11" font-weight="700">3. Touch Manifest</text>
+      <text x="12" y="40" fill="#94a3b8" font-family="sans-serif" font-size="10">Exact files touched &amp; commitments</text>
+    </g>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M 620 250 L 690 250" stroke="#10b981" stroke-width="3" fill="none"/>
+  <polygon points="690,245 700,250 690,255" fill="#10b981"/>
+
+  <!-- Right: Dense Transit Packet -->
+  <g transform="translate(700, 110)">
+    <rect width="200" height="280" rx="12" fill="#1e293b" stroke="#10b981" stroke-width="2"/>
+    <text x="100" y="36" fill="#34d399" font-family="sans-serif" font-size="14" font-weight="700" text-anchor="middle">TRANSIT PACKET</text>
+    <text x="100" y="58" fill="#94a3b8" font-family="sans-serif" font-size="11" text-anchor="middle">~800 - 1,500 tokens</text>
+    <line x1="20" y1="72" x2="180" y2="72" stroke="#334155"/>
+
+    <g transform="translate(20, 90)">
+      <text x="0" y="20" fill="#f8fafc" font-family="sans-serif" font-size="11">✓ High signal-to-noise</text>
+      <text x="0" y="44" fill="#f8fafc" font-family="sans-serif" font-size="11">✓ Instant understanding</text>
+      <text x="0" y="68" fill="#f8fafc" font-family="sans-serif" font-size="11">✓ Files touched manifest</text>
+      <text x="0" y="92" fill="#f8fafc" font-family="sans-serif" font-size="11">✓ Architectural reason</text>
+      <text x="0" y="116" fill="#f8fafc" font-family="sans-serif" font-size="11">✓ Zero context blowout</text>
+    </g>
+  </g>
+</svg>

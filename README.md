@@ -27,6 +27,9 @@ When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude 
 
 ## Supported Transit Lines
 
+![Subway Context Transit Pipeline](assets/subway-transit-pipeline.svg)
+*Universal on-demand multi-agent transit connecting Claude Code, Antigravity, and OpenCode via local stdio MCP.*
+
 | Line | Storage Format | Supported Capabilities |
 |---|---|---|
 | **Claude Code** | `~/.claude/projects/*/*.jsonl` | Full transcript, thoughts, active tab detection |
@@ -154,18 +157,16 @@ Now you can simply refer to `@claude-main` in any command.
 
 ## 4-Tier Station Aliasing System 🏷️
 
-![Antigravity Multi-Conversation Sidebar](assets/antigravity-sessions-sidebar.png)
-*Antigravity maintains persistent conversation documents across multiple workspaces (`dziner`, `portfolio`, etc.) with concurrent background tasks and active states (blue indicator dots).*
+![Subway 4-Tier Aliasing Hierarchy](assets/aliasing-hierarchy.svg)
+*Subway Context routes station requests through a 4-tier hierarchy: Explicit Pins -> Floating Heads -> Workspace Terminals -> Topic Slugs.*
 
 ### The Multi-Chat Challenge
 Terminal tools like Claude Code CLI and OpenCode run on a **process lifecycle** (a PID or active terminal socket). When you close the terminal or switch tasks, the process ends.
 
 **Antigravity (Gemini)** operates on an enduring **document library lifecycle**:
-* As shown in the sidebar above, you may have 5+ concurrent threads in the same workspace (`dziner` has *"Access To Previous Chats"*, *"Finding Nearby Subway Stati..."*, *"Checking Gitignore Status"*, etc.).
-* Other project chats run in parallel (notice the blue activity dot on *"Clone GitHub Repository"* in `portfolio`).
-* Switching chats does **not** terminate them; they pause at their last transcript turn in SQLite.
-
-If an alias like `@gemini` simply resolved to `ORDER BY last_modified_time DESC`, clicking over to check a gitignore file for 30 seconds would accidentally hijack Claude Code or OpenCode's context query!
+* An IDE workspace can have multiple concurrent conversation threads open in parallel across different projects.
+* Switching tabs does **not** terminate chats; they pause at their last transcript turn in SQLite.
+* If an alias like `@gemini` simply resolved to `ORDER BY last_modified_time DESC`, clicking over to check another file for 30 seconds would accidentally hijack another agent's context query!
 
 ### The 4-Tier Solution
 
@@ -182,6 +183,10 @@ Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier na
 
 ### `read_chat(chat_id, mode, since, anchor_text, ...)`
 Read context from another agent window with token-saving controls:
+
+![Decision Extraction Pipeline](assets/decision-extraction-pipeline.svg)
+*Subway Context extracts user intent, thought rationale, and touched file manifests, cutting 85–90% of token noise.*
+
 - **`since="last"`**: Only reads the delta since the previous bridge call between these two windows.
 - **`since="bridge -2"`**: Time-travel back 2 syncs ago.
 - **`mode="decisions"`**: Extracts user goals, strategic reasoning, action decisions, and touched files only.
@@ -224,11 +229,8 @@ Natural prompts work best across all agents:
 
 ## Native OpenCode `@` Autocomplete Integration
 
-![OpenCode Autocomplete Menu](assets/opencode-autocomplete.png)
-*Typing `@claude` in a workspace containing Claude test logs or JSON artifacts can flood the autocomplete menu with workspace files. Subway Context generates dedicated `@claude-` and `@agy-` agent stubs to isolate agent transit from file search.*
-
 ### Why Dedicated Agent Stubs Matter
-In OpenCode, the prompt `@` symbol searches **both** workspace files and registered agent definitions. If your project contains files like `data_v1_archive/site-098/claude_rationale_raw.json`, typing `@claude` causes file search matches to push agent stations out of the top results, forcing you to escape the selector.
+In OpenCode, typing `@` in the prompt searches **both** workspace files and registered agent definitions. If your project contains files matching `claude*` (e.g. test reports, scrape logs), typing `@claude` causes repository files to dominate the autocomplete popup.
 
 Subway Context solves this by automatically syncing all 4 tiers of aliases directly into OpenCode's global agent registry (`~/.config/opencode/agents/*.md`):
 - **Hyphen-Prefixed Filtering**: Typing `@claude-` filters out non-hyphenated files (`claude_...`) and displays only agent transit targets (`@claude-main`, `@claude-latest`, `@claude-dziner`, etc.).
