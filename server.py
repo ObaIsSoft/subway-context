@@ -153,9 +153,60 @@ def load_aliases() -> Dict[str, str]:
 
 
 def save_alias(alias: str, target_id: str) -> None:
+    clean_alias = alias.strip().lower().lstrip("@")
     aliases = load_aliases()
-    aliases[alias.strip().lower().lstrip("@")] = target_id.strip()
+    aliases[clean_alias] = target_id.strip()
     _save_json("aliases.json", aliases)
+    _sync_station_stubs()
+
+
+def _sync_station_stubs() -> None:
+    """Generate virtual station stubs in ~/.subway-context/stations/ and active projects.
+    This allows terminal/IDE file autoselectors (@) in Claude, OpenCode, and Antigravity
+    to immediately show and autocomplete @station aliases."""
+    aliases = load_aliases()
+    st_dir = os.path.join(SUBWAY_DIR, "stations")
+    os.makedirs(st_dir, exist_ok=True)
+
+    # Gather known project directories
+    active_dirs = set()
+    cwd = os.getcwd()
+    if os.path.isdir(cwd):
+        active_dirs.add(cwd)
+
+    # Check opencode project directories
+    try:
+        con = _opencode_db()
+        if con:
+            for row in con.execute("select worktree from project where worktree is not null"):
+                if os.path.isdir(row[0]):
+                    active_dirs.add(row[0])
+            con.close()
+    except Exception:
+        pass
+
+    for alias, cid in aliases.items():
+        fname = f"@{alias}.md"
+        content = (
+            f"# Subway Context Transit Station: @{alias}\n\n"
+            f"- **Target Chat ID**: `{cid}`\n"
+            f"- **Instructions for Agent**: When this file or @mention is referenced, "
+            f"call MCP tool `read_chat(chat_id='@{alias}', mode='decisions', since='last')` "
+            f"to board this chat's context.\n"
+        )
+        # Write to central station registry
+        with open(os.path.join(st_dir, fname), "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # Write to active project .subway/ dirs for instant @ selector discovery
+        for pdir in active_dirs:
+            try:
+                p_subway = os.path.join(pdir, ".subway")
+                os.makedirs(p_subway, exist_ok=True)
+                with open(os.path.join(p_subway, fname), "w", encoding="utf-8") as pf:
+                    pf.write(content)
+            except Exception:
+                continue
 
 
 def _checkpoint_key(c1: str, c2: str) -> str:
