@@ -2,6 +2,9 @@
 
 > **On-demand, token-efficient context transit system connecting independent AI coding agents across multiple windows (Antigravity, Claude Code, OpenCode terminal).**
 
+![Subway Context Tri-Agent Multi-Window Architecture](assets/subway-tri-pane-hero.jpg)
+*Live multi-window workspace: Claude Code IDE tab (center), OpenCode terminal (bottom dock), and Antigravity Gemini (right pane) connected concurrently via Subway Context.*
+
 Stop copy-pasting 50,000-line markdown summaries between AI tools or blowing through your context window. **Subway Context** acts as an on-demand transit system between your coding agents: board any chat, search by quote, sync only the delta turns since your last visit, and extract high-density decision logs.
 
 ---
@@ -18,7 +21,7 @@ When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude 
 - **Search by Quote**: Search any phrase you or the agent said; jump directly to that turn.
 - **Delta Sync (`since="last"`)**: Only transfers the new exchanges since the last time you bridged.
 - **Decision Log (`mode="decisions"`)**: Cuts 85-90% of token noise by extracting only instructions, rationale, architecture decisions, and files touched.
-- **Universal Multi-Window**: Works seamlessly across **Claude Code**, **Antigravity IDE**, and **OpenCode (terminal)**.
+- **Universal Multi-Window**: Works seamlessly across **Claude Code (CLI & IDE extension)**, **Antigravity IDE**, and **OpenCode (terminal)**.
 
 ---
 
@@ -151,7 +154,22 @@ Now you can simply refer to `@claude-main` in any command.
 
 ## 4-Tier Station Aliasing System 🏷️
 
-Subway Context eliminates raw UUIDs with a layered 4-tier naming hierarchy:
+![Antigravity Multi-Conversation Sidebar](assets/antigravity-sessions-sidebar.png)
+*Antigravity maintains persistent conversation documents across multiple workspaces (`dziner`, `portfolio`, etc.) with concurrent background tasks and active states (blue indicator dots).*
+
+### The Multi-Chat Challenge
+Terminal tools like Claude Code CLI and OpenCode run on a **process lifecycle** (a PID or active terminal socket). When you close the terminal or switch tasks, the process ends.
+
+**Antigravity (Gemini)** operates on an enduring **document library lifecycle**:
+* As shown in the sidebar above, you may have 5+ concurrent threads in the same workspace (`dziner` has *"Access To Previous Chats"*, *"Finding Nearby Subway Stati..."*, *"Checking Gitignore Status"*, etc.).
+* Other project chats run in parallel (notice the blue activity dot on *"Clone GitHub Repository"* in `portfolio`).
+* Switching chats does **not** terminate them; they pause at their last transcript turn in SQLite.
+
+If an alias like `@gemini` simply resolved to `ORDER BY last_modified_time DESC`, clicking over to check a gitignore file for 30 seconds would accidentally hijack Claude Code or OpenCode's context query!
+
+### The 4-Tier Solution
+
+Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier naming hierarchy:
 
 | Tier | Format | Examples | Behavior |
 |:---|:---|:---|:---|
@@ -206,12 +224,40 @@ Natural prompts work best across all agents:
 
 ## Native OpenCode `@` Autocomplete Integration
 
-Subway Context automatically syncs all 4 tiers of aliases directly into OpenCode's agent registry (`~/.config/opencode/agents/*.md`). 
+![OpenCode Autocomplete Menu](assets/opencode-autocomplete.png)
+*Typing `@claude` in a workspace containing Claude test logs or JSON artifacts can flood the autocomplete menu with workspace files. Subway Context generates dedicated `@claude-` and `@agy-` agent stubs to isolate agent transit from file search.*
 
-Whenever you open OpenCode, all Subway lines appear in its native `@` autocomplete popup without manual file copying:
-- Type `@claude-` to instantly select `@claude-main`, `@claude-latest`, or `@claude-<project>` without colliding with workspace files (e.g. `claude_report.json`).
-- Type `@agy-` to view active Antigravity stations (`@agy-live`, `@agy-latest`, `@agy-<project>`, `@agy-<topic>`).
-- Dynamic topic stubs carry a safety tag (`<!-- subway-auto-stub -->`) and are cleanly pruned when conversations cycle out of the top recent list, preserving your custom agent files.
+### Why Dedicated Agent Stubs Matter
+In OpenCode, the prompt `@` symbol searches **both** workspace files and registered agent definitions. If your project contains files like `data_v1_archive/site-098/claude_rationale_raw.json`, typing `@claude` causes file search matches to push agent stations out of the top results, forcing you to escape the selector.
+
+Subway Context solves this by automatically syncing all 4 tiers of aliases directly into OpenCode's global agent registry (`~/.config/opencode/agents/*.md`):
+- **Hyphen-Prefixed Filtering**: Typing `@claude-` filters out non-hyphenated files (`claude_...`) and displays only agent transit targets (`@claude-main`, `@claude-latest`, `@claude-dziner`, etc.).
+- **Antigravity Stations**: Typing `@agy-` displays active Antigravity stations (`@agy-live`, `@agy-latest`, `@agy-dziner`, `@agy-subway`, etc.).
+- **Safe Dynamic Rotation**: Auto-generated topic stubs carry a safety tag (`<!-- subway-auto-stub -->`). Subway automatically prunes old topic stubs as conversations age out, leaving your custom hand-written agent files untouched.
+
+---
+
+## Claude Code: IDE Extension vs CLI
+
+Subway Context supports both the **Claude Code CLI** (terminal) and the **official Claude Code IDE extension** (VS Code / Antigravity editor tab).
+
+```text
+┌─────────────────────────────────┬─────────────────────────────────┐
+│ [Center Tab] Claude Code IDE    │ [Right Pane] Antigravity IDE    │
+│ "Codebase comprehensive review" │ "dziner / Access To Previous"   │
+│ (Opus 3.5 Extra High)           │ (Gemini 2.5 Flash Medium)       │
+├─────────────────────────────────┴─────────────────────────────────┤
+│ [Bottom Panel] OpenCode Terminal                                  │
+│ "taste-engine:breakdown" (Flint 40B Free)                         │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+Both Claude environments share the exact same underlying architecture:
+1. **Unified Configuration**: Both read `~/.claude.json`. Subway Context is registered under `mcpServers["subway-context"]`, enabling `read_chat`, `list_chats`, and `send_note` in both CLI and IDE chat tabs.
+2. **Unified Session Tracking**: Active IDE editor tabs are recorded in `~/.claude/sessions/<pid>.json` with `"entrypoint": "claude-vscode"`. Subway automatically detects live tab names (e.g. `Codebase comprehensive review (fork)`) and makes them available for transit.
+3. **Slash Commands & Mentions**:
+   - In the Claude IDE tab input (`⌘ Esc to focus or unfocus Claude`), typing `/` triggers `/subway`, `/opencode`, and `/gemini`.
+   - In natural conversation, typing *"What did @opencode do in the terminal?"* causes Claude to query Subway Context directly.
 
 ---
 
