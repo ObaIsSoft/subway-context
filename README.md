@@ -67,6 +67,20 @@ Check connection status at any time:
 python3 install.py --status
 ```
 
+#### Selective Installation (e.g. only 2 of 3)
+If you only use certain agents (or want to skip one), you can choose interactively or pass flags:
+
+```bash
+# Connect only Claude Code and Antigravity
+python3 install.py --targets claude,gemini
+
+# Connect everything except OpenCode
+python3 install.py --skip opencode
+
+# Disconnect Subway from just one tool (leaving the others intact)
+python3 install.py --remove opencode
+```
+
 ---
 
 <details>
