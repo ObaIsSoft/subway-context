@@ -487,6 +487,20 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
                 con.close()
         except Exception:
             pass
+    elif meta.get("source") == "claude":
+        try:
+            p = meta.get("path", "")
+            if p:
+                sub_dir = os.path.join(os.path.dirname(p), meta["id"], "subagents")
+                if os.path.isdir(sub_dir):
+                    for sub_p in sorted(glob.glob(os.path.join(sub_dir, "*.jsonl")), key=os.path.getmtime, reverse=True)[:6]:
+                        sub_meta = claude_meta(sub_p)
+                        sub_id = sub_meta["id"]
+                        clean_sub_id = sub_id.replace("agent-", "")
+                        sub_desc = sub_meta.get("title") or "Subagent"
+                        children_lines.append(f"- `{clean_sub_id[:8]}`: {sub_desc} -> `read_chat(chat_id=\"{clean_sub_id[:8]}\", mode=\"decisions\")`")
+        except Exception:
+            pass
 
     header.extend([
         "",
@@ -613,8 +627,10 @@ def _read_head(path: str, nbytes: int) -> List[str]:
     return [l.decode("utf-8", "replace") for l in lines if l.strip()]
 
 
-def _claude_is_human(o: Dict[str, Any]) -> bool:
-    if o.get("isMeta") or o.get("isSidechain"):
+def _claude_is_human(o: Dict[str, Any], is_subagent: bool = False) -> bool:
+    if o.get("isMeta"):
+        return False
+    if o.get("isSidechain") and not is_subagent:
         return False
     origin = o.get("origin")
     if isinstance(origin, dict):
@@ -629,7 +645,7 @@ def _claude_is_human(o: Dict[str, Any]) -> bool:
     return isinstance(c, str) and not c.lstrip().startswith("<")
 
 
-def claude_parse_lines(lines: List[str]) -> List[Dict[str, Any]]:
+def claude_parse_lines(lines: List[str], is_subagent: bool = False) -> List[Dict[str, Any]]:
     turns: List[Dict[str, Any]] = []
     for line in lines:
         if '"type":"user"' not in line and '"type":"assistant"' not in line:
@@ -639,7 +655,7 @@ def claude_parse_lines(lines: List[str]) -> List[Dict[str, Any]]:
         except Exception:
             continue
         typ = o.get("type")
-        if o.get("isSidechain"):
+        if o.get("isSidechain") and not is_subagent:
             continue
         msg = o.get("message") or {}
         content = msg.get("content") or []
@@ -654,7 +670,7 @@ def claude_parse_lines(lines: List[str]) -> List[Dict[str, Any]]:
                     txt = content
                 turns.append({"role": "summary", "text": txt, "ts": ts})
                 continue
-            if not _claude_is_human(o):
+            if not _claude_is_human(o, is_subagent=is_subagent):
                 continue
             txt_parts = []
             if isinstance(content, str):
@@ -691,7 +707,10 @@ def claude_parse_lines(lines: List[str]) -> List[Dict[str, Any]]:
                     elif bt == "tool_use":
                         inp = b.get("input") or {}
                         hint = inp.get("command") or inp.get("file_path") or inp.get("description") or ""
-                        ast_tools.append(f"{b.get('name')}: {one_line(str(hint), 120)}")
+                        tool_name = b.get("name") or "tool"
+                        if tool_name == "Agent":
+                            hint = f"Agent [{inp.get('subagent_type', 'subagent')}]: {inp.get('description', '')}"
+                        ast_tools.append(f"{tool_name}: {one_line(str(hint), 120)}")
             for th in ast_thoughts:
                 turns.append({"role": "assistant", "text": "", "thought": th, "ts": ts})
             for tl in ast_tools:
@@ -701,14 +720,19 @@ def claude_parse_lines(lines: List[str]) -> List[Dict[str, Any]]:
     return turns
 
 
-def claude_files() -> List[str]:
-    return [p for p in glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl")) if os.path.isfile(p)]
+def claude_files(include_subagents: bool = False) -> List[str]:
+    files = [p for p in glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl")) if os.path.isfile(p)]
+    if include_subagents:
+        files.extend([p for p in glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*", "subagents", "*.jsonl")) if os.path.isfile(p)])
+    return files
 
 
 def claude_meta(path: str, open_sessions: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     st = os.stat(path)
     key = (st.st_mtime, st.st_size)
+    is_sub = "/subagents/" in path
     sid = os.path.basename(path)[:-6]
+    parent_id = os.path.basename(os.path.dirname(os.path.dirname(path))) if is_sub else ""
     cached = _claude_meta_cache.get(path)
     if cached and cached[0] == key:
         meta = dict(cached[1])
@@ -736,7 +760,7 @@ def claude_meta(path: str, open_sessions: Optional[Dict[str, Dict[str, Any]]] = 
             if not first_prompt and '"type":"user"' in line:
                 try:
                     o = json.loads(line)
-                    if _claude_is_human(o) and not o.get("isCompactSummary"):
+                    if _claude_is_human(o, is_subagent=is_sub) and not o.get("isCompactSummary"):
                         c = (o.get("message") or {}).get("content")
                         if isinstance(c, list):
                             first_prompt = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
@@ -746,12 +770,19 @@ def claude_meta(path: str, open_sessions: Optional[Dict[str, Dict[str, Any]]] = 
                     pass
             if cwd and first_prompt:
                 break
+        display_title = custom or title
+        if not display_title and first_prompt:
+            display_title = f"[Subagent] {one_line(first_prompt, 70)}" if is_sub else one_line(first_prompt, 80)
+        if not display_title:
+            display_title = f"[Subagent of {parent_id[:8]}]" if is_sub else "(untitled)"
+
         meta = {
             "source": "claude", "id": sid, "path": path,
-            "title": custom or title or one_line(first_prompt, 80),
+            "title": display_title,
             "first_prompt": first_prompt, "last_prompt": last_prompt,
-            "project": cwd or os.path.basename(os.path.dirname(path)),
+            "project": cwd or os.path.basename(os.path.dirname(os.path.dirname(path) if is_sub else path)),
             "updated": st.st_mtime, "size": st.st_size,
+            "subagent": is_sub, "parent": parent_id,
         }
         _claude_meta_cache[path] = (key, dict(meta))
     os_ = open_sessions if open_sessions is not None else claude_open_sessions()
@@ -763,16 +794,22 @@ def claude_meta(path: str, open_sessions: Optional[Dict[str, Dict[str, Any]]] = 
 
 
 def claude_read(path: str, mode: str, n: int) -> List[Dict[str, Any]]:
+    is_sub = "/subagents/" in path
     if mode == "recent":
         size = os.path.getsize(path)
         nbytes = 4_000_000
         while True:
             lines = _read_tail(path, nbytes)
-            turns = claude_parse_lines(lines)
+            turns = claude_parse_lines(lines, is_subagent=is_sub)
             users = sum(1 for t in turns if t["role"] in ("user", "summary"))
             if users > n or nbytes >= size:
                 return turns
             nbytes *= 4
+    elif mode == "outline":
+        lines = _read_head(path, 3_000_000)
+    else:
+        lines = _read_head(path, 15_000_000)
+    return claude_parse_lines(lines, is_subagent=is_sub)
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return claude_parse_lines(f)
 
@@ -1035,7 +1072,7 @@ def all_chats(source: str = "all", include_subagents: bool = False) -> List[Dict
     chats: List[Dict[str, Any]] = []
     if source in ("all", "claude"):
         opens = claude_open_sessions()
-        for p in claude_files():
+        for p in claude_files(include_subagents):
             try:
                 chats.append(claude_meta(p, opens))
             except Exception as e:
@@ -1110,7 +1147,8 @@ def resolve(ident: str, source: str = "all", project: str = "") -> Dict[str, Any
 
     # 4. Fallback: ID prefix, tab_name, or title match
     low = clean_alias
-    hits = [c for c in chats if c["id"].lower().startswith(low)]
+    clean_low = low.replace("agent-", "")
+    hits = [c for c in chats if c["id"].lower().startswith(low) or c["id"].lower().replace("agent-", "").startswith(clean_low)]
     if not hits:
         hits = [c for c in chats if (c.get("tab_name") or "").lower() == low]
     if not hits:

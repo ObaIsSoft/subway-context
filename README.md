@@ -222,7 +222,7 @@ Drop a lightweight dispatch into another agent window's inbox so it picks up whe
 
 ## Subagent Tracking & Deep Inspection 🤖
 
-When agents spin up parallel subagents (e.g. Antigravity subagent swarms or OpenCode child tasks):
+When agents spin up parallel subagents (e.g. Claude Code background `Agent` workers, Antigravity subagent swarms, or OpenCode child tasks):
 
 1. **Automatic Hierarchy Discovery**:
    Whenever you read a coordinator or parent chat with `read_chat(mode="decisions")`, Subway automatically identifies all spun child subagents and lists them in the header with one-click transit commands:
@@ -230,10 +230,11 @@ When agents spin up parallel subagents (e.g. Antigravity subagent swarms or Open
    ### Spun Child Subagents (Worker Sessions):
    - `1043988d`: Agent 1 (Vision-Math-Agent) -> `read_chat(chat_id="1043988d", mode="decisions")`
    - `a8360f72`: Agent 2 (Relations-Containment-Agent) -> `read_chat(chat_id="a8360f72", mode="decisions")`
+   - `af0752d2`: Senior security reviewer -> `read_chat(chat_id="af0752d2", mode="decisions")`
    ```
 
 2. **Direct Worker Boarding**:
-   Board any child subagent directly by its station ID (`read_chat(chat_id="a8360f72", mode="decisions")`). Subway extracts:
+   Board any child subagent directly by its station ID (`read_chat(chat_id="a8360f72", mode="decisions")` or `read_chat(chat_id="af0752d2", mode="decisions")`). Subway extracts:
    - The subagent's exact initial task brief and constraints.
    - Internal step-by-step thinking traces and reasoning.
    - Tests run, terminal output, and files touched.
