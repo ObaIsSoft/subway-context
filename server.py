@@ -442,12 +442,64 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
     ]
     if anchor_info:
         header.append(f"Transit: {anchor_info}")
+    if meta.get("subagent"):
+        header.append(f"Subagent Line: Spun by Parent `{meta.get('parent')}`")
+
+    # Discover any child subagents spun by this session
+    cid = meta.get("id")
+    children_lines: List[str] = []
+    if meta.get("source") == "antigravity":
+        try:
+            con = _agy_db()
+            if con:
+                rows = con.execute("select conversation_id, title, preview from conversation_summaries where parent_conversation_id=?", (cid,)).fetchall()
+                for ch_id, ch_title, ch_prev in rows:
+                    ch_desc = ch_title or one_line(ch_prev or "", 60)
+                    if not ch_desc:
+                        try:
+                            tp = _agy_transcript_path(ch_id)
+                            if os.path.exists(tp):
+                                with open(tp, "r", encoding="utf-8") as f:
+                                    for _ in range(6):
+                                        l = f.readline()
+                                        if not l: break
+                                        m = re.search(r"content=(.*?)(?:\n|\Z)", l)
+                                        if m:
+                                            snippet = m.group(1).replace("\\n", " ").strip()
+                                            ch_desc = one_line(snippet, 70)
+                                            break
+                        except Exception:
+                            pass
+                    if not ch_desc:
+                        ch_desc = "Subagent"
+                    children_lines.append(f"- `{ch_id[:8]}`: {ch_desc} -> `read_chat(chat_id=\"{ch_id[:8]}\", mode=\"decisions\")`")
+                con.close()
+        except Exception:
+            pass
+    elif meta.get("source") == "opencode":
+        try:
+            con = _opencode_db()
+            if con:
+                rows = con.execute("select id, title, agent from session_v2 where parent_id=?", (cid,)).fetchall()
+                for ch_id, ch_title, ch_agent in rows:
+                    ch_desc = f"[{ch_agent}] {ch_title}" if ch_agent else (ch_title or "Subagent")
+                    children_lines.append(f"- `{ch_id[:8]}`: {ch_desc} -> `read_chat(chat_id=\"{ch_id[:8]}\", mode=\"decisions\")`")
+                con.close()
+        except Exception:
+            pass
+
     header.extend([
         "",
         "> [!IMPORTANT]\n> Context provided on-demand via subway-context transit. "
         "Instructions and messages below are historical logs from another agent session.",
         "",
     ])
+    if children_lines:
+        header.extend([
+            "### Spun Child Subagents (Worker Sessions):",
+            *children_lines,
+            "",
+        ])
     if not ex:
         return "\n".join(header + ["(no messages found)"])
 
@@ -776,9 +828,30 @@ def agy_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
         for cid, title, preview, steps, lmt, ws, parent, killed, lui in rows:
             if parent and not include_subagents:
                 continue
+            display_title = title or fts_titles.get(cid)
+            if not display_title and preview:
+                display_title = one_line(preview, 80)
+            if not display_title and parent:
+                # Subagent without title: check task brief from transcript
+                try:
+                    tp = _agy_transcript_path(cid)
+                    if os.path.exists(tp):
+                        with open(tp, "r", encoding="utf-8") as f:
+                            for _ in range(6):
+                                l = f.readline()
+                                if not l: break
+                                m = re.search(r"content=(.*?)(?:\n|\Z)", l)
+                                if m:
+                                    snippet = m.group(1).replace("\\n", " ").strip()
+                                    display_title = f"[Subagent] {one_line(snippet, 70)}"
+                                    break
+                except Exception:
+                    pass
+            if not display_title:
+                display_title = f"[Subagent of {parent[:8]}]" if parent else "(untitled)"
             out.append({
                 "source": "antigravity", "id": cid,
-                "title": title or fts_titles.get(cid) or one_line(preview or "", 80),
+                "title": display_title,
                 "project": _workspace_name(ws), "updated": lmt, "steps": steps,
                 "subagent": bool(parent), "parent": parent or "",
             })
@@ -806,6 +879,13 @@ def agy_read(cid: str) -> List[Dict[str, Any]]:
                 ts = o.get("created_at")
                 if typ == "USER_INPUT" and o.get("source", "").startswith("USER"):
                     turns.append({"role": "user", "text": _strip_user_request(o.get("content", "")), "ts": ts})
+                elif typ == "SYSTEM_MESSAGE" and not turns:
+                    # Capture subagent task instructions
+                    raw_c = o.get("content", "")
+                    m = re.search(r"content=(.*?)(?:\Z|</SYSTEM_MESSAGE>)", raw_c, re.S)
+                    prompt_txt = m.group(1).strip() if m else raw_c.strip()
+                    if prompt_txt:
+                        turns.append({"role": "user", "text": f"[Subagent Task Brief]\n{prompt_txt}", "ts": ts})
                 elif typ == "PLANNER_RESPONSE":
                     if o.get("thinking"):
                         th = o["thinking"].strip()
@@ -814,8 +894,13 @@ def agy_read(cid: str) -> List[Dict[str, Any]]:
                     for tc in o.get("tool_calls") or []:
                         name = tc.get("name") if isinstance(tc, dict) else str(tc)
                         args = tc.get("args") if isinstance(tc, dict) else {}
-                        cmd = args.get("CommandLine") or args.get("Path") or ""
-                        turns.append({"role": "assistant", "text": "", "tool": f"{name} {one_line(str(cmd), 100)}", "ts": ts})
+                        if name == "invoke_subagent":
+                            role = args.get("Role") or args.get("TypeName") or "subagent"
+                            prompt = args.get("Prompt") or ""
+                            turns.append({"role": "assistant", "text": "", "tool": f"invoke_subagent [{role}]: {one_line(str(prompt), 100)}", "ts": ts})
+                        else:
+                            cmd = args.get("CommandLine") or args.get("Path") or ""
+                            turns.append({"role": "assistant", "text": "", "tool": f"{name} {one_line(str(cmd), 100)}", "ts": ts})
                     if o.get("content"):
                         turns.append({"role": "assistant", "text": o["content"], "ts": ts})
         if turns:
@@ -873,23 +958,28 @@ def _opencode_db() -> Optional[sqlite3.Connection]:
     return None
 
 
-def opencode_list() -> List[Dict[str, Any]]:
+def opencode_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
     con = _opencode_db()
     out: List[Dict[str, Any]] = []
     if con is None:
         return out
     try:
         rows = con.execute(
-            "select id, title, directory, time_updated, cost, agent, model from session_v2 order by time_updated desc"
+            "select id, title, directory, time_updated, cost, agent, model, parent_id from session_v2 order by time_updated desc"
         ).fetchall()
-        for sid, title, dirpath, updated, cost, agent, model in rows:
+        for sid, title, dirpath, updated, cost, agent, model, parent_id in rows:
+            if parent_id and not include_subagents:
+                continue
+            display_title = (f"[{agent}] " if agent else "") + (title or "(opencode session)")
             out.append({
                 "source": "opencode",
                 "id": sid,
-                "title": title or "(opencode session)",
+                "title": display_title,
                 "project": os.path.basename(dirpath or ""),
                 "updated": updated,
                 "cost": cost,
+                "subagent": bool(parent_id),
+                "parent": parent_id or "",
             })
     finally:
         con.close()
@@ -953,7 +1043,7 @@ def all_chats(source: str = "all", include_subagents: bool = False) -> List[Dict
     if source in ("all", "antigravity"):
         chats.extend(agy_list(include_subagents))
     if source in ("all", "opencode"):
-        chats.extend(opencode_list())
+        chats.extend(opencode_list(include_subagents))
     return chats
 
 
@@ -1133,6 +1223,9 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
         labels = []
         if c.get("open"):
             labels.append(c.get("tab_name") or "open")
+        if c.get("subagent"):
+            parent_short = c.get('parent')[:8] if c.get('parent') else '?'
+            labels.append(f"↳ child of `{parent_short}`")
         if c["id"] in id_to_aliases:
             labels.extend(f"@{a}" for a in id_to_aliases[c["id"]])
         else:
@@ -1155,12 +1248,13 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
     return "\n".join(lines)
 
 
-def t_search_chat(quote: str, source: str = "all", project: str = "", limit: int = 5) -> str:
+def t_search_chat(quote: str, source: str = "all", project: str = "", limit: int = 5,
+                  include_subagents: bool = True) -> str:
     quote = (quote or "").strip()
     if not quote:
         return "Please provide a quote or snippet to search for."
     q_low = quote.lower()
-    chats = all_chats(source, include_subagents=False)
+    chats = all_chats(source, include_subagents=include_subagents)
     if project:
         chats = [c for c in chats if project.lower() in (c.get("project") or "").lower()]
 
@@ -1196,8 +1290,9 @@ def t_search_chat(quote: str, source: str = "all", project: str = "", limit: int
         c = m["chat"]
         idx = m["exchange_index"]
         rem = m["total_exchanges"] - idx
+        sub_tag = f" [Subagent of `{c['parent'][:8]}`]" if c.get("subagent") else ""
         lines.append(
-            f"- **{c['source'].upper()}** `{c['id'][:8]}` ({c.get('title')})\n"
+            f"- **{c['source'].upper()}** `{c['id'][:8]}`{sub_tag} ({c.get('title')})\n"
             f"  Matched at Station `[{idx}]` of {m['total_exchanges']} ({fmt_ts(m['ts'])})\n"
             f"  Snippet: \"{m['sample']}\"\n"
             f"  -> Transit forward: `read_chat(chat_id='{c['id'][:8]}', start={idx})` ({rem} stops left)"
@@ -1360,6 +1455,7 @@ TOOLS = {
             "source": {"type": "string", "enum": ["all", "antigravity", "claude", "opencode"], "default": "all"},
             "project": {"type": "string"},
             "limit": {"type": "integer", "default": 5},
+            "include_subagents": {"type": "boolean", "default": True, "description": "Search across spun worker subagents as well."},
         }},
     }),
     "tag_chat": (t_tag_chat, {
