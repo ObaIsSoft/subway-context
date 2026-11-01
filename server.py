@@ -1562,8 +1562,9 @@ def save_locks(data: Dict[str, Any]) -> None:
     _save_json("locks.json", data)
 
 
-def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, purpose: str = "") -> str:
-    """Acquire a temporary workspace lease on a file to prevent multi-agent collision."""
+def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, purpose: str = "",
+                 baseline_commit: str = "", role: str = "implementer") -> str:
+    """Acquire a temporary workspace lease on a file to prevent multi-agent collision and regressions."""
     if not filepath:
         return "Error: filepath is required."
     clean_path = os.path.normpath(filepath.strip())
@@ -1583,13 +1584,37 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
     locks = data.get("locks", {})
     existing = locks.get(clean_path)
 
+    # 1. Collision Check against active leases
     if existing and existing.get("expires_at", 0) > now:
         prev_holder = existing.get("holder", "another-agent")
         if prev_holder != holder:
             rem = int(existing["expires_at"] - now)
             purp_str = f" for '{existing.get('purpose')}'" if existing.get("purpose") else ""
-            return (f"🚨 COLLISION WARNING: '{clean_path}' is already leased to {prev_holder}{purp_str}. "
+            return (f"[COLLISION WARNING] '{clean_path}' is already leased to {prev_holder}{purp_str}. "
                     f"Lease expires in {rem}s. Do NOT overwrite or clobber until released or expired.")
+
+    # 2. Regression Shield Check: if file was previously verified and marked APPROVED
+    if existing and existing.get("status") == "APPROVED":
+        prev_signoff = existing.get("signoff", {})
+        signed_commit = prev_signoff.get("commit_sha", "")
+        signed_by = prev_signoff.get("reviewer", "reviewer")
+        clean_role = (role or "implementer").lower()
+        if clean_role not in ("coordinator", "refactorer") and baseline_commit != signed_commit:
+            return (f"[REGRESSION SHIELD] '{clean_path}' was previously verified and APPROVED by {signed_by} "
+                    f"at commit {signed_commit or 'HEAD'}. Blind re-editing is prevented. "
+                    f"To modify this file, provide baseline_commit='{signed_commit}' and declare purpose, "
+                    f"or request coordinator/refactorer role authorization.")
+
+    # Auto-resolve baseline commit if omitted
+    if not baseline_commit:
+        try:
+            baseline_commit = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                timeout=2
+            ).decode("utf-8").strip()
+        except Exception:
+            baseline_commit = ""
 
     locks[clean_path] = {
         "holder": holder,
@@ -1597,12 +1622,66 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
         "expires_at": expires_at,
         "duration": duration,
         "purpose": purpose or "Active modification",
+        "baseline_commit": baseline_commit,
+        "role": role or "implementer",
+        "status": "LEASED",
     }
     data["locks"] = locks
     save_locks(data)
     exp_iso = _dt.datetime.fromtimestamp(expires_at).astimezone().strftime("%H:%M:%S")
-    return (f"🔒 LEASE ACQUIRED: '{clean_path}' claimed by {holder} until {exp_iso} ({duration}s). "
+    base_note = f" (baseline: {baseline_commit})" if baseline_commit else ""
+    return (f"[LEASE ACQUIRED] '{clean_path}' claimed by {holder} (role: {role}){base_note} until {exp_iso} ({duration}s). "
             f"Purpose: {purpose or 'Active modification'}.")
+
+
+def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", reviewer: str = "") -> str:
+    """Sign off on a completed file modification to lock in quality and prevent regressions."""
+    if not filepath:
+        return "Error: filepath is required."
+    clean_path = os.path.normpath(filepath.strip())
+    if not reviewer:
+        me = detect_self()
+        reviewer = me["id"][:8] if me else "unknown-reviewer"
+
+    data = load_locks()
+    locks = data.get("locks", {})
+    entry = locks.get(clean_path, {})
+
+    commit_sha = ""
+    try:
+        commit_sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        ).decode("utf-8").strip()
+    except Exception:
+        commit_sha = "uncommitted"
+
+    verdict_clean = verdict.strip().lower()
+    is_approved = verdict_clean in ("approved", "accept", "pass", "good")
+    status_str = "APPROVED" if is_approved else "NEEDS_WORK"
+
+    entry["status"] = status_str
+    entry["signoff"] = {
+        "reviewer": reviewer,
+        "verdict": status_str,
+        "notes": notes or ("Quality verified, no regressions" if is_approved else "Rework required"),
+        "commit_sha": commit_sha,
+        "timestamp": time.time(),
+        "time_iso": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    locks[clean_path] = entry
+    data["locks"] = locks
+    save_locks(data)
+
+    event_tag = f"[SIGNOFF: {status_str}]"
+    msg = f"{event_tag} '{clean_path}' evaluated by {reviewer} at commit {commit_sha}. Notes: {notes or entry['signoff']['notes']}"
+    t_broadcast_track(msg, track="main", files=[clean_path], decisions=[f"Sign-off {status_str} by {reviewer}"])
+
+    if is_approved:
+        return f"[SIGNOFF: APPROVED] '{clean_path}' marked approved by {reviewer} (commit: {commit_sha}). Regression Shield active."
+    else:
+        return f"[SIGNOFF: NEEDS_WORK] '{clean_path}' flagged for rework by {reviewer}. Notes: {notes}"
 
 
 def t_release_file(filepath: str, holder: str = "") -> str:
@@ -1622,7 +1701,7 @@ def t_release_file(filepath: str, holder: str = "") -> str:
     del locks[clean_path]
     data["locks"] = locks
     save_locks(data)
-    return f"🔓 RELEASED: '{clean_path}' is now free for modification by any agent."
+    return f"[RELEASED] '{clean_path}' is now free for modification by any agent."
 
 
 def t_list_locks() -> str:
@@ -1638,7 +1717,9 @@ def t_list_locks() -> str:
         rem = max(0, int(info.get("expires_at", 0) - now))
         h = info.get("holder", "unknown")
         purp = info.get("purpose", "")
-        lines.append(f"- `🔒 {path}` — held by **{h}** ({rem}s remaining) :: {purp}")
+        st = info.get("status", "LEASED")
+        role = info.get("role", "implementer")
+        lines.append(f"- `[LOCKED] {path}` — held by **{h}** (role: {role}, {rem}s remaining, status: {st}) :: {purp}")
     return "\n".join(lines)
 
 
@@ -1673,7 +1754,7 @@ def t_join_track(track: str = "main", station_id: str = "") -> str:
             json.dump(subs, f, indent=2)
 
     history = t_read_track(track=clean_track, limit=5)
-    return (f"🚉 Joined shared context track '{clean_track}' as station `{station_id}`. "
+    return (f"[TRACK JOINED] Station `{station_id}` subscribed to shared context track '{clean_track}'. "
             f"Active subscribers: {len(subs)}.\n\n{history}")
 
 
@@ -1687,12 +1768,25 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
         me = detect_self()
         station_id = me["id"][:8] if me else "host"
 
+    # Audited Action Trap: check for destructive commands
+    is_destructive = False
+    lower_msg = message.lower()
+    destructive_patterns = ["rm -rf", "rm -r", "rm ", "sudo ", "git reset --hard", "drop table", "delete from", "mkfs", "dd if="]
+    for p in destructive_patterns:
+        if p in lower_msg:
+            is_destructive = True
+            break
+
+    prefix = "[ALERT: DESTRUCTIVE ACTION] " if is_destructive else ""
+    full_message = f"{prefix}{message.strip()}"
+
     rec = {
         "id": uuid.uuid4().hex[:8],
         "timestamp": time.time(),
         "iso": _dt.datetime.now().astimezone().strftime("%H:%M:%S"),
         "station_id": station_id,
-        "message": message.strip(),
+        "message": full_message,
+        "is_destructive": is_destructive,
         "files": files or [],
         "decisions": decisions or [],
     }
@@ -1700,8 +1794,17 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
     with open(tf, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
+    # If destructive, also append to alerts log
+    if is_destructive:
+        alerts_file = os.path.join(TRACKS_DIR, "alerts.jsonl")
+        try:
+            with open(alerts_file, "a", encoding="utf-8") as af:
+                af.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+
     file_note = f" (files: {', '.join(files)})" if files else ""
-    return f"📡 Broadcast posted to track '{clean_track}' by `{station_id}`: {message}{file_note}"
+    return f"[BROADCAST] Posted to track '{clean_track}' by `{station_id}`: {full_message}{file_note}"
 
 
 def t_read_track(track: str = "main", limit: int = 15, since_timestamp: float = 0.0) -> str:
@@ -1788,8 +1891,9 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
-                  project_dir: str = "", timeout_seconds: int = 600) -> str:
-    """Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) and link it to a shared track."""
+                  project_dir: str = "", timeout_seconds: int = 600, effort: str = "auto",
+                  mode: str = "standard") -> str:
+    """Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) with adaptive effort and God Mode."""
     if not role or not prompt:
         return "Error: role and prompt are required."
     _ensure_subway_dir()
@@ -1799,19 +1903,44 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         cwd = HOME
 
     selected_provider = provider.lower()
+    selected_mode = mode.lower()
     bin_path = None
 
+    is_god_mode = selected_mode == "god" or selected_provider == "god"
+    god_warning = ""
+    if is_god_mode:
+        god_warning = ("[WARNING: GOD MODE ACTIVE] Maximum frontier reasoning effort and multi-agent autonomy enabled. "
+                       "High token velocity and cost consumption. Use with experimental caution.\n")
+        t_broadcast_track(
+            f"[GOD MODE ACTIVE] Autonomous high-reasoning worker launched for role: '{role}'",
+            track=track,
+            station_id="god-mode-router"
+        )
+        if selected_provider == "god":
+            selected_provider = "auto"
+
     if selected_provider == "auto":
-        opencode_bin = find_opencode_binary()
         claude_bin = find_claude_binary()
-        if opencode_bin:
-            selected_provider = "opencode"
-            bin_path = opencode_bin
-        elif claude_bin:
-            selected_provider = "claude"
-            bin_path = claude_bin
+        opencode_bin = find_opencode_binary()
+        if is_god_mode:
+            # God mode prioritizes strongest frontier models (Claude Opus / flagship)
+            if claude_bin:
+                selected_provider = "claude"
+                bin_path = claude_bin
+            elif opencode_bin:
+                selected_provider = "opencode"
+                bin_path = opencode_bin
+            else:
+                selected_provider = "antigravity"
         else:
-            selected_provider = "antigravity"
+            if opencode_bin:
+                selected_provider = "opencode"
+                bin_path = opencode_bin
+            elif claude_bin:
+                selected_provider = "claude"
+                bin_path = claude_bin
+            else:
+                selected_provider = "antigravity"
     elif selected_provider in ("claude", "claude-code"):
         selected_provider = "claude"
         bin_path = find_claude_binary()
@@ -1821,7 +1950,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     elif selected_provider == "antigravity":
         pass
     else:
-        return f"Error: unknown provider '{provider}'. Must be 'auto', 'claude', 'opencode', or 'antigravity'."
+        return f"Error: unknown provider '{provider}'. Must be 'auto', 'claude', 'opencode', 'antigravity', or 'god'."
 
     worker_id = f"worker_{uuid.uuid4().hex[:6]}"
     log_file = os.path.join(WORKERS_DIR, f"{worker_id}.log")
@@ -1834,6 +1963,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             "track": track,
             "project_dir": cwd,
             "status": "pending_dispatch",
+            "effort": effort,
+            "mode": "god" if is_god_mode else "standard",
             "pid": None,
             "created_at": _dt.datetime.now().astimezone().isoformat(),
             "completed_at": None,
@@ -1843,8 +1974,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         }
         with open(_worker_file(worker_id), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
-        t_broadcast_track(f"Delegated task '{role}' to Antigravity worker `{worker_id}`", track=track, station_id=worker_id)
-        return (f"🚀 Antigravity Worker `{worker_id}` initialized for role '{role}'.\n"
+        t_broadcast_track(f"Delegated task '{role}' to Antigravity worker `{worker_id}` (effort: {effort})", track=track, station_id=worker_id)
+        return (f"{god_warning}[SPAWNED] Antigravity Worker `{worker_id}` initialized for role '{role}'.\n"
                 f"Invoke via: invoke_subagent(Role='{role}', Prompt='{prompt}')")
 
     if not bin_path:
@@ -1875,6 +2006,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "track": track,
         "project_dir": cwd,
         "status": "running",
+        "effort": effort,
+        "mode": "god" if is_god_mode else "standard",
         "pid": pid,
         "created_at": _dt.datetime.now().astimezone().isoformat(),
         "completed_at": None,
@@ -1885,15 +2018,17 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     with open(_worker_file(worker_id), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
+    mode_tag = " [GOD MODE]" if is_god_mode else ""
     t_broadcast_track(
-        f"Spun {selected_provider.upper()} worker `{worker_id}` (PID {pid}) on track '{track}' for role: '{role}'",
+        f"Spun {selected_provider.upper()}{mode_tag} worker `{worker_id}` (PID {pid}) on track '{track}' for role: '{role}'",
         track=track,
         station_id=worker_id,
     )
 
-    return (f"🚀 SPUN WORKER: `{worker_id}` [{selected_provider.upper()}] (PID {pid})\n"
+    return (f"{god_warning}[SPAWNED WORKER] `{worker_id}` [{selected_provider.upper()}{mode_tag}] (PID {pid})\n"
             f"- Role: **{role}**\n"
             f"- Track: **{track}**\n"
+            f"- Effort: **{effort}** | Mode: **{meta['mode']}**\n"
             f"- Working Dir: `{cwd}`\n"
             f"- Live Log: `{log_file}`\n"
             f"Check progress anytime with worker_status(worker_id='{worker_id}') or collect_reports().")
@@ -1923,12 +2058,14 @@ def t_worker_status(worker_id: str = "", track: str = "") -> str:
         if not match:
             return f"Worker `{worker_id}` not found."
         m = match[0]
-        status_icon = "🟢 RUNNING" if m.get("status") == "running" else "✅ COMPLETED" if m.get("status") == "completed" else "⚪ " + m.get("status", "unknown")
+        status_label = "[RUNNING]" if m.get("status") == "running" else "[COMPLETED]" if m.get("status") == "completed" else f"[{m.get('status', 'unknown').upper()}]"
         out = [
             f"# Worker Detail: `{m['id']}`",
             f"- **Role**: {m.get('role')}",
             f"- **Provider**: {m.get('provider', '').upper()}",
-            f"- **Status**: {status_icon}",
+            f"- **Mode**: {m.get('mode', 'standard').upper()}",
+            f"- **Effort**: {m.get('effort', 'auto')}",
+            f"- **Status**: {status_label}",
             f"- **PID**: {m.get('pid')}",
             f"- **Track**: {m.get('track')}",
             f"- **Directory**: `{m.get('project_dir')}`",
@@ -1958,8 +2095,9 @@ def t_worker_status(worker_id: str = "", track: str = "") -> str:
 
     lines = ["# Autonomous Subway Workers", ""]
     for r in records[:15]:
-        st = "🟢 RUNNING" if r.get("status") == "running" else "✅ DONE" if r.get("status") == "completed" else "⚪ " + r.get("status", "")
-        lines.append(f"- `{r.get('id')}` [{r.get('provider', '').upper()}] **{r.get('role')}** :: {st} (PID {r.get('pid')}, track: {r.get('track')})")
+        st = "[RUNNING]" if r.get("status") == "running" else "[DONE]" if r.get("status") == "completed" else f"[{r.get('status', '').upper()}]"
+        mode_str = f" [{r.get('mode', 'std').upper()}]" if r.get("mode") == "god" else ""
+        lines.append(f"- `{r.get('id')}` [{r.get('provider', '').upper()}{mode_str}] **{r.get('role')}** :: {st} (PID {r.get('pid')}, track: {r.get('track')})")
     return "\n".join(lines)
 
 
@@ -2002,8 +2140,8 @@ def t_collect_reports(track: str = "main", wait: bool = False) -> str:
     records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     out = [f"# Worker Reports for Track: '{track}'", ""]
     for m in records:
-        icon = "🟢" if m.get("status") == "running" else "✅" if m.get("status") == "completed" else "⚠️"
-        out.append(f"## {icon} `{m['id']}` — {m.get('role')} ({m.get('provider', '').upper()})")
+        status_tag = f"[{m.get('status', '').upper()}]"
+        out.append(f"## {status_tag} `{m['id']}` — {m.get('role')} ({m.get('provider', '').upper()})")
         out.append(f"- **Status**: {m.get('status')} (PID {m.get('pid')})")
         out.append(f"- **Completed**: {m.get('completed_at') or 'in progress'}")
         log_f = m.get("log_file")
@@ -2081,9 +2219,9 @@ def t_hud_status(project: str = "") -> str:
     subsep = "-" * 78
     lines = [
         sep,
-        f"🚇 SUBWAY CONTEXT LIVE HUD — STATION DEPARTURE BOARD   [{data['time_iso']}]",
+        f"SUBWAY CONTEXT LIVE HUD - STATION DEPARTURE BOARD   [{data['time_iso']}]",
         sep,
-        "[WORKSPACE GUARD — ACTIVE FILE LEASES]",
+        "[WORKSPACE GUARD - ACTIVE FILE LEASES]",
     ]
     if not locks:
         lines.append("  (No files locked. Workspace collision-free.)")
@@ -2091,16 +2229,19 @@ def t_hud_status(project: str = "") -> str:
         for p, info in locks.items():
             rem = max(0, int(info.get("expires_at", 0) - now))
             h = info.get("holder", "unknown")
-            lines.append(f"  🔒 {p:<36} <- Held by {h} ({rem}s left) :: {info.get('purpose', '')}")
+            st = info.get("status", "LEASED")
+            role = info.get("role", "implementer")
+            lines.append(f"  [LOCKED] {p:<32} <- Held by {h} ({role}, {st}, {rem}s left) :: {info.get('purpose', '')}")
 
     lines.extend([subsep, "[AUTONOMOUS WORKER SWARM]"])
     if not workers:
         lines.append("  (No workers spawned. Run spin_worker() to delegate.)")
     else:
         for w in workers[:6]:
-            st = "🟢 RUNNING" if w.get("status") == "running" else "✅ DONE"
+            st = "[RUNNING]" if w.get("status") == "running" else "[DONE]"
             prov = w.get("provider", "").upper()
-            lines.append(f"  ⚙️  {w['id']:<14} [{prov:<8}] {st:<10} Track: {w.get('track', 'main'):<6} Role: {w.get('role')}")
+            mode_tag = f"[{w.get('mode', 'std').upper()}]"
+            lines.append(f"  [*] {w['id']:<12} [{prov:<8}] {mode_tag:<7} {st:<9} Track: {w.get('track', 'main'):<5} Role: {w.get('role')}")
 
     lines.extend([subsep, "[SHARED CONTEXT TRACKS]"])
     if not tracks:
@@ -2110,11 +2251,11 @@ def t_hud_status(project: str = "") -> str:
             last = tinfo.get("last_entry") or {}
             msg = last.get("message", "No dispatches yet")
             st_id = last.get("station_id", "none")
-            lines.append(f"  📡 Track '{tname}': {tinfo.get('count', 0)} events. Latest from `{st_id}`: {msg}")
+            lines.append(f"  [TRACK] '{tname}': {tinfo.get('count', 0)} events. Latest from `{st_id}`: {msg}")
 
     lines.extend([
         sep,
-        "🌐 Live Web HUD running at: http://localhost:7890",
+        "Live Web HUD running at: http://localhost:7890",
         sep,
     ])
     return "\n".join(lines)
@@ -2273,7 +2414,7 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
 <body>
 <header>
   <div class="brand">
-    <div class="logo-icon">🚇</div>
+    <div class="logo-icon" style="font-weight: 800; font-size: 14px; color: var(--cyan); background: #0c1524; border: 1px solid var(--border); padding: 4px 8px; border-radius: 6px;">[SUBWAY]</div>
     <div>
       <h1>SUBWAY CONTEXT LIVE HUD</h1>
       <div class="brand-sub">Autonomous Multi-Agent Workspace Shield & Station Board</div>
@@ -2308,7 +2449,7 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
   <!-- Panel 1: Workspace Guard -->
   <div class="panel">
     <div class="panel-head">
-      <div class="panel-title">🛡️ Workspace Guard (File Leases)</div>
+      <div class="panel-title">[GUARD] Workspace File Leases</div>
       <span class="badge badge-amber" id="lock-count-badge">0 active</span>
     </div>
     <div class="table-wrap">
@@ -2317,19 +2458,26 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
           <tr>
             <th>File Path</th>
             <th>Holder</th>
+            <th>Role</th>
+            <th>Status</th>
             <th>Expires In</th>
-            <th>Purpose</th>
             <th>Action</th>
           </tr>
         </thead>
         <tbody id="locks-body">
-          <tr><td colspan="5" style="color: var(--muted); text-align: center;">No active file leases. All files free for modification.</td></tr>
+          <tr><td colspan="6" style="color: var(--muted); text-align: center;">No active file leases. All files free for modification.</td></tr>
         </tbody>
       </table>
     </div>
     <form id="claim-form" class="form-row" onsubmit="handleClaim(event)">
       <input type="text" id="claim-path" placeholder="File path (e.g. src/index.ts)" style="flex: 2;" required />
       <input type="text" id="claim-holder" placeholder="Holder (@claude-main)" style="flex: 1;" />
+      <select id="claim-role">
+        <option value="implementer">implementer</option>
+        <option value="reviewer">reviewer</option>
+        <option value="refactorer">refactorer</option>
+        <option value="coordinator">coordinator</option>
+      </select>
       <input type="number" id="claim-duration" placeholder="300s" value="300" style="width: 70px;" />
       <button type="submit" class="btn">Claim</button>
     </form>
@@ -2338,7 +2486,7 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
   <!-- Panel 2: Worker Swarm -->
   <div class="panel">
     <div class="panel-head">
-      <div class="panel-title">⚙️ Autonomous Worker Swarm</div>
+      <div class="panel-title">[SWARM] Autonomous Workers</div>
       <span class="badge badge-cyan" id="worker-count-badge">0 workers</span>
     </div>
     <div class="table-wrap">
@@ -2347,6 +2495,7 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
           <tr>
             <th>Worker ID</th>
             <th>Provider</th>
+            <th>Mode</th>
             <th>Status</th>
             <th>Role</th>
             <th>PID</th>
@@ -2354,7 +2503,7 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
           </tr>
         </thead>
         <tbody id="workers-body">
-          <tr><td colspan="6" style="color: var(--muted); text-align: center;">No worker subagents running.</td></tr>
+          <tr><td colspan="7" style="color: var(--muted); text-align: center;">No worker subagents running.</td></tr>
         </tbody>
       </table>
     </div>
@@ -2366,6 +2515,14 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
         <option value="opencode">OpenCode</option>
         <option value="claude">Claude</option>
         <option value="antigravity">Antigravity</option>
+        <option value="god">God Mode</option>
+      </select>
+      <select id="spawn-effort">
+        <option value="auto">Effort: Auto</option>
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+        <option value="max">Max</option>
       </select>
       <button type="submit" class="btn">Spawn</button>
     </form>
@@ -2374,7 +2531,7 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
   <!-- Panel 3: Shared Decision Tracks -->
   <div class="panel" style="grid-column: 1 / -1;">
     <div class="panel-head">
-      <div class="panel-title">📡 Shared Decision Ledger (Track: <span id="current-track-name" style="color: var(--cyan);">main</span>)</div>
+      <div class="panel-title">[TRACK] Shared Decision Ledger (Track: <span id="current-track-name" style="color: var(--cyan);">main</span>)</div>
       <div style="display: flex; gap: 8px;">
         <button class="btn" onclick="switchTrack('main')">main</button>
         <button class="btn" onclick="switchTrack('pr')">pr</button>
@@ -2432,10 +2589,11 @@ function renderStatus(data) {
       const item = locks[k];
       const rem = Math.max(0, Math.floor(item.expires_at - now));
       return `<tr>
-        <td><code>🔒 ${k}</code></td>
+        <td><code>[LOCKED] ${k}</code></td>
         <td><span class="badge badge-cyan">${item.holder}</span></td>
+        <td><span class="badge">${item.role || 'implementer'}</span></td>
+        <td><span class="badge ${item.status === 'APPROVED' ? 'badge-emerald' : 'badge-amber'}">${item.status || 'LEASED'}</span></td>
         <td><span style="color: ${rem < 30 ? 'var(--rose)' : 'var(--amber)'}; font-weight: 600;">${rem}s</span></td>
-        <td style="color: var(--muted);">${item.purpose || ''}</td>
         <td><button class="btn btn-danger" onclick="releaseLock('${k}', '${item.holder}')">Release</button></td>
       </tr>`;
     }).join("");
@@ -2448,16 +2606,18 @@ function renderStatus(data) {
   
   const workersBody = document.getElementById("workers-body");
   if (workers.length === 0) {
-    workersBody.innerHTML = '<tr><td colspan="6" style="color: var(--muted); text-align: center;">No worker subagents spawned.</td></tr>';
+    workersBody.innerHTML = '<tr><td colspan="7" style="color: var(--muted); text-align: center;">No worker subagents spawned.</td></tr>';
   } else {
     workersBody.innerHTML = workers.map(w => {
       const isRunning = w.status === 'running';
       const statusBadge = isRunning
-        ? '<span class="badge badge-emerald">RUNNING</span>'
-        : '<span class="badge">DONE</span>';
+        ? '<span class="badge badge-emerald">[RUNNING]</span>'
+        : '<span class="badge">[DONE]</span>';
+      const isGod = w.mode === 'god';
       return `<tr>
         <td><code>${w.id}</code></td>
         <td><span class="badge badge-purple">${(w.provider || '').toUpperCase()}</span></td>
+        <td><span class="badge ${isGod ? 'badge-amber' : ''}">${isGod ? 'GOD' : (w.effort || 'std').toUpperCase()}</span></td>
         <td>${statusBadge}</td>
         <td><strong>${w.role}</strong></td>
         <td>${w.pid || '-'}</td>
@@ -2494,11 +2654,12 @@ async function handleClaim(e) {
   e.preventDefault();
   const path = document.getElementById("claim-path").value;
   const holder = document.getElementById("claim-holder").value;
+  const role = document.getElementById("claim-role").value;
   const duration = parseInt(document.getElementById("claim-duration").value || "300");
   await fetch("/api/claim", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({filepath: path, holder: holder, duration: duration})
+    body: JSON.stringify({filepath: path, holder: holder, role: role, duration: duration})
   });
   document.getElementById("claim-path").value = "";
   fetchStatus();
@@ -2518,10 +2679,12 @@ async function handleSpawn(e) {
   const role = document.getElementById("spawn-role").value;
   const prompt = document.getElementById("spawn-prompt").value;
   const provider = document.getElementById("spawn-provider").value;
+  const effort = document.getElementById("spawn-effort").value;
+  const mode = provider === "god" ? "god" : "standard";
   await fetch("/api/spawn", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({role: role, prompt: prompt, provider: provider, track: currentTrack})
+    body: JSON.stringify({role: role, prompt: prompt, provider: provider, effort: effort, mode: mode, track: currentTrack})
   });
   document.getElementById("spawn-role").value = "";
   document.getElementById("spawn-prompt").value = "";
@@ -2786,12 +2949,23 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}},
     }),
     "claim_file": (t_claim_file, {
-        "description": "Acquire a temporary workspace lease on a file to prevent collision with other agents.",
+        "description": "Acquire a temporary workspace lease on a file to prevent collision and regressions across agents.",
         "inputSchema": {"type": "object", "required": ["filepath"], "properties": {
             "filepath": {"type": "string", "description": "Target file path to claim."},
             "holder": {"type": "string", "description": "Station ID or agent alias claiming the file (default: self)."},
             "duration_seconds": {"type": "integer", "default": 300, "description": "Lease lifetime in seconds (10-3600)."},
             "purpose": {"type": "string", "description": "Short explanation of the planned changes."},
+            "baseline_commit": {"type": "string", "description": "Git commit hash to anchor against for Regression Shield."},
+            "role": {"type": "string", "enum": ["implementer", "reviewer", "refactorer", "coordinator"], "default": "implementer"},
+        }},
+    }),
+    "signoff_file": (t_signoff_file, {
+        "description": "Review and sign off on a completed file modification to lock in quality and prevent regressions.",
+        "inputSchema": {"type": "object", "required": ["filepath"], "properties": {
+            "filepath": {"type": "string", "description": "Target file path to sign off."},
+            "verdict": {"type": "string", "enum": ["approved", "needs_work"], "default": "approved"},
+            "notes": {"type": "string", "description": "Evaluation rationale, test verification notes, or rework requirements."},
+            "reviewer": {"type": "string", "description": "Station ID or alias of reviewer."},
         }},
     }),
     "release_file": (t_release_file, {
@@ -2806,14 +2980,16 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}},
     }),
     "spin_worker": (t_spin_worker, {
-        "description": "Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) and link it to a shared track.",
+        "description": "Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) with adaptive effort and God Mode.",
         "inputSchema": {"type": "object", "required": ["role", "prompt"], "properties": {
             "role": {"type": "string", "description": "Brief 2-5 word job title for the worker (e.g. 'Unit Tester')."},
             "prompt": {"type": "string", "description": "Clear actionable instruction for the subagent."},
-            "provider": {"type": "string", "enum": ["auto", "claude", "opencode", "antigravity"], "default": "auto"},
+            "provider": {"type": "string", "enum": ["auto", "claude", "opencode", "antigravity", "god"], "default": "auto"},
             "track": {"type": "string", "default": "main", "description": "Shared context track name."},
             "project_dir": {"type": "string", "description": "Working directory (default: current workspace)."},
             "timeout_seconds": {"type": "integer", "default": 600},
+            "effort": {"type": "string", "enum": ["auto", "low", "medium", "high", "max"], "default": "auto"},
+            "mode": {"type": "string", "enum": ["standard", "god", "ultracode"], "default": "standard"},
         }},
     }),
     "worker_status": (t_worker_status, {
@@ -2933,7 +3109,7 @@ def main() -> None:
                     port = int(sys.argv[2])
                 except Exception:
                     pass
-            print(f"🚇 Starting Subway Context Live HUD on http://localhost:{port} ...")
+            print(f"[SUBWAY] Starting Live HUD on http://localhost:{port} ...")
             start_hud_server(port=port, daemon=False)
             try:
                 while True:

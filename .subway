@@ -1,0 +1,14 @@
+# Subway Context Anchor File
+# This file enables `@subway` autocomplete in Claude Code and Antigravity.
+# Available Subway tools:
+# - list_chats()
+# - hud_status()
+# - claim_file(filepath, purpose, baseline_commit, role)
+# - signoff_file(filepath, verdict, notes)
+# - release_file(filepath)
+# - spin_worker(role, prompt, provider, effort, mode)
+# - worker_status(worker_id)
+# - collect_reports(track)
+# - broadcast_track(message, track, files, decisions)
+# - read_track(track)
+

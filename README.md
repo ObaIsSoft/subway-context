@@ -1,4 +1,4 @@
-# Subway Context 🚇
+# Subway Context
 
 > **On-demand, token-efficient context transit system connecting independent AI coding agents across multiple windows (Antigravity, Claude Code, OpenCode terminal).**
 
@@ -49,7 +49,7 @@ git clone https://github.com/ObaIsSoft/subway-context.git ~/Documents/dev/subway
 cd ~/Documents/dev/subway-context
 ```
 
-### 2. Universal 1-Click Auto-Connect ⚡
+### 2. Universal 1-Click Auto-Connect
 
 Run the universal installer to automatically detect and register Subway Context across all installed agents (**Claude Code**, **Antigravity**, and **OpenCode**) in one step:
 
@@ -62,16 +62,16 @@ _(Or simply tell Gemini / Claude: **"Connect Subway Context to my coding agents"
 Output:
 
 ```text
-🚇 Subway Context Universal Connector
+Subway Context Universal Connector
 
 Server binary: /Users/.../Documents/dev/subway-context/server.py
 Python runner: /usr/bin/python3
 
-  ✓ Claude Code           : Connected in ~/.claude.json
-  ✓ Antigravity (Gemini)  : Connected in ~/.gemini/config/mcp_config.json
-  ✓ OpenCode (Terminal)   : Connected in ~/.config/opencode/opencode.json & stubs synced
+  [+] Claude Code           : Connected in ~/.claude.json
+  [+] Antigravity (Gemini)  : Connected in ~/.gemini/config/mcp_config.json
+  [+] OpenCode (Terminal)   : Connected in ~/.config/opencode/opencode.json & stubs synced
 
-✓ Completed. 3 of 3 agent lines connected.
+[OK] Completed. 3 of 3 agent lines connected.
 ```
 
 Check connection status at any time:
@@ -174,7 +174,7 @@ Now you can simply refer to `@claude-main` in any command.
 
 ---
 
-## 4-Tier Station Aliasing System 🏷️
+## 4-Tier Station Aliasing System
 
 ![Subway 4-Tier Aliasing Hierarchy](assets/aliasing-hierarchy.svg)
 _Subway Context routes station requests through a 4-tier hierarchy: Explicit Pins -> Floating Heads -> Workspace Terminals -> Topic Slugs._
@@ -220,27 +220,29 @@ Drop a lightweight dispatch into another agent window's inbox so it picks up whe
 
 ---
 
-## Live Workspace Guard (Collision Shield) 🛡️
+## Live Workspace Guard (Collision Shield)
 
 When multiple autonomous agents (e.g. Claude Code in tab 1, OpenCode in terminal dock, and Antigravity in sidecar) run concurrently in the same repository, they risk **file collision**—clobbering and overwriting each other's edits.
 
 Subway Context provides an active **Workspace Guard** lease mechanism (`~/.subway-context/locks.json`):
 
-1. **`claim_file(filepath, holder, duration_seconds, purpose)`**:
+1. **`claim_file(filepath, holder, duration_seconds, purpose, baseline_commit, role)`**:
    - Acquires a time-limited lease (default: 300s) on a file.
    - If another agent tries to claim or edit the file while the lease is active, Subway Context raises an immediate collision warning with the holder's alias and expiry countdown:
      ```text
-     🚨 COLLISION WARNING: 'src/components/Header.tsx' is already leased to claude-main for 'Layout refactor'. 
+     [COLLISION WARNING] 'src/components/Header.tsx' is already leased to claude-main for 'Layout refactor'. 
      Lease expires in 240s. Do NOT overwrite or clobber until released or expired.
      ```
-2. **`release_file(filepath, holder)`**:
+2. **`signoff_file(filepath, verdict="approved"|"needs_work", notes="...")`**:
+   - Formally reviews completed changes and anchors them against git commits to prevent regressions.
+3. **`release_file(filepath, holder)`**:
    - Explicitly relinquishes the file lease once modifications and git commits are done.
-3. **`list_locks()`**:
+4. **`list_locks()`**:
    - Surfaces all active file leases across all agents with remaining lease timers and declared purposes.
 
 ---
 
-## Live Station Board HUD 🚇
+## Live Station Board HUD
 
 Subway Context includes a real-time, interactive **Station Departure Board HUD** available both in the terminal and as a cyber-transit dark-mode web dashboard.
 
@@ -265,29 +267,30 @@ Any agent can inspect the state of the entire multi-window fleet with a single c
 
 ```text
 ==============================================================================
-🚇 SUBWAY CONTEXT LIVE HUD — STATION DEPARTURE BOARD   [2026-11-01 03:28:28]
+SUBWAY CONTEXT LIVE HUD - STATION DEPARTURE BOARD   [2026-11-01 03:28:28]
 ==============================================================================
-[WORKSPACE GUARD — ACTIVE FILE LEASES]
-  🔒 src/components/Header.tsx       <- Held by claude-main (240s left) :: Layout refactor
+[WORKSPACE GUARD - ACTIVE FILE LEASES]
+  [LOCKED] src/components/Header.tsx       <- Held by claude-main (240s left) :: Layout refactor
 ------------------------------------------------------------------------------
 [AUTONOMOUS WORKER SWARM]
-  ⚙️  worker_a8f1e2  [OPENCODE] 🟢 RUNNING   Track: main   Role: Unit Tester
+  [*]  worker_a8f1e2  [OPENCODE] [RUNNING]   Track: main   Role: Unit Tester
 ------------------------------------------------------------------------------
 [SHARED CONTEXT TRACKS]
-  📡 Track 'main': 3 events. Latest from `claude-main`: Refactored Hero to CSS grid
+  [TRACK] 'main': 3 events. Latest from `claude-main`: Refactored Hero to CSS grid
 ==============================================================================
-🌐 Live Web HUD running at: http://localhost:7890
+Live Web HUD running at: http://localhost:7890
 ==============================================================================
 ```
 
 ---
 
-## Autonomous Worker Swarms & Delegation 🤖
+## Autonomous Worker Swarms & Delegation
 
 Subway Context enables agents to dynamically delegate tasks and spin up background subagents across different agent engines without manual terminal switching:
 
-### `spin_worker(role, prompt, provider, track)`
+### `spin_worker(role, prompt, provider, track, effort, mode)`
 - Dynamically discovers and invokes the optimal local agent CLI (`opencode`, `claude`, or creates Antigravity delegation).
+- Supports **Adaptive Complexity** (`effort="auto"|"low"|"medium"|"high"|"max"`) and **God Mode** (`mode="god"`).
 - Runs headless in background sessions with detached process trees.
 - Automatically routes stdout/stderr into structured logs (`~/.subway-context/workers/<worker_id>.log`).
 - Broadcasts the worker launch to the shared context track.
@@ -298,17 +301,17 @@ Subway Context enables agents to dynamically delegate tasks and spin up backgrou
 
 ---
 
-## Shared Context Tracks (Synchronized Decision Ledgers) 🛤️
+## Shared Context Tracks (Synchronized Decision Ledgers)
 
 Rather than forcing each agent to read the entire multi-thousand-turn conversation history of another window, Subway Context provides lightweight **Shared Decision Tracks** (`~/.subway-context/tracks/<track>.jsonl`).
 
 - **`join_track(track="main")`**: Subscribes an agent to a shared context track and catches it up on recent decisions.
-- **`broadcast_track(message, track="main", files=[...], decisions=[...])`**: Publishes a key milestone, architectural decision, or claimed file list to all collaborating agents.
+- **`broadcast_track(message, track="main", files=[...], decisions=[...])`**: Publishes a key milestone, architectural decision, or claimed file list to all collaborating agents. Automatically audits and broadcasts destructive commands (`rm`, `sudo`, `git reset`).
 - **`read_track(track="main", limit=15)`**: Zero-waste sync format returning high-density decisions and touched files across the entire multi-agent swarm.
 
 ---
 
-## Subagent Tracking & Deep Inspection 🤖
+## Subagent Tracking & Deep Inspection
 
 When agents spin up parallel subagents (e.g. Claude Code background `Agent` workers, Antigravity subagent swarms, or OpenCode child tasks):
 
