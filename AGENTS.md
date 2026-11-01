@@ -71,6 +71,50 @@ send_note(to="@claude-main", text="Finished refactoring auth. Check git diff.")
 check_notes()
 ```
 
+### E. Live Workspace Guard (Collision Shield)
+```python
+# 1. Acquire a temporary lease on a file before editing
+claim_file(filepath="src/components/Header.tsx", purpose="Layout refactor", duration_seconds=300)
+
+# 2. Release lease once edits and commits are complete
+release_file(filepath="src/components/Header.tsx")
+
+# 3. Check active leases across the fleet
+list_locks()
+```
+
+### F. Shared Decision Tracks
+```python
+# 1. Catch up on shared track state
+join_track(track="main")
+
+# 2. Broadcast a decision to all collaborating agents
+broadcast_track(
+    message="Switched router to CSS grid",
+    track="main",
+    files=["src/components/Header.tsx"],
+    decisions=["Keep mobile backward compatibility"]
+)
+
+# 3. Read synchronized decisions
+read_track(track="main", limit=10)
+```
+
+### G. Autonomous Worker Delegation & Live HUD
+```python
+# 1. Delegate a task to an autonomous worker subagent
+spin_worker(role="Unit Tester", prompt="Run pytest and report regressions", provider="auto", track="main")
+
+# 2. Check worker status or inspect logs
+worker_status(worker_id="worker_496c67")
+
+# 3. Collect final reports from completed workers
+collect_reports(track="main", wait=True)
+
+# 4. View live transit dashboard snapshot
+hud_status()
+```
+
 ---
 
 ## 4. Grounding & Code Inspection

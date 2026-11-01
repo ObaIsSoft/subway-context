@@ -30,21 +30,30 @@ from __future__ import annotations
 
 import datetime as _dt
 import glob
+import http.server
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import traceback
+import urllib.parse
+import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("SUBWAY_CLAUDE_DIR", os.path.join(HOME, ".claude"))
 AGY_DIR = os.environ.get("SUBWAY_AGY_DIR", os.path.join(HOME, ".gemini", "antigravity"))
 OPENCODE_DIR = os.environ.get("SUBWAY_OPENCODE_DIR", os.path.join(HOME, ".local", "share", "opencode"))
 SUBWAY_DIR = os.environ.get("SUBWAY_DIR", os.path.join(HOME, ".subway-context"))
+LOCKS_FILE = os.path.join(SUBWAY_DIR, "locks.json")
+WORKERS_DIR = os.path.join(SUBWAY_DIR, "workers")
+TRACKS_DIR = os.path.join(SUBWAY_DIR, "tracks")
 
 DEFAULT_MAX_CHARS = 30000
 MAX_THOUGHT_CHARS = 1200
@@ -126,6 +135,8 @@ def extract_files_from_text(text: str) -> Set[str]:
 def _ensure_subway_dir() -> None:
     os.makedirs(SUBWAY_DIR, exist_ok=True)
     os.makedirs(os.path.join(SUBWAY_DIR, "inbox"), exist_ok=True)
+    os.makedirs(WORKERS_DIR, exist_ok=True)
+    os.makedirs(TRACKS_DIR, exist_ok=True)
 
 
 def _load_json(filename: str) -> Dict[str, Any]:
@@ -1473,6 +1484,1236 @@ def t_whoami() -> str:
     return ("Active on host. Antigravity agents: check your Conversation ID in context.")
 
 
+# --------------------------------------------------------------------------
+# Dynamic Binary Discovery
+# --------------------------------------------------------------------------
+
+def find_claude_binary() -> Optional[str]:
+    """Dynamically locate Claude Code binary across system PATH, user bins, or IDE extension bundles."""
+    env_bin = os.environ.get("CLAUDE_BIN")
+    if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
+        return env_bin
+    p = shutil.which("claude")
+    if p:
+        return p
+    candidates = [
+        os.path.join(HOME, ".local", "bin", "claude"),
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+        *glob.glob(os.path.join(HOME, ".nvm", "versions", "node", "*", "bin", "claude")),
+        *glob.glob(os.path.join(HOME, ".npm-global", "bin", "claude")),
+        *glob.glob(os.path.join(HOME, ".vscode", "extensions", "anthropic.claude-code-*", "resources", "native-binary", "claude")),
+        *glob.glob(os.path.join(HOME, ".antigravity-ide", "extensions", "anthropic.claude-code-*", "resources", "native-binary", "claude")),
+        os.path.join(HOME, "Library", "Application Support", "Claude", "claude"),
+    ]
+    for c in candidates:
+        if os.path.exists(c) or os.path.lexists(c):
+            return c
+    return None
+
+
+def find_opencode_binary() -> Optional[str]:
+    """Dynamically locate OpenCode / OpenCode2 binary across PATH, nvm, or local bins."""
+    env_bin = os.environ.get("OPENCODE_BIN")
+    if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
+        return env_bin
+    for name in ("opencode", "opencode2"):
+        p = shutil.which(name)
+        if p:
+            return p
+    candidates = [
+        *glob.glob(os.path.join(HOME, ".nvm", "versions", "node", "*", "bin", "opencode*")),
+        *glob.glob(os.path.join(HOME, ".local", "bin", "opencode*")),
+        "/usr/local/bin/opencode",
+        "/usr/local/bin/opencode2",
+        "/opt/homebrew/bin/opencode",
+        "/opt/homebrew/bin/opencode2",
+    ]
+    for c in candidates:
+        if os.path.exists(c) or os.path.lexists(c):
+            return c
+    return None
+
+
+# --------------------------------------------------------------------------
+# Feature B: Live Workspace Guard (File Leases & Collision Shield)
+# --------------------------------------------------------------------------
+
+def _clean_locks(locks_data: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    active = {}
+    for path, info in locks_data.get("locks", {}).items():
+        if info.get("expires_at", 0) > now:
+            active[path] = info
+    locks_data["locks"] = active
+    return locks_data
+
+
+def load_locks() -> Dict[str, Any]:
+    _ensure_subway_dir()
+    data = _load_json("locks.json")
+    if not isinstance(data, dict) or "locks" not in data:
+        data = {"locks": {}}
+    return _clean_locks(data)
+
+
+def save_locks(data: Dict[str, Any]) -> None:
+    _ensure_subway_dir()
+    _save_json("locks.json", data)
+
+
+def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, purpose: str = "") -> str:
+    """Acquire a temporary workspace lease on a file to prevent multi-agent collision."""
+    if not filepath:
+        return "Error: filepath is required."
+    clean_path = os.path.normpath(filepath.strip())
+    if not holder:
+        me = detect_self()
+        holder = me["id"][:8] if me else "unknown-station"
+
+    try:
+        duration = max(10, min(int(duration_seconds), 3600))
+    except Exception:
+        duration = 300
+
+    now = time.time()
+    expires_at = now + duration
+
+    data = load_locks()
+    locks = data.get("locks", {})
+    existing = locks.get(clean_path)
+
+    if existing and existing.get("expires_at", 0) > now:
+        prev_holder = existing.get("holder", "another-agent")
+        if prev_holder != holder:
+            rem = int(existing["expires_at"] - now)
+            purp_str = f" for '{existing.get('purpose')}'" if existing.get("purpose") else ""
+            return (f"🚨 COLLISION WARNING: '{clean_path}' is already leased to {prev_holder}{purp_str}. "
+                    f"Lease expires in {rem}s. Do NOT overwrite or clobber until released or expired.")
+
+    locks[clean_path] = {
+        "holder": holder,
+        "acquired_at": now,
+        "expires_at": expires_at,
+        "duration": duration,
+        "purpose": purpose or "Active modification",
+    }
+    data["locks"] = locks
+    save_locks(data)
+    exp_iso = _dt.datetime.fromtimestamp(expires_at).astimezone().strftime("%H:%M:%S")
+    return (f"🔒 LEASE ACQUIRED: '{clean_path}' claimed by {holder} until {exp_iso} ({duration}s). "
+            f"Purpose: {purpose or 'Active modification'}.")
+
+
+def t_release_file(filepath: str, holder: str = "") -> str:
+    """Release a workspace file lease."""
+    if not filepath:
+        return "Error: filepath is required."
+    clean_path = os.path.normpath(filepath.strip())
+    data = load_locks()
+    locks = data.get("locks", {})
+    if clean_path not in locks:
+        return f"File '{clean_path}' was not currently leased."
+
+    current = locks[clean_path]
+    if holder and current.get("holder") and current.get("holder") != holder:
+        return f"Warning: '{clean_path}' is held by {current.get('holder')}, not {holder}. Lease not released."
+
+    del locks[clean_path]
+    data["locks"] = locks
+    save_locks(data)
+    return f"🔓 RELEASED: '{clean_path}' is now free for modification by any agent."
+
+
+def t_list_locks() -> str:
+    """List all currently active file leases across all agents."""
+    data = load_locks()
+    save_locks(data)
+    locks = data.get("locks", {})
+    if not locks:
+        return "No active file leases. All files are currently free for modification."
+    now = time.time()
+    lines = ["# Active Workspace File Leases (Workspace Guard)", ""]
+    for path, info in sorted(locks.items(), key=lambda x: x[1].get("expires_at", 0)):
+        rem = max(0, int(info.get("expires_at", 0) - now))
+        h = info.get("holder", "unknown")
+        purp = info.get("purpose", "")
+        lines.append(f"- `🔒 {path}` — held by **{h}** ({rem}s remaining) :: {purp}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Shared Context Tracks (~/.subway-context/tracks/)
+# --------------------------------------------------------------------------
+
+def _track_file(track: str) -> str:
+    _ensure_subway_dir()
+    clean = re.sub(r"[^\w-]", "", track.strip().lower()) or "main"
+    return os.path.join(TRACKS_DIR, f"{clean}.jsonl")
+
+
+def t_join_track(track: str = "main", station_id: str = "") -> str:
+    """Subscribe a station to a shared context track and retrieve current track state."""
+    clean_track = re.sub(r"[^\w-]", "", track.strip().lower()) or "main"
+    if not station_id:
+        me = detect_self()
+        station_id = me["id"][:8] if me else "unknown"
+
+    sub_file = os.path.join(TRACKS_DIR, f"{clean_track}.subscribers.json")
+    subs: List[str] = []
+    if os.path.exists(sub_file):
+        try:
+            with open(sub_file, "r", encoding="utf-8") as f:
+                subs = json.load(f)
+        except Exception:
+            subs = []
+    if station_id not in subs:
+        subs.append(station_id)
+        with open(sub_file, "w", encoding="utf-8") as f:
+            json.dump(subs, f, indent=2)
+
+    history = t_read_track(track=clean_track, limit=5)
+    return (f"🚉 Joined shared context track '{clean_track}' as station `{station_id}`. "
+            f"Active subscribers: {len(subs)}.\n\n{history}")
+
+
+def t_broadcast_track(message: str, track: str = "main", files: Optional[List[str]] = None,
+                      decisions: Optional[List[str]] = None, station_id: str = "") -> str:
+    """Broadcast a decision, commitment, or status update to a shared multi-agent track."""
+    if not message:
+        return "Error: message is required."
+    clean_track = re.sub(r"[^\w-]", "", track.strip().lower()) or "main"
+    if not station_id:
+        me = detect_self()
+        station_id = me["id"][:8] if me else "host"
+
+    rec = {
+        "id": uuid.uuid4().hex[:8],
+        "timestamp": time.time(),
+        "iso": _dt.datetime.now().astimezone().strftime("%H:%M:%S"),
+        "station_id": station_id,
+        "message": message.strip(),
+        "files": files or [],
+        "decisions": decisions or [],
+    }
+    tf = _track_file(clean_track)
+    with open(tf, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+    file_note = f" (files: {', '.join(files)})" if files else ""
+    return f"📡 Broadcast posted to track '{clean_track}' by `{station_id}`: {message}{file_note}"
+
+
+def t_read_track(track: str = "main", limit: int = 15, since_timestamp: float = 0.0) -> str:
+    """Read the latest synchronized decisions and status updates from a shared track."""
+    clean_track = re.sub(r"[^\w-]", "", track.strip().lower()) or "main"
+    tf = _track_file(clean_track)
+    if not os.path.exists(tf) or os.path.getsize(tf) == 0:
+        return f"Track '{clean_track}' is currently empty. Broadcast decisions with broadcast_track()."
+
+    entries = []
+    try:
+        with open(tf, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        e = json.loads(line)
+                        if e.get("timestamp", 0) >= since_timestamp:
+                            entries.append(e)
+                    except Exception:
+                        continue
+    except Exception as exc:
+        return f"Error reading track '{clean_track}': {exc}"
+
+    if not entries:
+        return f"No entries in track '{clean_track}' since timestamp {since_timestamp}."
+
+    recent = entries[-int(limit):]
+    lines = [f"# Shared Context Track: '{clean_track}' ({len(recent)} recent dispatches)", ""]
+    for e in recent:
+        iso = e.get("iso") or _dt.datetime.fromtimestamp(e.get("timestamp", time.time())).strftime("%H:%M:%S")
+        st = e.get("station_id", "unknown")
+        msg = e.get("message", "")
+        lines.append(f"- **[{iso}] `{st}`**: {msg}")
+        fl = e.get("files")
+        if fl:
+            lines.append(f"  - *Files touched/claimed*: {', '.join(f'`{f}`' for f in fl)}")
+        decs = e.get("decisions")
+        if decs:
+            for d in decs:
+                lines.append(f"  - *Decision*: {d}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Automated Worker Spawner & Delegation
+# --------------------------------------------------------------------------
+
+def _worker_file(worker_id: str) -> str:
+    _ensure_subway_dir()
+    return os.path.join(WORKERS_DIR, f"{worker_id}.json")
+
+
+def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Check if the worker process is still alive and update metadata."""
+    if meta.get("status") == "running":
+        pid = meta.get("pid")
+        if pid:
+            alive = False
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except (OSError, ProcessLookupError):
+                alive = False
+
+            if not alive:
+                meta["status"] = "completed"
+                meta["completed_at"] = _dt.datetime.now().astimezone().isoformat()
+                log_file = meta.get("log_file")
+                if log_file and os.path.exists(log_file):
+                    try:
+                        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                            lines = f.readlines()
+                            tail = "".join(lines[-10:])
+                            meta["report"] = tail.strip()
+                    except Exception:
+                        pass
+                try:
+                    with open(_worker_file(meta["id"]), "w", encoding="utf-8") as f:
+                        json.dump(meta, f, indent=2)
+                except Exception:
+                    pass
+    return meta
+
+
+def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
+                  project_dir: str = "", timeout_seconds: int = 600) -> str:
+    """Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) and link it to a shared track."""
+    if not role or not prompt:
+        return "Error: role and prompt are required."
+    _ensure_subway_dir()
+
+    cwd = project_dir or os.getcwd()
+    if not os.path.isdir(cwd):
+        cwd = HOME
+
+    selected_provider = provider.lower()
+    bin_path = None
+
+    if selected_provider == "auto":
+        opencode_bin = find_opencode_binary()
+        claude_bin = find_claude_binary()
+        if opencode_bin:
+            selected_provider = "opencode"
+            bin_path = opencode_bin
+        elif claude_bin:
+            selected_provider = "claude"
+            bin_path = claude_bin
+        else:
+            selected_provider = "antigravity"
+    elif selected_provider in ("claude", "claude-code"):
+        selected_provider = "claude"
+        bin_path = find_claude_binary()
+    elif selected_provider in ("opencode", "opencode2"):
+        selected_provider = "opencode"
+        bin_path = find_opencode_binary()
+    elif selected_provider == "antigravity":
+        pass
+    else:
+        return f"Error: unknown provider '{provider}'. Must be 'auto', 'claude', 'opencode', or 'antigravity'."
+
+    worker_id = f"worker_{uuid.uuid4().hex[:6]}"
+    log_file = os.path.join(WORKERS_DIR, f"{worker_id}.log")
+
+    if selected_provider == "antigravity":
+        meta = {
+            "id": worker_id,
+            "role": role,
+            "provider": "antigravity",
+            "track": track,
+            "project_dir": cwd,
+            "status": "pending_dispatch",
+            "pid": None,
+            "created_at": _dt.datetime.now().astimezone().isoformat(),
+            "completed_at": None,
+            "prompt": prompt,
+            "log_file": log_file,
+            "report": "Delegation prepared. Call invoke_subagent() to execute inside Antigravity.",
+        }
+        with open(_worker_file(worker_id), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        t_broadcast_track(f"Delegated task '{role}' to Antigravity worker `{worker_id}`", track=track, station_id=worker_id)
+        return (f"🚀 Antigravity Worker `{worker_id}` initialized for role '{role}'.\n"
+                f"Invoke via: invoke_subagent(Role='{role}', Prompt='{prompt}')")
+
+    if not bin_path:
+        return f"Error: Could not locate binary for '{selected_provider}'. Ensure it is installed and on PATH."
+
+    if selected_provider == "claude":
+        cmd = [bin_path, "--dangerously-skip-permissions", "-p", prompt]
+    else:
+        cmd = [bin_path, "run", "--auto", "--title", f"Subway: {role}", prompt]
+
+    try:
+        out_f = open(log_file, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=out_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        pid = proc.pid
+    except Exception as exc:
+        return f"Error spawning worker process: {exc}"
+
+    meta = {
+        "id": worker_id,
+        "role": role,
+        "provider": selected_provider,
+        "track": track,
+        "project_dir": cwd,
+        "status": "running",
+        "pid": pid,
+        "created_at": _dt.datetime.now().astimezone().isoformat(),
+        "completed_at": None,
+        "prompt": prompt,
+        "log_file": log_file,
+        "report": "",
+    }
+    with open(_worker_file(worker_id), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    t_broadcast_track(
+        f"Spun {selected_provider.upper()} worker `{worker_id}` (PID {pid}) on track '{track}' for role: '{role}'",
+        track=track,
+        station_id=worker_id,
+    )
+
+    return (f"🚀 SPUN WORKER: `{worker_id}` [{selected_provider.upper()}] (PID {pid})\n"
+            f"- Role: **{role}**\n"
+            f"- Track: **{track}**\n"
+            f"- Working Dir: `{cwd}`\n"
+            f"- Live Log: `{log_file}`\n"
+            f"Check progress anytime with worker_status(worker_id='{worker_id}') or collect_reports().")
+
+
+def t_worker_status(worker_id: str = "", track: str = "") -> str:
+    """Check the execution status and output tail of worker subagents."""
+    _ensure_subway_dir()
+    files = glob.glob(os.path.join(WORKERS_DIR, "worker_*.json"))
+    if not files:
+        return "No workers have been spawned yet."
+
+    records = []
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                meta = _update_worker_status(meta)
+                records.append(meta)
+        except Exception:
+            continue
+
+    records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+    if worker_id:
+        match = [r for r in records if r.get("id") == worker_id or worker_id in r.get("id", "")]
+        if not match:
+            return f"Worker `{worker_id}` not found."
+        m = match[0]
+        status_icon = "🟢 RUNNING" if m.get("status") == "running" else "✅ COMPLETED" if m.get("status") == "completed" else "⚪ " + m.get("status", "unknown")
+        out = [
+            f"# Worker Detail: `{m['id']}`",
+            f"- **Role**: {m.get('role')}",
+            f"- **Provider**: {m.get('provider', '').upper()}",
+            f"- **Status**: {status_icon}",
+            f"- **PID**: {m.get('pid')}",
+            f"- **Track**: {m.get('track')}",
+            f"- **Directory**: `{m.get('project_dir')}`",
+            f"- **Created At**: {m.get('created_at')}",
+            f"- **Completed At**: {m.get('completed_at') or 'in progress'}",
+            "",
+            "## Task Prompt",
+            f"> {m.get('prompt')}",
+            "",
+            "## Output Log Tail",
+        ]
+        log_f = m.get("log_file")
+        if log_f and os.path.exists(log_f):
+            try:
+                with open(log_f, "r", encoding="utf-8", errors="replace") as lf:
+                    lines = lf.readlines()
+                    tail = "".join(lines[-25:])
+                    out.append(f"```text\n{tail.strip() or '(no output yet)'}\n```")
+            except Exception as e:
+                out.append(f"*(error reading log: {e})*")
+        else:
+            out.append("*(log file not found)*")
+        return "\n".join(out)
+
+    if track:
+        records = [r for r in records if r.get("track") == track]
+
+    lines = ["# Autonomous Subway Workers", ""]
+    for r in records[:15]:
+        st = "🟢 RUNNING" if r.get("status") == "running" else "✅ DONE" if r.get("status") == "completed" else "⚪ " + r.get("status", "")
+        lines.append(f"- `{r.get('id')}` [{r.get('provider', '').upper()}] **{r.get('role')}** :: {st} (PID {r.get('pid')}, track: {r.get('track')})")
+    return "\n".join(lines)
+
+
+def t_collect_reports(track: str = "main", wait: bool = False) -> str:
+    """Collect final reports, files modified, and decisions from workers on a track."""
+    _ensure_subway_dir()
+    if wait:
+        start_wait = time.time()
+        while time.time() - start_wait < 15:
+            files = glob.glob(os.path.join(WORKERS_DIR, "worker_*.json"))
+            any_running = False
+            for fp in files:
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        m = json.load(f)
+                        m = _update_worker_status(m)
+                        if (track == "all" or m.get("track") == track) and m.get("status") == "running":
+                            any_running = True
+                except Exception:
+                    continue
+            if not any_running:
+                break
+            time.sleep(1.0)
+
+    files = glob.glob(os.path.join(WORKERS_DIR, "worker_*.json"))
+    records = []
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                m = json.load(f)
+                m = _update_worker_status(m)
+                if track == "all" or m.get("track") == track:
+                    records.append(m)
+        except Exception:
+            continue
+
+    if not records:
+        return f"No workers found for track '{track}'."
+
+    records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    out = [f"# Worker Reports for Track: '{track}'", ""]
+    for m in records:
+        icon = "🟢" if m.get("status") == "running" else "✅" if m.get("status") == "completed" else "⚠️"
+        out.append(f"## {icon} `{m['id']}` — {m.get('role')} ({m.get('provider', '').upper()})")
+        out.append(f"- **Status**: {m.get('status')} (PID {m.get('pid')})")
+        out.append(f"- **Completed**: {m.get('completed_at') or 'in progress'}")
+        log_f = m.get("log_file")
+        if log_f and os.path.exists(log_f):
+            try:
+                with open(log_f, "r", encoding="utf-8", errors="replace") as lf:
+                    lines = lf.readlines()
+                    tail = "".join(lines[-15:])
+                    out.append(f"\n```text\n{tail.strip() or '(no output yet)'}\n```\n")
+            except Exception:
+                pass
+        out.append("---")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# Feature C: Live Station Board HUD (Dashboard & HTTP Server)
+# --------------------------------------------------------------------------
+
+def get_hud_data(project: str = "") -> Dict[str, Any]:
+    """Compile a full snapshot of the Subway transit network for the HUD."""
+    _ensure_subway_dir()
+    chats_data = t_list_chats(source="all", project=project, limit=12)
+    locks = load_locks().get("locks", {})
+    worker_files = glob.glob(os.path.join(WORKERS_DIR, "worker_*.json"))
+    workers = []
+    for fp in worker_files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                w = json.load(f)
+                w = _update_worker_status(w)
+                workers.append(w)
+        except Exception:
+            continue
+    workers.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+    tracks_summary = {}
+    for tf in glob.glob(os.path.join(TRACKS_DIR, "*.jsonl")):
+        tname = os.path.basename(tf).replace(".jsonl", "")
+        cnt = 0
+        last_entry = None
+        try:
+            with open(tf, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        cnt += 1
+                        try:
+                            last_entry = json.loads(line.strip())
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        tracks_summary[tname] = {"count": cnt, "last_entry": last_entry}
+
+    return {
+        "version": VERSION,
+        "timestamp": time.time(),
+        "time_iso": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+        "locks": locks,
+        "workers": workers[:15],
+        "tracks": tracks_summary,
+        "raw_stations_text": chats_data,
+    }
+
+
+def t_hud_status(project: str = "") -> str:
+    """Display an ASCII departures-board style dashboard of the Subway transit network."""
+    data = get_hud_data(project=project)
+    now = time.time()
+    locks = data.get("locks", {})
+    workers = data.get("workers", [])
+    tracks = data.get("tracks", {})
+
+    sep = "=" * 78
+    subsep = "-" * 78
+    lines = [
+        sep,
+        f"🚇 SUBWAY CONTEXT LIVE HUD — STATION DEPARTURE BOARD   [{data['time_iso']}]",
+        sep,
+        "[WORKSPACE GUARD — ACTIVE FILE LEASES]",
+    ]
+    if not locks:
+        lines.append("  (No files locked. Workspace collision-free.)")
+    else:
+        for p, info in locks.items():
+            rem = max(0, int(info.get("expires_at", 0) - now))
+            h = info.get("holder", "unknown")
+            lines.append(f"  🔒 {p:<36} <- Held by {h} ({rem}s left) :: {info.get('purpose', '')}")
+
+    lines.extend([subsep, "[AUTONOMOUS WORKER SWARM]"])
+    if not workers:
+        lines.append("  (No workers spawned. Run spin_worker() to delegate.)")
+    else:
+        for w in workers[:6]:
+            st = "🟢 RUNNING" if w.get("status") == "running" else "✅ DONE"
+            prov = w.get("provider", "").upper()
+            lines.append(f"  ⚙️  {w['id']:<14} [{prov:<8}] {st:<10} Track: {w.get('track', 'main'):<6} Role: {w.get('role')}")
+
+    lines.extend([subsep, "[SHARED CONTEXT TRACKS]"])
+    if not tracks:
+        lines.append("  (No active tracks. Join or broadcast with join_track() / broadcast_track().)")
+    else:
+        for tname, tinfo in tracks.items():
+            last = tinfo.get("last_entry") or {}
+            msg = last.get("message", "No dispatches yet")
+            st_id = last.get("station_id", "none")
+            lines.append(f"  📡 Track '{tname}': {tinfo.get('count', 0)} events. Latest from `{st_id}`: {msg}")
+
+    lines.extend([
+        sep,
+        "🌐 Live Web HUD running at: http://localhost:7890",
+        sep,
+    ])
+    return "\n".join(lines)
+
+
+HUD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Subway Context — Live Station Board HUD</title>
+<style>
+:root {
+  --bg: #090d16;
+  --surface: #111827;
+  --surface-hover: #1e293b;
+  --border: #1f293d;
+  --text: #f9fafb;
+  --muted: #9ca3af;
+  --cyan: #06b6d4;
+  --emerald: #10b981;
+  --amber: #f59e0b;
+  --rose: #f43f5e;
+  --purple: #8b5cf6;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "JetBrains Mono", monospace;
+  background-color: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  padding: 24px;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 12px; }
+.logo-icon { font-size: 28px; }
+.brand h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+.brand-sub { font-size: 13px; color: var(--muted); }
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  color: var(--emerald);
+  padding: 4px 12px;
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--emerald);
+  box-shadow: 0 0 8px var(--emerald);
+}
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.metric-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+.metric-card .title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+.metric-card .val { font-size: 28px; font-weight: 700; margin-top: 4px; color: var(--cyan); }
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 24px;
+}
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.panel-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+}
+.badge-amber { background: rgba(245, 158, 11, 0.15); color: var(--amber); border-color: rgba(245, 158, 11, 0.3); }
+.badge-emerald { background: rgba(16, 185, 129, 0.15); color: var(--emerald); border-color: rgba(16, 185, 129, 0.3); }
+.badge-cyan { background: rgba(6, 182, 212, 0.15); color: var(--cyan); border-color: rgba(6, 182, 212, 0.3); }
+.table-wrap { overflow-x: auto; width: 100%; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+th { color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 500; font-size: 12px; }
+td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+tr:hover td { background: var(--surface-hover); }
+.btn {
+  background: var(--surface-hover);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn:hover { background: var(--cyan); color: #000; border-color: var(--cyan); }
+.btn-danger { color: var(--rose); }
+.btn-danger:hover { background: var(--rose); color: #fff; border-color: var(--rose); }
+.form-row { display: flex; gap: 8px; margin-top: 14px; }
+input, select, textarea {
+  background: #0d121d;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--cyan); }
+.track-feed { max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.track-item {
+  background: #0d121d;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+.track-time { color: var(--muted); font-size: 11px; margin-bottom: 4px; display: flex; justify-content: space-between; }
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100;
+}
+.modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto;
+}
+pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; color: #a5f3fc; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo-icon">🚇</div>
+    <div>
+      <h1>SUBWAY CONTEXT LIVE HUD</h1>
+      <div class="brand-sub">Autonomous Multi-Agent Workspace Shield & Station Board</div>
+    </div>
+  </div>
+  <div style="display: flex; gap: 12px; align-items: center;">
+    <div class="status-pill"><div class="pulse-dot"></div> STATION ACTIVE</div>
+    <button class="btn" onclick="fetchStatus()">Refresh</button>
+  </div>
+</header>
+
+<div class="metrics-grid">
+  <div class="metric-card">
+    <div class="title">Active File Leases</div>
+    <div class="val" id="metric-locks" style="color: var(--amber);">0</div>
+  </div>
+  <div class="metric-card">
+    <div class="title">Worker Swarms</div>
+    <div class="val" id="metric-workers" style="color: var(--purple);">0</div>
+  </div>
+  <div class="metric-card">
+    <div class="title">Shared Tracks</div>
+    <div class="val" id="metric-tracks" style="color: var(--cyan);">0</div>
+  </div>
+  <div class="metric-card">
+    <div class="title">Last Heartbeat</div>
+    <div class="val" id="metric-time" style="font-size: 16px; color: var(--muted); margin-top: 12px;">--:--:--</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Panel 1: Workspace Guard -->
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">🛡️ Workspace Guard (File Leases)</div>
+      <span class="badge badge-amber" id="lock-count-badge">0 active</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>File Path</th>
+            <th>Holder</th>
+            <th>Expires In</th>
+            <th>Purpose</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="locks-body">
+          <tr><td colspan="5" style="color: var(--muted); text-align: center;">No active file leases. All files free for modification.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <form id="claim-form" class="form-row" onsubmit="handleClaim(event)">
+      <input type="text" id="claim-path" placeholder="File path (e.g. src/index.ts)" style="flex: 2;" required />
+      <input type="text" id="claim-holder" placeholder="Holder (@claude-main)" style="flex: 1;" />
+      <input type="number" id="claim-duration" placeholder="300s" value="300" style="width: 70px;" />
+      <button type="submit" class="btn">Claim</button>
+    </form>
+  </div>
+
+  <!-- Panel 2: Worker Swarm -->
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">⚙️ Autonomous Worker Swarm</div>
+      <span class="badge badge-cyan" id="worker-count-badge">0 workers</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Worker ID</th>
+            <th>Provider</th>
+            <th>Status</th>
+            <th>Role</th>
+            <th>PID</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="workers-body">
+          <tr><td colspan="6" style="color: var(--muted); text-align: center;">No worker subagents running.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <form id="spawn-form" class="form-row" onsubmit="handleSpawn(event)">
+      <input type="text" id="spawn-role" placeholder="Role (e.g. Test Runner)" style="flex: 1;" required />
+      <input type="text" id="spawn-prompt" placeholder="Instruction prompt..." style="flex: 2;" required />
+      <select id="spawn-provider">
+        <option value="auto">Auto</option>
+        <option value="opencode">OpenCode</option>
+        <option value="claude">Claude</option>
+        <option value="antigravity">Antigravity</option>
+      </select>
+      <button type="submit" class="btn">Spawn</button>
+    </form>
+  </div>
+
+  <!-- Panel 3: Shared Decision Tracks -->
+  <div class="panel" style="grid-column: 1 / -1;">
+    <div class="panel-head">
+      <div class="panel-title">📡 Shared Decision Ledger (Track: <span id="current-track-name" style="color: var(--cyan);">main</span>)</div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn" onclick="switchTrack('main')">main</button>
+        <button class="btn" onclick="switchTrack('pr')">pr</button>
+      </div>
+    </div>
+    <div class="track-feed" id="track-feed">
+      <div style="color: var(--muted); text-align: center; padding: 20px;">No broadcast entries on this track.</div>
+    </div>
+    <form id="broadcast-form" class="form-row" onsubmit="handleBroadcast(event)" style="margin-top: 14px;">
+      <input type="text" id="bc-msg" placeholder="Broadcast decision or milestone to all agents..." style="flex: 3;" required />
+      <input type="text" id="bc-files" placeholder="Files touched (comma separated)" style="flex: 2;" />
+      <button type="submit" class="btn">Broadcast</button>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+      <h3 id="modal-title" style="font-size: 16px;">Log Output</h3>
+      <button class="btn" onclick="closeModal()">Close</button>
+    </div>
+    <pre id="modal-content">Loading...</pre>
+  </div>
+</div>
+
+<script>
+let currentTrack = "main";
+
+async function fetchStatus() {
+  try {
+    const res = await fetch("/api/status");
+    const data = await res.json();
+    renderStatus(data);
+  } catch (e) {
+    console.error("Status fetch failed", e);
+  }
+}
+
+function renderStatus(data) {
+  document.getElementById("metric-time").innerText = data.time_iso.split(" ")[1] || "--:--:--";
+  
+  // Render Locks
+  const locks = data.locks || {};
+  const lockKeys = Object.keys(locks);
+  document.getElementById("metric-locks").innerText = lockKeys.length;
+  document.getElementById("lock-count-badge").innerText = lockKeys.length + " active";
+  
+  const locksBody = document.getElementById("locks-body");
+  if (lockKeys.length === 0) {
+    locksBody.innerHTML = '<tr><td colspan="5" style="color: var(--muted); text-align: center;">No active file leases. All files free.</td></tr>';
+  } else {
+    const now = Date.now() / 1000;
+    locksBody.innerHTML = lockKeys.map(k => {
+      const item = locks[k];
+      const rem = Math.max(0, Math.floor(item.expires_at - now));
+      return `<tr>
+        <td><code>🔒 ${k}</code></td>
+        <td><span class="badge badge-cyan">${item.holder}</span></td>
+        <td><span style="color: ${rem < 30 ? 'var(--rose)' : 'var(--amber)'}; font-weight: 600;">${rem}s</span></td>
+        <td style="color: var(--muted);">${item.purpose || ''}</td>
+        <td><button class="btn btn-danger" onclick="releaseLock('${k}', '${item.holder}')">Release</button></td>
+      </tr>`;
+    }).join("");
+  }
+
+  // Render Workers
+  const workers = data.workers || [];
+  document.getElementById("metric-workers").innerText = workers.length;
+  document.getElementById("worker-count-badge").innerText = workers.length + " workers";
+  
+  const workersBody = document.getElementById("workers-body");
+  if (workers.length === 0) {
+    workersBody.innerHTML = '<tr><td colspan="6" style="color: var(--muted); text-align: center;">No worker subagents spawned.</td></tr>';
+  } else {
+    workersBody.innerHTML = workers.map(w => {
+      const isRunning = w.status === 'running';
+      const statusBadge = isRunning
+        ? '<span class="badge badge-emerald">RUNNING</span>'
+        : '<span class="badge">DONE</span>';
+      return `<tr>
+        <td><code>${w.id}</code></td>
+        <td><span class="badge badge-purple">${(w.provider || '').toUpperCase()}</span></td>
+        <td>${statusBadge}</td>
+        <td><strong>${w.role}</strong></td>
+        <td>${w.pid || '-'}</td>
+        <td><button class="btn" onclick="viewWorkerLog('${w.id}')">Log</button></td>
+      </tr>`;
+    }).join("");
+  }
+
+  // Render Tracks count
+  const tracks = data.tracks || {};
+  document.getElementById("metric-tracks").innerText = Object.keys(tracks).length;
+}
+
+async function loadTrackFeed() {
+  try {
+    const res = await fetch(`/api/track?name=${currentTrack}`);
+    const data = await res.json();
+    const feed = document.getElementById("track-feed");
+    const lines = (data.content || '').split('\\n');
+    const items = lines.filter(l => l.startsWith('- '));
+    if (items.length === 0) {
+      feed.innerHTML = '<div style="color: var(--muted); text-align: center; padding: 20px;">No broadcast entries on this track.</div>';
+    } else {
+      feed.innerHTML = items.map(it => {
+        return `<div class="track-item">${it.replace(/^- /, '')}</div>`;
+      }).join("");
+    }
+  } catch (e) {
+    console.error("Track feed load error", e);
+  }
+}
+
+async function handleClaim(e) {
+  e.preventDefault();
+  const path = document.getElementById("claim-path").value;
+  const holder = document.getElementById("claim-holder").value;
+  const duration = parseInt(document.getElementById("claim-duration").value || "300");
+  await fetch("/api/claim", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({filepath: path, holder: holder, duration: duration})
+  });
+  document.getElementById("claim-path").value = "";
+  fetchStatus();
+}
+
+async function releaseLock(path, holder) {
+  await fetch("/api/release", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({filepath: path, holder: holder})
+  });
+  fetchStatus();
+}
+
+async function handleSpawn(e) {
+  e.preventDefault();
+  const role = document.getElementById("spawn-role").value;
+  const prompt = document.getElementById("spawn-prompt").value;
+  const provider = document.getElementById("spawn-provider").value;
+  await fetch("/api/spawn", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({role: role, prompt: prompt, provider: provider, track: currentTrack})
+  });
+  document.getElementById("spawn-role").value = "";
+  document.getElementById("spawn-prompt").value = "";
+  fetchStatus();
+}
+
+async function handleBroadcast(e) {
+  e.preventDefault();
+  const msg = document.getElementById("bc-msg").value;
+  const filesRaw = document.getElementById("bc-files").value;
+  const files = filesRaw ? filesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  await fetch("/api/broadcast", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({message: msg, track: currentTrack, files: files, station_id: "hud-admin"})
+  });
+  document.getElementById("bc-msg").value = "";
+  document.getElementById("bc-files").value = "";
+  loadTrackFeed();
+}
+
+function switchTrack(trackName) {
+  currentTrack = trackName;
+  document.getElementById("current-track-name").innerText = trackName;
+  loadTrackFeed();
+}
+
+async function viewWorkerLog(id) {
+  document.getElementById("modal-title").innerText = `Log Tail: ${id}`;
+  document.getElementById("modal-content").innerText = "Loading...";
+  document.getElementById("modal-overlay").style.display = "flex";
+  try {
+    const res = await fetch(`/api/worker_log?id=${id}`);
+    const data = await res.json();
+    document.getElementById("modal-content").innerText = data.log || "(empty log)";
+  } catch (e) {
+    document.getElementById("modal-content").innerText = `Error: ${e}`;
+  }
+}
+
+function closeModal() {
+  document.getElementById("modal-overlay").style.display = "none";
+}
+
+fetchStatus();
+loadTrackFeed();
+setInterval(fetchStatus, 2000);
+setInterval(loadTrackFeed, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def send_json(self, data: Any, status: int = 200) -> None:
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        pr = urllib.parse.urlparse(self.path)
+        path = pr.path
+        query = urllib.parse.parse_qs(pr.query)
+
+        if path in ("/", "/index.html"):
+            payload = HUD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/status":
+            proj = query.get("project", [""])[0]
+            data = get_hud_data(project=proj)
+            self.send_json(data)
+            return
+
+        if path == "/api/worker_log":
+            wid = query.get("id", [""])[0]
+            log_file = os.path.join(WORKERS_DIR, f"{wid}.log")
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                        lines = f.readlines()
+                        tail = "".join(lines[-100:])
+                        self.send_json({"id": wid, "log": tail})
+                        return
+                except Exception as e:
+                    self.send_json({"error": str(e)}, 500)
+                    return
+            self.send_json({"error": "log not found"}, 404)
+            return
+
+        if path == "/api/track":
+            tname = query.get("name", ["main"])[0]
+            txt = t_read_track(track=tname, limit=30)
+            self.send_json({"track": tname, "content": txt})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        pr = urllib.parse.urlparse(self.path)
+        path = pr.path
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            payload = {}
+
+        if path == "/api/claim":
+            res = t_claim_file(
+                filepath=payload.get("filepath", ""),
+                holder=payload.get("holder", ""),
+                duration_seconds=payload.get("duration", 300),
+                purpose=payload.get("purpose", ""),
+            )
+            self.send_json({"result": res})
+            return
+
+        if path == "/api/release":
+            res = t_release_file(
+                filepath=payload.get("filepath", ""),
+                holder=payload.get("holder", ""),
+            )
+            self.send_json({"result": res})
+            return
+
+        if path == "/api/broadcast":
+            res = t_broadcast_track(
+                message=payload.get("message", ""),
+                track=payload.get("track", "main"),
+                files=payload.get("files", []),
+                decisions=payload.get("decisions", []),
+                station_id=payload.get("station_id", "web-hud"),
+            )
+            self.send_json({"result": res})
+            return
+
+        if path == "/api/spawn":
+            res = t_spin_worker(
+                role=payload.get("role", ""),
+                prompt=payload.get("prompt", ""),
+                provider=payload.get("provider", "auto"),
+                track=payload.get("track", "main"),
+                project_dir=payload.get("project_dir", ""),
+            )
+            self.send_json({"result": res})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+
+_HUD_SERVER_INSTANCE = None
+
+def start_hud_server(port: int = 7890, daemon: bool = True) -> Optional[http.server.HTTPServer]:
+    global _HUD_SERVER_INSTANCE
+    if _HUD_SERVER_INSTANCE is not None:
+        return _HUD_SERVER_INSTANCE
+    try:
+        httpd = http.server.HTTPServer(("127.0.0.1", port), SubwayHUDHandler)
+        _HUD_SERVER_INSTANCE = httpd
+        t = threading.Thread(target=httpd.serve_forever, daemon=daemon)
+        t.start()
+        log(f"Subway Live HUD running at http://127.0.0.1:{port}")
+        return httpd
+    except Exception as e:
+        log(f"HUD server could not bind to port {port}: {e}")
+        return None
+
+
+
 TOOLS = {
     "list_chats": (t_list_chats, {
         "description": "List all active lines and stations (chats) across Antigravity, Claude Code, and OpenCode. "
@@ -1544,6 +2785,82 @@ TOOLS = {
         "description": "Report active station ID and line for this server.",
         "inputSchema": {"type": "object", "properties": {}},
     }),
+    "claim_file": (t_claim_file, {
+        "description": "Acquire a temporary workspace lease on a file to prevent collision with other agents.",
+        "inputSchema": {"type": "object", "required": ["filepath"], "properties": {
+            "filepath": {"type": "string", "description": "Target file path to claim."},
+            "holder": {"type": "string", "description": "Station ID or agent alias claiming the file (default: self)."},
+            "duration_seconds": {"type": "integer", "default": 300, "description": "Lease lifetime in seconds (10-3600)."},
+            "purpose": {"type": "string", "description": "Short explanation of the planned changes."},
+        }},
+    }),
+    "release_file": (t_release_file, {
+        "description": "Release a workspace file lease so other agents can edit it.",
+        "inputSchema": {"type": "object", "required": ["filepath"], "properties": {
+            "filepath": {"type": "string", "description": "File path to release."},
+            "holder": {"type": "string", "description": "Station ID or agent alias releasing the file."},
+        }},
+    }),
+    "list_locks": (t_list_locks, {
+        "description": "List all active workspace file leases across all agents.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }),
+    "spin_worker": (t_spin_worker, {
+        "description": "Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) and link it to a shared track.",
+        "inputSchema": {"type": "object", "required": ["role", "prompt"], "properties": {
+            "role": {"type": "string", "description": "Brief 2-5 word job title for the worker (e.g. 'Unit Tester')."},
+            "prompt": {"type": "string", "description": "Clear actionable instruction for the subagent."},
+            "provider": {"type": "string", "enum": ["auto", "claude", "opencode", "antigravity"], "default": "auto"},
+            "track": {"type": "string", "default": "main", "description": "Shared context track name."},
+            "project_dir": {"type": "string", "description": "Working directory (default: current workspace)."},
+            "timeout_seconds": {"type": "integer", "default": 600},
+        }},
+    }),
+    "worker_status": (t_worker_status, {
+        "description": "Check execution status and live log tails of spawned worker subagents.",
+        "inputSchema": {"type": "object", "properties": {
+            "worker_id": {"type": "string", "description": "Specific worker ID to inspect, or omit to list all."},
+            "track": {"type": "string", "description": "Filter by shared context track name."},
+        }},
+    }),
+    "collect_reports": (t_collect_reports, {
+        "description": "Collect completion reports and log tails from workers on a track.",
+        "inputSchema": {"type": "object", "properties": {
+            "track": {"type": "string", "default": "main", "description": "Track name or 'all'."},
+            "wait": {"type": "boolean", "default": False, "description": "Wait up to 15s for running workers to finish."},
+        }},
+    }),
+    "join_track": (t_join_track, {
+        "description": "Subscribe this station to a shared multi-agent decision track and receive current track state.",
+        "inputSchema": {"type": "object", "properties": {
+            "track": {"type": "string", "default": "main", "description": "Track name (e.g. 'main', 'pr')."},
+            "station_id": {"type": "string", "description": "Station ID or alias (default: self)."},
+        }},
+    }),
+    "broadcast_track": (t_broadcast_track, {
+        "description": "Publish a decision, milestone, or file modification to a shared multi-agent track.",
+        "inputSchema": {"type": "object", "required": ["message"], "properties": {
+            "message": {"type": "string", "description": "Summary of decision or progress update."},
+            "track": {"type": "string", "default": "main"},
+            "files": {"type": "array", "items": {"type": "string"}, "description": "List of files touched or claimed."},
+            "decisions": {"type": "array", "items": {"type": "string"}, "description": "Architectural rulings or commitments."},
+            "station_id": {"type": "string", "description": "Author station ID or alias."},
+        }},
+    }),
+    "read_track": (t_read_track, {
+        "description": "Read latest synchronized decisions and status dispatches from a shared context track.",
+        "inputSchema": {"type": "object", "properties": {
+            "track": {"type": "string", "default": "main"},
+            "limit": {"type": "integer", "default": 15},
+            "since_timestamp": {"type": "number", "default": 0.0},
+        }},
+    }),
+    "hud_status": (t_hud_status, {
+        "description": "Snapshot departure-board view of active lines, file leases, worker swarms, and shared tracks.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": {"type": "string", "description": "Optional project filter."},
+        }},
+    }),
 }
 
 
@@ -1609,6 +2926,21 @@ def main() -> None:
             from install import check_status
             check_status()
             return
+        if arg in ("--hud", "hud"):
+            port = 7890
+            if len(sys.argv) > 2:
+                try:
+                    port = int(sys.argv[2])
+                except Exception:
+                    pass
+            print(f"🚇 Starting Subway Context Live HUD on http://localhost:{port} ...")
+            start_hud_server(port=port, daemon=False)
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\nHUD stopped.")
+            return
         if arg in ("--uninstall", "--remove", "uninstall"):
             from install import remove_all
             remove_all()
@@ -1617,7 +2949,8 @@ def main() -> None:
         args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
         print(TOOLS[name][0](**args))
         return
-    log(f"v{VERSION} ready")
+    start_hud_server(port=7890, daemon=True)
+    log(f"v{VERSION} ready (HUD active on http://127.0.0.1:7890)")
     for line in sys.stdin:
         line = line.strip()
         if not line:

@@ -220,6 +220,94 @@ Drop a lightweight dispatch into another agent window's inbox so it picks up whe
 
 ---
 
+## Live Workspace Guard (Collision Shield) 🛡️
+
+When multiple autonomous agents (e.g. Claude Code in tab 1, OpenCode in terminal dock, and Antigravity in sidecar) run concurrently in the same repository, they risk **file collision**—clobbering and overwriting each other's edits.
+
+Subway Context provides an active **Workspace Guard** lease mechanism (`~/.subway-context/locks.json`):
+
+1. **`claim_file(filepath, holder, duration_seconds, purpose)`**:
+   - Acquires a time-limited lease (default: 300s) on a file.
+   - If another agent tries to claim or edit the file while the lease is active, Subway Context raises an immediate collision warning with the holder's alias and expiry countdown:
+     ```text
+     🚨 COLLISION WARNING: 'src/components/Header.tsx' is already leased to claude-main for 'Layout refactor'. 
+     Lease expires in 240s. Do NOT overwrite or clobber until released or expired.
+     ```
+2. **`release_file(filepath, holder)`**:
+   - Explicitly relinquishes the file lease once modifications and git commits are done.
+3. **`list_locks()`**:
+   - Surfaces all active file leases across all agents with remaining lease timers and declared purposes.
+
+---
+
+## Live Station Board HUD 🚇
+
+Subway Context includes a real-time, interactive **Station Departure Board HUD** available both in the terminal and as a cyber-transit dark-mode web dashboard.
+
+### 1. Launching the Web HUD (Port 7890)
+
+```bash
+# Launch interactive HUD dashboard in your browser
+python3 server.py hud
+# Or specify custom port
+python3 server.py hud 7891
+```
+
+Once launched, visit **`http://localhost:7890`** to view:
+- **Active Subway Lines**: Live connected stations across Claude Code, Antigravity, and OpenCode.
+- **Workspace Guard Table**: Real-time file leases with visual countdown timers and 1-click release actions.
+- **Worker Swarms**: Status of all background agents with live log tail inspection.
+- **Shared Decision Ledger**: Real-time chronological decision feed across all windows.
+
+### 2. Terminal Snapshot (`hud_status`)
+
+Any agent can inspect the state of the entire multi-window fleet with a single call to `hud_status()`:
+
+```text
+==============================================================================
+🚇 SUBWAY CONTEXT LIVE HUD — STATION DEPARTURE BOARD   [2026-11-01 03:28:28]
+==============================================================================
+[WORKSPACE GUARD — ACTIVE FILE LEASES]
+  🔒 src/components/Header.tsx       <- Held by claude-main (240s left) :: Layout refactor
+------------------------------------------------------------------------------
+[AUTONOMOUS WORKER SWARM]
+  ⚙️  worker_a8f1e2  [OPENCODE] 🟢 RUNNING   Track: main   Role: Unit Tester
+------------------------------------------------------------------------------
+[SHARED CONTEXT TRACKS]
+  📡 Track 'main': 3 events. Latest from `claude-main`: Refactored Hero to CSS grid
+==============================================================================
+🌐 Live Web HUD running at: http://localhost:7890
+==============================================================================
+```
+
+---
+
+## Autonomous Worker Swarms & Delegation 🤖
+
+Subway Context enables agents to dynamically delegate tasks and spin up background subagents across different agent engines without manual terminal switching:
+
+### `spin_worker(role, prompt, provider, track)`
+- Dynamically discovers and invokes the optimal local agent CLI (`opencode`, `claude`, or creates Antigravity delegation).
+- Runs headless in background sessions with detached process trees.
+- Automatically routes stdout/stderr into structured logs (`~/.subway-context/workers/<worker_id>.log`).
+- Broadcasts the worker launch to the shared context track.
+
+### `worker_status(worker_id)` & `collect_reports(track, wait=True)`
+- Tracks worker lifecycle (`running`, `completed`, `failed`).
+- Extracts decision tails and files touched so parent agents can review work immediately.
+
+---
+
+## Shared Context Tracks (Synchronized Decision Ledgers) 🛤️
+
+Rather than forcing each agent to read the entire multi-thousand-turn conversation history of another window, Subway Context provides lightweight **Shared Decision Tracks** (`~/.subway-context/tracks/<track>.jsonl`).
+
+- **`join_track(track="main")`**: Subscribes an agent to a shared context track and catches it up on recent decisions.
+- **`broadcast_track(message, track="main", files=[...], decisions=[...])`**: Publishes a key milestone, architectural decision, or claimed file list to all collaborating agents.
+- **`read_track(track="main", limit=15)`**: Zero-waste sync format returning high-density decisions and touched files across the entire multi-agent swarm.
+
+---
+
 ## Subagent Tracking & Deep Inspection 🤖
 
 When agents spin up parallel subagents (e.g. Claude Code background `Agent` workers, Antigravity subagent swarms, or OpenCode child tasks):
