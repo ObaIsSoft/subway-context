@@ -598,7 +598,8 @@ def claude_open_sessions() -> Dict[str, Dict[str, Any]]:
     res: Dict[str, Dict[str, Any]] = {}
     for p in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
         try:
-            d = json.load(open(p))
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
             pid = int(d.get("pid", 0))
             alive = False
             if pid:
@@ -1193,7 +1194,8 @@ def detect_self() -> Optional[Dict[str, Any]]:
     opens = {}
     for p in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
         try:
-            d = json.load(open(p))
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
             opens[int(d.get("pid", 0))] = d
         except Exception:
             pass
@@ -1297,12 +1299,12 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
     return "\n".join(lines)
 
 
-def t_search_chat(quote: str, source: str = "all", project: str = "", limit: int = 5,
+def t_search_chat(quote: str = "", query: str = "", source: str = "all", project: str = "", limit: int = 5,
                   include_subagents: bool = True) -> str:
-    quote = (quote or "").strip()
-    if not quote:
+    target = (quote or query or "").strip()
+    if not target:
         return "Please provide a quote or snippet to search for."
-    q_low = quote.lower()
+    q_low = target.lower()
     chats = all_chats(source, include_subagents=include_subagents)
     if project:
         chats = [c for c in chats if project.lower() in (c.get("project") or "").lower()]
@@ -1543,7 +1545,7 @@ def _clean_locks(locks_data: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
     active = {}
     for path, info in locks_data.get("locks", {}).items():
-        if info.get("expires_at", 0) > now:
+        if info.get("expires_at", 0) > now or info.get("status") == "APPROVED":
             active[path] = info
     locks_data["locks"] = active
     return locks_data
@@ -1587,7 +1589,7 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
     # 1. Collision Check against active leases
     if existing and existing.get("expires_at", 0) > now:
         prev_holder = existing.get("holder", "another-agent")
-        if prev_holder != holder:
+        if prev_holder and prev_holder != holder:
             rem = int(existing["expires_at"] - now)
             purp_str = f" for '{existing.get('purpose')}'" if existing.get("purpose") else ""
             return (f"[COLLISION WARNING] '{clean_path}' is already leased to {prev_holder}{purp_str}. "
@@ -1698,7 +1700,13 @@ def t_release_file(filepath: str, holder: str = "") -> str:
     if holder and current.get("holder") and current.get("holder") != holder:
         return f"Warning: '{clean_path}' is held by {current.get('holder')}, not {holder}. Lease not released."
 
-    del locks[clean_path]
+    if current.get("status") == "APPROVED":
+        current["holder"] = ""
+        current["expires_at"] = 0
+        locks[clean_path] = current
+    else:
+        del locks[clean_path]
+
     data["locks"] = locks
     save_locks(data)
     return f"[RELEASED] '{clean_path}' is now free for modification by any agent."
@@ -1715,11 +1723,16 @@ def t_list_locks() -> str:
     lines = ["# Active Workspace File Leases (Workspace Guard)", ""]
     for path, info in sorted(locks.items(), key=lambda x: x[1].get("expires_at", 0)):
         rem = max(0, int(info.get("expires_at", 0) - now))
-        h = info.get("holder", "unknown")
+        h = info.get("holder", "")
         purp = info.get("purpose", "")
         st = info.get("status", "LEASED")
         role = info.get("role", "implementer")
-        lines.append(f"- `[LOCKED] {path}` — held by **{h}** (role: {role}, {rem}s remaining, status: {st}) :: {purp}")
+        if st == "APPROVED" and info.get("expires_at", 0) <= now:
+            signed_commit = (info.get("signoff") or {}).get("commit_sha", "")
+            reviewer = (info.get("signoff") or {}).get("reviewer", "reviewer")
+            lines.append(f"- `[APPROVED] {path}` — verified by **{reviewer}** (commit: {signed_commit}) :: Regression Shield active")
+        else:
+            lines.append(f"- `[LOCKED] {path}` — held by **{h}** (role: {role}, {rem}s remaining, status: {st}) :: {purp}")
     return "\n".join(lines)
 
 
@@ -1890,10 +1903,79 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
     return meta
 
 
+def estimate_complexity(prompt: str, role: str = "") -> Dict[str, Any]:
+    """Estimate task complexity and recommend model tier, effort level, and provider."""
+    text = f"{role} {prompt}".lower()
+    
+    god_keywords = ["system redesign", "full rewrite", "god mode", "autonomous overhaul", "audit everything", "multi-repo", "complete architecture"]
+    high_keywords = ["refactor", "migration", "architecture", "concurrency", "distributed", "auth flow", "security", "encryption", "multi-file", "protocol", "performance optimization", "memory leak", "race condition"]
+    med_keywords = ["test", "unit test", "spec", "bug fix", "endpoint", "parser", "component", "function", "update logic", "api route", "hook"]
+    low_keywords = ["typo", "lint", "format", "rename", "comment", "docstring", "single line", "read file", "check status", "readme", "log", "clean"]
+
+    if any(k in text for k in god_keywords):
+        tier = "frontier"
+        effort = "max"
+        mode = "god"
+        rationale = "Scope involves full architectural overhaul or multi-system changes requiring frontier reasoning."
+        recommended_provider = "claude"
+    elif any(k in text for k in high_keywords):
+        tier = "high"
+        effort = "high"
+        mode = "standard"
+        rationale = "Multi-file refactoring, concurrency, or architectural security logic requires deep reasoning."
+        recommended_provider = "claude"
+    elif any(k in text for k in med_keywords):
+        tier = "medium"
+        effort = "medium"
+        mode = "standard"
+        rationale = "Targeted feature, component, or unit test work matches standard reasoning models."
+        recommended_provider = "auto"
+    elif any(k in text for k in low_keywords):
+        tier = "low"
+        effort = "low"
+        mode = "standard"
+        rationale = "Boilerplate, linting, formatting, or documentation tasks operate with fast/low effort."
+        recommended_provider = "opencode"
+    else:
+        if len(prompt.split()) > 100:
+            tier = "high"
+            effort = "high"
+            mode = "standard"
+            rationale = "Long detailed prompt with extensive requirements."
+            recommended_provider = "auto"
+        else:
+            tier = "medium"
+            effort = "medium"
+            mode = "standard"
+            rationale = "General task with moderate scope."
+            recommended_provider = "auto"
+
+    return {
+        "tier": tier,
+        "effort": effort,
+        "mode": mode,
+        "recommended_provider": recommended_provider,
+        "rationale": rationale,
+    }
+
+
+def t_estimate_complexity(prompt: str, role: str = "") -> str:
+    """Evaluate task complexity and return recommended effort, tier, and provider."""
+    res = estimate_complexity(prompt, role)
+    return (f"# Task Complexity Assessment\n"
+            f"- **Role**: {role or '(unspecified)'}\n"
+            f"- **Complexity Tier**: {res['tier'].upper()}\n"
+            f"- **Recommended Effort**: {res['effort'].upper()}\n"
+            f"- **Mode**: {res['mode'].upper()}\n"
+            f"- **Recommended Provider**: {res['recommended_provider'].upper()}\n"
+            f"- **Rationale**: {res['rationale']}")
+
+
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
                   project_dir: str = "", timeout_seconds: int = 600, effort: str = "auto",
-                  mode: str = "standard") -> str:
-    """Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) with adaptive effort and God Mode."""
+                  mode: str = "standard", model: str = "", user_confirmed: bool = False,
+                  permission_mode: str = "auto_safe", capabilities: Optional[List[str]] = None) -> str:
+    """Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) with capability translation, explicit model selection, adaptive effort, and user confirmation gate."""
     if not role or not prompt:
         return "Error: role and prompt are required."
     _ensure_subway_dir()
@@ -1906,13 +1988,36 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     selected_mode = mode.lower()
     bin_path = None
 
+    # Derive default capabilities if not provided
+    if capabilities is None:
+        capabilities = ["files:read", "files:write", "terminal:safe"]
+        p_low = f"{role} {prompt}".lower()
+        if any(w in p_low for w in ("browser", "chrome", "scrape", "dom", "ui test", "e2e")):
+            capabilities.append("browser")
+        if any(w in p_low for w in ("mcp", "database", "sql")):
+            capabilities.append("mcp")
+        if mode == "god" or "full shell" in p_low:
+            capabilities.append("terminal:full")
+
+    # Initial adaptive complexity estimation if effort is auto
+    complexity = estimate_complexity(prompt, role)
+    if effort == "auto" or not effort:
+        effort = complexity["effort"]
+        if complexity["mode"] == "god" and selected_mode == "standard":
+            selected_mode = "god"
+
     is_god_mode = selected_mode == "god" or selected_provider == "god"
+    if is_god_mode:
+        effort = "max"
+        selected_mode = "god"
+        if "terminal:full" not in capabilities:
+            capabilities.append("terminal:full")
     god_warning = ""
     if is_god_mode:
         god_warning = ("[WARNING: GOD MODE ACTIVE] Maximum frontier reasoning effort and multi-agent autonomy enabled. "
                        "High token velocity and cost consumption. Use with experimental caution.\n")
         t_broadcast_track(
-            f"[GOD MODE ACTIVE] Autonomous high-reasoning worker launched for role: '{role}'",
+            f"[GOD MODE ACTIVE] Autonomous high-reasoning worker requested for role: '{role}'",
             track=track,
             station_id="god-mode-router"
         )
@@ -1923,7 +2028,6 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         claude_bin = find_claude_binary()
         opencode_bin = find_opencode_binary()
         if is_god_mode:
-            # God mode prioritizes strongest frontier models (Claude Opus / flagship)
             if claude_bin:
                 selected_provider = "claude"
                 bin_path = claude_bin
@@ -1955,36 +2059,141 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     worker_id = f"worker_{uuid.uuid4().hex[:6]}"
     log_file = os.path.join(WORKERS_DIR, f"{worker_id}.log")
 
-    if selected_provider == "antigravity":
+    # Resolve target model per provider and map capabilities to provider-specific arguments
+    target_model = model.strip()
+    cmd = []
+    antigravity_spec = {}
+
+    if selected_provider == "claude":
+        if not bin_path:
+            return f"Error: Could not locate binary for Claude Code. Ensure it is installed and on PATH."
+        if not target_model:
+            if is_god_mode or effort == "max":
+                target_model = "opus"
+            elif effort == "high":
+                target_model = "sonnet"
+            elif effort == "medium":
+                target_model = "sonnet"
+            elif effort == "low":
+                target_model = "haiku"
+            else:
+                target_model = "sonnet"
+
+        cmd = [bin_path]
+        if target_model:
+            cmd.extend(["--model", target_model])
+        if effort and effort != "auto":
+            cmd.extend(["--effort", effort])
+
+        # Capability translation for Claude Code
+        if "browser" in capabilities:
+            cmd.append("--chrome")
+        if permission_mode == "dangerously_skip" or "terminal:full" in capabilities:
+            cmd.append("--dangerously-skip-permissions")
+        else:
+            allowed = []
+            if "files:read" in capabilities:
+                allowed.extend(["Read", "Glob", "Grep"])
+            if "files:write" in capabilities:
+                allowed.extend(["Edit", "Write"])
+            if "terminal:safe" in capabilities:
+                allowed.extend(["Bash(git *)", "Bash(npm *)", "Bash(pytest *)", "Bash(python3 *)"])
+            if "browser" in capabilities:
+                allowed.append("Browser")
+            if allowed:
+                cmd.extend(["--allowedTools", ",".join(allowed)])
+
+        cmd.extend(["-p", prompt])
+
+    elif selected_provider == "opencode":
+        if not bin_path:
+            return f"Error: Could not locate binary for OpenCode. Ensure it is installed and on PATH."
+        target_model = target_model or "default"
+        cmd = [bin_path, "run", "--title", f"Subway: {role}"]
+        if target_model and target_model != "default":
+            cmd.extend(["--model", target_model])
+        if effort in ("high", "max") or is_god_mode:
+            cmd.append("--thinking")
+        if permission_mode in ("dangerously_skip", "auto_safe") or "terminal:safe" in capabilities or "terminal:full" in capabilities:
+            cmd.append("--auto")
+        cmd.append(prompt)
+
+    elif selected_provider == "antigravity":
+        target_model = target_model or ("claude-opus-5.5" if is_god_mode else "inherit")
+        antigravity_spec = {
+            "EnableWriteTools": "files:write" in capabilities or "terminal:safe" in capabilities or "terminal:full" in capabilities,
+            "EnableMCPTools": "mcp" in capabilities or "browser" in capabilities,
+            "EnableSubagentTools": is_god_mode or "subagents" in capabilities,
+            "BypassSandbox": "terminal:full" in capabilities,
+        }
+
+    # If user confirmation is required and not yet provided, queue worker
+    if not user_confirmed:
         meta = {
             "id": worker_id,
             "role": role,
-            "provider": "antigravity",
-            "track": track,
-            "project_dir": cwd,
-            "status": "pending_dispatch",
+            "provider": selected_provider,
+            "model": target_model,
             "effort": effort,
             "mode": "god" if is_god_mode else "standard",
+            "permission_mode": permission_mode,
+            "capabilities": capabilities,
+            "antigravity_spec": antigravity_spec,
+            "track": track,
+            "project_dir": cwd,
+            "status": "pending_approval",
+            "cmd": cmd,
             "pid": None,
             "created_at": _dt.datetime.now().astimezone().isoformat(),
             "completed_at": None,
             "prompt": prompt,
             "log_file": log_file,
-            "report": "Delegation prepared. Call invoke_subagent() to execute inside Antigravity.",
+            "report": "Awaiting user confirmation before launching.",
         }
         with open(_worker_file(worker_id), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
-        t_broadcast_track(f"Delegated task '{role}' to Antigravity worker `{worker_id}` (effort: {effort})", track=track, station_id=worker_id)
-        return (f"{god_warning}[SPAWNED] Antigravity Worker `{worker_id}` initialized for role '{role}'.\n"
-                f"Invoke via: invoke_subagent(Role='{role}', Prompt='{prompt}')")
 
-    if not bin_path:
-        return f"Error: Could not locate binary for '{selected_provider}'. Ensure it is installed and on PATH."
+        t_broadcast_track(
+            f"[PENDING APPROVAL] Worker `{worker_id}` queued ({role}, {selected_provider.upper()} model:{target_model} effort:{effort}). User authorization required.",
+            track=track,
+            station_id="guard"
+        )
+        caps_str = ", ".join(capabilities)
+        return (f"{god_warning}[APPROVAL REQUIRED] Worker `{worker_id}` is queued in PENDING APPROVAL state.\n"
+                f"- Role: **{role}**\n"
+                f"- Target Provider: **{selected_provider.upper()}**\n"
+                f"- Model: **{target_model}** | Effort: **{effort}** | Mode: **{meta['mode']}**\n"
+                f"- Capabilities: `[{caps_str}]`\n"
+                f"- Permission Mode: `{permission_mode}`\n"
+                f"- Prompt: {prompt}\n\n"
+                f"Please ask the user for confirmation before spinning up external agent processes.\n"
+                f"Once confirmed, call approve_worker(worker_id='{worker_id}') or approve directly via the Live HUD.")
 
-    if selected_provider == "claude":
-        cmd = [bin_path, "--dangerously-skip-permissions", "-p", prompt]
-    else:
-        cmd = [bin_path, "run", "--auto", "--title", f"Subway: {role}", prompt]
+    # Spawning when user_confirmed=True
+    if selected_provider == "antigravity":
+        meta = {
+            "id": worker_id,
+            "role": role,
+            "provider": "antigravity",
+            "model": target_model,
+            "track": track,
+            "project_dir": cwd,
+            "status": "pending_dispatch",
+            "effort": effort,
+            "mode": "god" if is_god_mode else "standard",
+            "permission_mode": permission_mode,
+            "pid": None,
+            "created_at": _dt.datetime.now().astimezone().isoformat(),
+            "completed_at": None,
+            "prompt": prompt,
+            "log_file": log_file,
+            "report": f"Delegation prepared for Antigravity ({target_model}, effort: {effort}). Call invoke_subagent() to execute.",
+        }
+        with open(_worker_file(worker_id), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        t_broadcast_track(f"Delegated task '{role}' to Antigravity worker `{worker_id}` (model: {target_model}, effort: {effort})", track=track, station_id=worker_id)
+        return (f"{god_warning}[SPAWNED] Antigravity Worker `{worker_id}` initialized for role '{role}' (model: {target_model}, effort: {effort}).\n"
+                f"Invoke via: invoke_subagent(Role='{role}', Prompt='{prompt}', Model='{target_model}')")
 
     try:
         out_f = open(log_file, "w", encoding="utf-8")
@@ -2003,11 +2212,13 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "id": worker_id,
         "role": role,
         "provider": selected_provider,
+        "model": target_model,
         "track": track,
         "project_dir": cwd,
         "status": "running",
         "effort": effort,
         "mode": "god" if is_god_mode else "standard",
+        "permission_mode": permission_mode,
         "pid": pid,
         "created_at": _dt.datetime.now().astimezone().isoformat(),
         "completed_at": None,
@@ -2020,18 +2231,99 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
 
     mode_tag = " [GOD MODE]" if is_god_mode else ""
     t_broadcast_track(
-        f"Spun {selected_provider.upper()}{mode_tag} worker `{worker_id}` (PID {pid}) on track '{track}' for role: '{role}'",
+        f"Spun {selected_provider.upper()}{mode_tag} worker `{worker_id}` ({target_model}, effort:{effort}, PID {pid}) for role: '{role}'",
         track=track,
         station_id=worker_id,
     )
 
     return (f"{god_warning}[SPAWNED WORKER] `{worker_id}` [{selected_provider.upper()}{mode_tag}] (PID {pid})\n"
             f"- Role: **{role}**\n"
-            f"- Track: **{track}**\n"
-            f"- Effort: **{effort}** | Mode: **{meta['mode']}**\n"
+            f"- Model: **{target_model}** | Effort: **{effort}** | Mode: **{meta['mode']}**\n"
+            f"- Permission Mode: `{permission_mode}`\n"
             f"- Working Dir: `{cwd}`\n"
             f"- Live Log: `{log_file}`\n"
             f"Check progress anytime with worker_status(worker_id='{worker_id}') or collect_reports().")
+
+
+def t_approve_worker(worker_id: str) -> str:
+    """Approve and launch a pending worker subagent."""
+    _ensure_subway_dir()
+    meta_file = _worker_file(worker_id)
+    if not os.path.exists(meta_file):
+        return f"Error: worker `{worker_id}` not found."
+
+    with open(meta_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    if meta.get("status") != "pending_approval":
+        return f"Worker `{worker_id}` is not pending approval (current status: {meta.get('status')})."
+
+    provider = meta.get("provider", "auto")
+    role = meta.get("role", "Worker")
+    track = meta.get("track", "main")
+    cwd = meta.get("project_dir", HOME)
+    log_file = meta.get("log_file", os.path.join(WORKERS_DIR, f"{worker_id}.log"))
+    cmd = meta.get("cmd", [])
+
+    if provider == "antigravity":
+        meta["status"] = "pending_dispatch"
+        meta["report"] = f"Approved for dispatch in Antigravity ({meta.get('model')}, effort: {meta.get('effort')})."
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        t_broadcast_track(f"[WORKER APPROVED] Antigravity worker `{worker_id}` approved for dispatch.", track=track, station_id=worker_id)
+        return f"[APPROVED] Worker `{worker_id}` is approved. Call invoke_subagent(Role='{role}', Prompt='{meta.get('prompt')}')"
+
+    if not cmd:
+        return f"Error: no command stored for worker `{worker_id}`."
+
+    try:
+        out_f = open(log_file, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=out_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        pid = proc.pid
+    except Exception as exc:
+        return f"Error spawning approved worker process: {exc}"
+
+    meta["status"] = "running"
+    meta["pid"] = pid
+    meta["report"] = ""
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    t_broadcast_track(
+        f"[WORKER APPROVED & LAUNCHED] Worker `{worker_id}` [{provider.upper()}] (PID {pid}) started for role: '{role}'",
+        track=track,
+        station_id=worker_id
+    )
+    return f"[APPROVED & LAUNCHED] Worker `{worker_id}` [{provider.upper()}] (PID {pid}) is now running.\nLive Log: `{log_file}`"
+
+
+def t_reject_worker(worker_id: str, reason: str = "") -> str:
+    """Reject and cancel a pending worker subagent."""
+    _ensure_subway_dir()
+    meta_file = _worker_file(worker_id)
+    if not os.path.exists(meta_file):
+        return f"Error: worker `{worker_id}` not found."
+
+    with open(meta_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    meta["status"] = "rejected"
+    meta["rejection_reason"] = reason or "Cancelled by user"
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    t_broadcast_track(
+        f"[WORKER REJECTED] Worker `{worker_id}` rejected. Reason: {meta['rejection_reason']}",
+        track=meta.get("track", "main"),
+        station_id="guard"
+    )
+    return f"[REJECTED] Worker `{worker_id}` was rejected and cancelled."
 
 
 def t_worker_status(worker_id: str = "", track: str = "") -> str:
@@ -2157,6 +2449,66 @@ def t_collect_reports(track: str = "main", wait: bool = False) -> str:
     return "\n".join(out)
 
 
+def t_escalate_worker(worker_id: str, new_effort: str = "max", new_mode: str = "god",
+                       reason: str = "", successor_provider: str = "auto") -> str:
+    """Dynamically escalate the reasoning tier or spawn an escalated successor for a struggling worker."""
+    _ensure_subway_dir()
+    meta_file = _worker_file(worker_id)
+    if not os.path.exists(meta_file):
+        return f"Error: worker `{worker_id}` not found."
+
+    with open(meta_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    prev_effort = meta.get("effort", "auto")
+    prev_mode = meta.get("mode", "standard")
+    role = meta.get("role", "Worker")
+    track = meta.get("track", "main")
+    prompt = meta.get("prompt", "")
+
+    log_file = meta.get("log_file")
+    tail = ""
+    if log_file and os.path.exists(log_file):
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                tail = "".join(lf.readlines()[-20:]).strip()
+        except Exception:
+            pass
+
+    meta["escalated"] = True
+    meta["escalated_from"] = {"effort": prev_effort, "mode": prev_mode, "reason": reason}
+    meta["effort"] = new_effort
+    meta["mode"] = new_mode
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    esc_msg = f"[ESCALATE_COMPLEXITY] Worker `{worker_id}` ({role}) escalated from {prev_effort}/{prev_mode} to {new_effort}/{new_mode}."
+    if reason:
+        esc_msg += f" Reason: {reason}"
+    t_broadcast_track(esc_msg, track=track, station_id="coordinator")
+
+    successor_prompt = (
+        f"ESCALATION SUCCESSOR for task '{role}'.\n"
+        f"Original task: {prompt}\n"
+        f"Escalation reason: {reason or 'Complexity exceeds lower tier capabilities'}\n"
+        f"Previous worker output context:\n{tail or '(No log output)'}\n"
+        f"Please complete this task using maximum reasoning effort."
+    )
+
+    succ_res = t_spin_worker(
+        role=f"Escalated {role}",
+        prompt=successor_prompt,
+        provider=successor_provider if successor_provider != "auto" else ("claude" if new_mode == "god" else "auto"),
+        track=track,
+        project_dir=meta.get("project_dir", ""),
+        effort=new_effort,
+        mode=new_mode
+    )
+
+    return (f"{esc_msg}\n\n"
+            f"[SUCCESSOR WORKER DISPATCHED]\n{succ_res}")
+
+
 # --------------------------------------------------------------------------
 # Feature C: Live Station Board HUD (Dashboard & HTTP Server)
 # --------------------------------------------------------------------------
@@ -2266,293 +2618,439 @@ HUD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Subway Context — Live Station Board HUD</title>
+<title>Subway Context — Live HUD</title>
 <style>
 :root {
   --bg: #090d16;
-  --surface: #111827;
-  --surface-hover: #1e293b;
-  --border: #1f293d;
-  --text: #f9fafb;
-  --muted: #9ca3af;
-  --cyan: #06b6d4;
-  --emerald: #10b981;
-  --amber: #f59e0b;
-  --rose: #f43f5e;
-  --purple: #8b5cf6;
+  --surface: #111726;
+  --surface-alt: #182033;
+  --surface-hover: #1c263c;
+  --border: #232e44;
+  --border-subtle: #192233;
+  --text: #e6edf3;
+  --text-bright: #ffffff;
+  --muted: #8b96a5;
+  --accent: #58a6ff;
+  --accent-dim: rgba(88, 166, 255, 0.12);
+  --danger: #f85149;
+  --danger-bg: rgba(248, 81, 73, 0.12);
+  --success: #3fb950;
+  --success-bg: rgba(63, 185, 80, 0.12);
+  --warning: #d29922;
+  --warning-bg: rgba(210, 153, 34, 0.14);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "JetBrains Mono", monospace;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   background-color: var(--bg);
   color: var(--text);
   line-height: 1.5;
-  padding: 24px;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+code, pre, .mono {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+.app-layout {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
 }
 header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 24px;
-  padding-bottom: 16px;
+  padding-bottom: 20px;
   border-bottom: 1px solid var(--border);
 }
-.brand { display: flex; align-items: center; gap: 12px; }
-.logo-icon { font-size: 28px; }
-.brand h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+.brand { display: flex; align-items: baseline; gap: 14px; }
+.brand h1 { font-size: 18px; font-weight: 700; letter-spacing: 0.5px; color: var(--text-bright); }
 .brand-sub { font-size: 13px; color: var(--muted); }
+.header-actions { display: flex; gap: 10px; align-items: center; }
 .status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  background: rgba(16, 185, 129, 0.15);
-  border: 1px solid rgba(16, 185, 129, 0.4);
-  color: var(--emerald);
-  padding: 4px 12px;
-  border-radius: 9999px;
-  font-size: 12px;
-  font-weight: 600;
-}
-.pulse-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--emerald);
-  box-shadow: 0 0 8px var(--emerald);
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 5px 12px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
 }
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(4, 1fr);
   gap: 16px;
-  margin-bottom: 24px;
+}
+@media (max-width: 860px) {
+  .metrics-grid { grid-template-columns: repeat(2, 1fr); }
 }
 .metric-card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
-}
-.metric-card .title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
-.metric-card .val { font-size: 28px; font-weight: 700; margin-top: 4px; color: var(--cyan); }
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
-  gap: 24px;
-}
-.panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
+  border-radius: 8px;
+  padding: 18px 20px;
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
 }
-.panel-head {
+.metric-card .title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--muted); letter-spacing: 0.6px; }
+.metric-card .val { font-size: 26px; font-weight: 700; margin-top: 6px; color: var(--text-bright); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.card-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-subtle);
 }
-.panel-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+  letter-spacing: 0.3px;
+}
 .badge {
   font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: var(--surface-hover);
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--surface-alt);
   border: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
 }
-.badge-amber { background: rgba(245, 158, 11, 0.15); color: var(--amber); border-color: rgba(245, 158, 11, 0.3); }
-.badge-emerald { background: rgba(16, 185, 129, 0.15); color: var(--emerald); border-color: rgba(16, 185, 129, 0.3); }
-.badge-cyan { background: rgba(6, 182, 212, 0.15); color: var(--cyan); border-color: rgba(6, 182, 212, 0.3); }
+.badge-god { border-color: var(--warning); color: var(--warning); background: var(--warning-bg); font-weight: 600; }
+.badge-active { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.badge-pass { border-color: var(--success); color: var(--success); background: var(--success-bg); }
+.badge-pending { border-color: var(--warning); color: var(--warning); background: var(--warning-bg); font-weight: 600; }
+.badge-danger { border-color: var(--danger); color: var(--danger); background: var(--danger-bg); }
+
 .table-wrap { overflow-x: auto; width: 100%; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
-th { color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 500; font-size: 12px; }
-td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; text-align: left; }
+th {
+  color: var(--muted);
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--surface);
+}
+td { padding: 14px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--surface-hover); }
+
 .btn {
-  background: var(--surface-hover);
+  background: var(--surface-alt);
   color: var(--text);
   border: 1px solid var(--border);
-  padding: 6px 12px;
-  border-radius: 6px;
+  padding: 6px 14px;
+  border-radius: 5px;
   font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
-.btn:hover { background: var(--cyan); color: #000; border-color: var(--cyan); }
-.btn-danger { color: var(--rose); }
-.btn-danger:hover { background: var(--rose); color: #fff; border-color: var(--rose); }
-.form-row { display: flex; gap: 8px; margin-top: 14px; }
+.btn:hover { background: var(--border); color: #fff; }
+.btn-primary { background: #238636; border-color: #2ea043; color: #fff; font-weight: 600; }
+.btn-primary:hover { background: #2ea043; }
+.btn-danger { color: var(--danger); border-color: rgba(248, 81, 73, 0.4); background: var(--danger-bg); }
+.btn-danger:hover { background: #b62324; color: #fff; border-color: #b62324; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+
+.form-toolbar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  align-items: center;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  padding: 16px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+}
 input, select, textarea {
-  background: #0d121d;
+  background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
   padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 13px;
+  border-radius: 5px;
+  font-size: 12px;
   font-family: inherit;
 }
-input:focus, select:focus, textarea:focus { outline: none; border-color: var(--cyan); }
-.track-feed { max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-.track-item {
-  background: #0d121d;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 13px;
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+
+.track-feed {
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  padding-right: 4px;
 }
-.track-time { color: var(--muted); font-size: 11px; margin-bottom: 4px; display: flex; justify-content: space-between; }
+.track-item {
+  background: var(--surface-alt);
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  padding: 12px 16px;
+  line-height: 1.5;
+}
+
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 32px;
 }
 .modal {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 32px;
+  max-width: 920px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.7);
 }
-pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; color: #a5f3fc; }
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+pre {
+  background: var(--bg);
+  padding: 20px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  font-size: 12px;
+  overflow-x: auto;
+  color: var(--text);
+  line-height: 1.6;
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">
-    <div class="logo-icon" style="font-weight: 800; font-size: 14px; color: var(--cyan); background: #0c1524; border: 1px solid var(--border); padding: 4px 8px; border-radius: 6px;">[SUBWAY]</div>
-    <div>
-      <h1>SUBWAY CONTEXT LIVE HUD</h1>
-      <div class="brand-sub">Autonomous Multi-Agent Workspace Shield & Station Board</div>
+<div class="app-layout">
+  <header>
+    <div class="brand">
+      <h1>SUBWAY CONTEXT // LIVE HUD</h1>
+      <span class="brand-sub">Multi-Agent Context Transit Network</span>
+    </div>
+    <div class="header-actions">
+      <span class="status-pill">[SYSTEM ONLINE]</span>
+      <button class="btn btn-sm" onclick="fetchStatus()">Refresh</button>
+    </div>
+  </header>
+
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="title">Active File Leases</div>
+      <div class="val" id="metric-locks">0</div>
+    </div>
+    <div class="metric-card">
+      <div class="title">Autonomous Workers</div>
+      <div class="val" id="metric-workers">0</div>
+    </div>
+    <div class="metric-card">
+      <div class="title">Decision Tracks</div>
+      <div class="val" id="metric-tracks">0</div>
+    </div>
+    <div class="metric-card">
+      <div class="title">System Heartbeat</div>
+      <div class="val" id="metric-time" style="font-size: 20px; margin-top: 10px;">--:--:--</div>
     </div>
   </div>
-  <div style="display: flex; gap: 12px; align-items: center;">
-    <div class="status-pill"><div class="pulse-dot"></div> STATION ACTIVE</div>
-    <button class="btn" onclick="fetchStatus()">Refresh</button>
-  </div>
-</header>
 
-<div class="metrics-grid">
-  <div class="metric-card">
-    <div class="title">Active File Leases</div>
-    <div class="val" id="metric-locks" style="color: var(--amber);">0</div>
-  </div>
-  <div class="metric-card">
-    <div class="title">Worker Swarms</div>
-    <div class="val" id="metric-workers" style="color: var(--purple);">0</div>
-  </div>
-  <div class="metric-card">
-    <div class="title">Shared Tracks</div>
-    <div class="val" id="metric-tracks" style="color: var(--cyan);">0</div>
-  </div>
-  <div class="metric-card">
-    <div class="title">Last Heartbeat</div>
-    <div class="val" id="metric-time" style="font-size: 16px; color: var(--muted); margin-top: 12px;">--:--:--</div>
-  </div>
-</div>
-
-<div class="dashboard-grid">
-  <!-- Panel 1: Workspace Guard -->
-  <div class="panel">
-    <div class="panel-head">
-      <div class="panel-title">[GUARD] Workspace File Leases</div>
-      <span class="badge badge-amber" id="lock-count-badge">0 active</span>
+  <!-- Primary Section: Autonomous Worker Swarm -->
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">
+        <span>Autonomous Worker Swarm</span>
+        <span class="badge" id="worker-count-badge">0 workers</span>
+      </div>
+      <button class="btn btn-sm" onclick="toggleElement('spawn-drawer')">+ Delegate Worker</button>
     </div>
+
+    <!-- Collapsible Worker Spawn Drawer -->
+    <div id="spawn-drawer" style="display: none;">
+      <form id="spawn-form" class="form-grid" onsubmit="handleSpawn(event)">
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Worker Role</label>
+          <input type="text" id="spawn-role" placeholder="e.g. Unit Test Engineer" style="width:100%;" required />
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Target Provider</label>
+          <select id="spawn-provider" style="width:100%;">
+            <option value="auto">Auto Router</option>
+            <option value="claude">Claude Code CLI</option>
+            <option value="opencode">OpenCode CLI</option>
+            <option value="antigravity">Antigravity IDE</option>
+            <option value="god">God Mode (Frontier Reasoning)</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Target Model</label>
+          <input type="text" id="spawn-model" placeholder="opus, sonnet, haiku, etc." style="width:100%;" />
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Reasoning Effort</label>
+          <select id="spawn-effort" style="width:100%;">
+            <option value="auto">Auto Heuristic</option>
+            <option value="low">Low (Fast)</option>
+            <option value="medium">Medium (Standard)</option>
+            <option value="high">High (Deep)</option>
+            <option value="max">Max (Frontier)</option>
+          </select>
+        </div>
+        <div style="grid-column: 1 / -1;">
+          <label style="display:block; font-size:11px; color:var(--muted); margin-bottom:4px;">Task Instruction Prompt</label>
+          <input type="text" id="spawn-prompt" placeholder="Actionable instruction for the autonomous subagent..." style="width:100%;" required />
+        </div>
+        <div style="grid-column: 1 / -1; display:flex; justify-content:space-between; align-items:center;">
+          <label style="display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer;">
+            <input type="checkbox" id="spawn-approval" checked /> Require User Confirmation before launch
+          </label>
+          <button type="submit" class="btn btn-primary">Dispatch Subagent</button>
+        </div>
+      </form>
+    </div>
+
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
-            <th>File Path</th>
-            <th>Holder</th>
+            <th style="width: 140px;">Worker ID</th>
+            <th style="width: 130px;">Provider</th>
+            <th style="width: 190px;">Model & Effort</th>
+            <th style="width: 160px;">State</th>
             <th>Role</th>
-            <th>Status</th>
-            <th>Expires In</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody id="locks-body">
-          <tr><td colspan="6" style="color: var(--muted); text-align: center;">No active file leases. All files free for modification.</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <form id="claim-form" class="form-row" onsubmit="handleClaim(event)">
-      <input type="text" id="claim-path" placeholder="File path (e.g. src/index.ts)" style="flex: 2;" required />
-      <input type="text" id="claim-holder" placeholder="Holder (@claude-main)" style="flex: 1;" />
-      <select id="claim-role">
-        <option value="implementer">implementer</option>
-        <option value="reviewer">reviewer</option>
-        <option value="refactorer">refactorer</option>
-        <option value="coordinator">coordinator</option>
-      </select>
-      <input type="number" id="claim-duration" placeholder="300s" value="300" style="width: 70px;" />
-      <button type="submit" class="btn">Claim</button>
-    </form>
-  </div>
-
-  <!-- Panel 2: Worker Swarm -->
-  <div class="panel">
-    <div class="panel-head">
-      <div class="panel-title">[SWARM] Autonomous Workers</div>
-      <span class="badge badge-cyan" id="worker-count-badge">0 workers</span>
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Worker ID</th>
-            <th>Provider</th>
-            <th>Mode</th>
-            <th>Status</th>
-            <th>Role</th>
-            <th>PID</th>
-            <th>Action</th>
+            <th style="width: 80px;">PID</th>
+            <th style="width: 180px; text-align: right;">Actions</th>
           </tr>
         </thead>
         <tbody id="workers-body">
-          <tr><td colspan="7" style="color: var(--muted); text-align: center;">No worker subagents running.</td></tr>
+          <tr><td colspan="7" style="color: var(--muted); text-align: center; padding: 24px;">No worker subagents running. Click '+ Delegate Worker' to dispatch tasks.</td></tr>
         </tbody>
       </table>
     </div>
-    <form id="spawn-form" class="form-row" onsubmit="handleSpawn(event)">
-      <input type="text" id="spawn-role" placeholder="Role (e.g. Test Runner)" style="flex: 1;" required />
-      <input type="text" id="spawn-prompt" placeholder="Instruction prompt..." style="flex: 2;" required />
-      <select id="spawn-provider">
-        <option value="auto">Auto</option>
-        <option value="opencode">OpenCode</option>
-        <option value="claude">Claude</option>
-        <option value="antigravity">Antigravity</option>
-        <option value="god">God Mode</option>
-      </select>
-      <select id="spawn-effort">
-        <option value="auto">Effort: Auto</option>
-        <option value="low">Low</option>
-        <option value="medium">Medium</option>
-        <option value="high">High</option>
-        <option value="max">Max</option>
-      </select>
-      <button type="submit" class="btn">Spawn</button>
-    </form>
   </div>
 
-  <!-- Panel 3: Shared Decision Tracks -->
-  <div class="panel" style="grid-column: 1 / -1;">
-    <div class="panel-head">
-      <div class="panel-title">[TRACK] Shared Decision Ledger (Track: <span id="current-track-name" style="color: var(--cyan);">main</span>)</div>
+  <!-- Secondary Section: Workspace Guard (File Leases & Regression Gates) -->
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">
+        <span>Workspace Collision Guard</span>
+        <span class="badge" id="lock-count-badge">0 active leases</span>
+      </div>
+      <button class="btn btn-sm" onclick="toggleElement('claim-drawer')">+ Claim Lease</button>
+    </div>
+
+    <!-- Collapsible File Claim Drawer -->
+    <div id="claim-drawer" style="display: none;">
+      <form id="claim-form" class="form-toolbar" onsubmit="handleClaim(event)">
+        <input type="text" id="claim-path" placeholder="File path (e.g. src/router.ts)" style="flex: 2; min-width: 200px;" required />
+        <input type="text" id="claim-holder" placeholder="Holder (@claude-main)" style="flex: 1; min-width: 140px;" />
+        <select id="claim-role" style="min-width: 130px;">
+          <option value="implementer">role: implementer</option>
+          <option value="reviewer">role: reviewer</option>
+          <option value="refactorer">role: refactorer</option>
+          <option value="coordinator">role: coordinator</option>
+        </select>
+        <input type="number" id="claim-duration" placeholder="300s" value="300" style="width: 80px;" />
+        <button type="submit" class="btn btn-primary">Acquire Lease</button>
+      </form>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Target File</th>
+            <th style="width: 160px;">Holder</th>
+            <th style="width: 130px;">Role</th>
+            <th style="width: 130px;">Status</th>
+            <th style="width: 120px;">Expires In</th>
+            <th style="width: 110px; text-align: right;">Action</th>
+          </tr>
+        </thead>
+        <tbody id="locks-body">
+          <tr><td colspan="6" style="color: var(--muted); text-align: center; padding: 24px;">No active file leases. All files are free for modification.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Tertiary Section: Shared Decision Tracks -->
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">
+        <span>Shared Decision Ledger</span>
+        <span class="badge">Track: <span id="current-track-name" style="color: var(--accent); font-weight: 600;">main</span></span>
+      </div>
       <div style="display: flex; gap: 8px;">
-        <button class="btn" onclick="switchTrack('main')">main</button>
-        <button class="btn" onclick="switchTrack('pr')">pr</button>
+        <button class="btn btn-sm" onclick="switchTrack('main')">main</button>
+        <button class="btn btn-sm" onclick="switchTrack('pr')">pr</button>
       </div>
     </div>
+
     <div class="track-feed" id="track-feed">
-      <div style="color: var(--muted); text-align: center; padding: 20px;">No broadcast entries on this track.</div>
+      <div style="color: var(--muted); text-align: center; padding: 24px;">No broadcast entries on this track.</div>
     </div>
-    <form id="broadcast-form" class="form-row" onsubmit="handleBroadcast(event)" style="margin-top: 14px;">
-      <input type="text" id="bc-msg" placeholder="Broadcast decision or milestone to all agents..." style="flex: 3;" required />
-      <input type="text" id="bc-files" placeholder="Files touched (comma separated)" style="flex: 2;" />
-      <button type="submit" class="btn">Broadcast</button>
+
+    <form id="broadcast-form" class="form-toolbar" onsubmit="handleBroadcast(event)" style="margin-top: 4px;">
+      <input type="text" id="bc-msg" placeholder="Broadcast architectural decision, milestone, or invariant..." style="flex: 3; min-width: 260px;" required />
+      <input type="text" id="bc-files" placeholder="Files touched (comma separated)" style="flex: 2; min-width: 180px;" />
+      <button type="submit" class="btn btn-primary">Broadcast Entry</button>
     </form>
   </div>
 </div>
 
+<!-- Modal Viewer -->
 <div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
   <div class="modal" onclick="event.stopPropagation()">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-      <h3 id="modal-title" style="font-size: 16px;">Log Output</h3>
-      <button class="btn" onclick="closeModal()">Close</button>
+    <div class="modal-header">
+      <h3 id="modal-title" style="font-size: 14px; font-weight: 600; letter-spacing: 0.5px;">Log Output</h3>
+      <button class="btn btn-sm" onclick="closeModal()">Close</button>
     </div>
     <pre id="modal-content">Loading...</pre>
   </div>
@@ -2560,6 +3058,11 @@ pre { background: #080c14; padding: 12px; border-radius: 8px; font-size: 12px; o
 
 <script>
 let currentTrack = "main";
+
+function toggleElement(id) {
+  const el = document.getElementById(id);
+  el.style.display = (el.style.display === "none" || !el.style.display) ? "block" : "none";
+}
 
 async function fetchStatus() {
   try {
@@ -2578,23 +3081,24 @@ function renderStatus(data) {
   const locks = data.locks || {};
   const lockKeys = Object.keys(locks);
   document.getElementById("metric-locks").innerText = lockKeys.length;
-  document.getElementById("lock-count-badge").innerText = lockKeys.length + " active";
+  document.getElementById("lock-count-badge").innerText = lockKeys.length + " active leases";
   
   const locksBody = document.getElementById("locks-body");
   if (lockKeys.length === 0) {
-    locksBody.innerHTML = '<tr><td colspan="5" style="color: var(--muted); text-align: center;">No active file leases. All files free.</td></tr>';
+    locksBody.innerHTML = '<tr><td colspan="6" style="color: var(--muted); text-align: center; padding: 24px;">No active file leases. All files are free for modification.</td></tr>';
   } else {
     const now = Date.now() / 1000;
     locksBody.innerHTML = lockKeys.map(k => {
       const item = locks[k];
       const rem = Math.max(0, Math.floor(item.expires_at - now));
+      const isApproved = item.status === 'APPROVED';
       return `<tr>
-        <td><code>[LOCKED] ${k}</code></td>
-        <td><span class="badge badge-cyan">${item.holder}</span></td>
+        <td><code class="mono">[LOCKED] ${k}</code></td>
+        <td><span class="badge">${item.holder}</span></td>
         <td><span class="badge">${item.role || 'implementer'}</span></td>
-        <td><span class="badge ${item.status === 'APPROVED' ? 'badge-emerald' : 'badge-amber'}">${item.status || 'LEASED'}</span></td>
-        <td><span style="color: ${rem < 30 ? 'var(--rose)' : 'var(--amber)'}; font-weight: 600;">${rem}s</span></td>
-        <td><button class="btn btn-danger" onclick="releaseLock('${k}', '${item.holder}')">Release</button></td>
+        <td><span class="badge ${isApproved ? 'badge-pass' : ''}">${item.status || 'LEASED'}</span></td>
+        <td style="color: ${rem < 30 ? 'var(--danger)' : 'var(--muted)'}; font-weight: 600;">${rem}s</td>
+        <td style="text-align: right;"><button class="btn btn-danger btn-sm" onclick="releaseLock('${k}', '${item.holder}')">Release</button></td>
       </tr>`;
     }).join("");
   }
@@ -2606,22 +3110,37 @@ function renderStatus(data) {
   
   const workersBody = document.getElementById("workers-body");
   if (workers.length === 0) {
-    workersBody.innerHTML = '<tr><td colspan="7" style="color: var(--muted); text-align: center;">No worker subagents spawned.</td></tr>';
+    workersBody.innerHTML = '<tr><td colspan="7" style="color: var(--muted); text-align: center; padding: 24px;">No worker subagents running. Click \\'+ Delegate Worker\\' to dispatch tasks.</td></tr>';
   } else {
     workersBody.innerHTML = workers.map(w => {
-      const isRunning = w.status === 'running';
-      const statusBadge = isRunning
-        ? '<span class="badge badge-emerald">[RUNNING]</span>'
-        : '<span class="badge">[DONE]</span>';
+      let statusBadge = '<span class="badge">[UNKNOWN]</span>';
+      let actionButtons = `<button class="btn btn-sm" onclick="viewWorkerLog('${w.id}')">Tail Log</button>`;
+      
+      if (w.status === 'pending_approval') {
+        statusBadge = '<span class="badge badge-pending">[PENDING APPROVAL]</span>';
+        actionButtons = `<button class="btn btn-primary btn-sm" onclick="approveWorker('${w.id}')">Approve</button> <button class="btn btn-danger btn-sm" onclick="rejectWorker('${w.id}')">Reject</button>`;
+      } else if (w.status === 'running') {
+        statusBadge = '<span class="badge badge-active">[RUNNING]</span>';
+        actionButtons = `<button class="btn btn-sm" onclick="viewWorkerLog('${w.id}')">Tail Log</button>`;
+      } else if (w.status === 'completed' || w.status === 'done') {
+        statusBadge = '<span class="badge badge-pass">[COMPLETED]</span>';
+        actionButtons = `<button class="btn btn-sm" onclick="viewWorkerLog('${w.id}')">Report</button>`;
+      } else if (w.status === 'rejected') {
+        statusBadge = '<span class="badge badge-danger">[REJECTED]</span>';
+        actionButtons = `<button class="btn btn-sm" onclick="viewWorkerLog('${w.id}')">Reason</button>`;
+      }
+      
       const isGod = w.mode === 'god';
+      const modelStr = (w.model || w.provider || '').toUpperCase();
+      const effortStr = isGod ? 'GOD' : (w.effort || 'std').toUpperCase();
       return `<tr>
-        <td><code>${w.id}</code></td>
-        <td><span class="badge badge-purple">${(w.provider || '').toUpperCase()}</span></td>
-        <td><span class="badge ${isGod ? 'badge-amber' : ''}">${isGod ? 'GOD' : (w.effort || 'std').toUpperCase()}</span></td>
+        <td><code class="mono">${w.id}</code></td>
+        <td><span class="badge">${(w.provider || '').toUpperCase()}</span></td>
+        <td><span class="badge ${isGod ? 'badge-god' : ''}">${modelStr} · ${effortStr}</span></td>
         <td>${statusBadge}</td>
         <td><strong>${w.role}</strong></td>
-        <td>${w.pid || '-'}</td>
-        <td><button class="btn" onclick="viewWorkerLog('${w.id}')">Log</button></td>
+        <td><code class="mono">${w.pid || '-'}</code></td>
+        <td style="text-align: right; white-space: nowrap;">${actionButtons}</td>
       </tr>`;
     }).join("");
   }
@@ -2639,7 +3158,7 @@ async function loadTrackFeed() {
     const lines = (data.content || '').split('\\n');
     const items = lines.filter(l => l.startsWith('- '));
     if (items.length === 0) {
-      feed.innerHTML = '<div style="color: var(--muted); text-align: center; padding: 20px;">No broadcast entries on this track.</div>';
+      feed.innerHTML = '<div style="color: var(--muted); text-align: center; padding: 24px;">No broadcast entries on this track.</div>';
     } else {
       feed.innerHTML = items.map(it => {
         return `<div class="track-item">${it.replace(/^- /, '')}</div>`;
@@ -2662,6 +3181,7 @@ async function handleClaim(e) {
     body: JSON.stringify({filepath: path, holder: holder, role: role, duration: duration})
   });
   document.getElementById("claim-path").value = "";
+  document.getElementById("claim-drawer").style.display = "none";
   fetchStatus();
 }
 
@@ -2679,15 +3199,27 @@ async function handleSpawn(e) {
   const role = document.getElementById("spawn-role").value;
   const prompt = document.getElementById("spawn-prompt").value;
   const provider = document.getElementById("spawn-provider").value;
+  const model = document.getElementById("spawn-model").value;
   const effort = document.getElementById("spawn-effort").value;
+  const approval = document.getElementById("spawn-approval").checked;
   const mode = provider === "god" ? "god" : "standard";
   await fetch("/api/spawn", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({role: role, prompt: prompt, provider: provider, effort: effort, mode: mode, track: currentTrack})
+    body: JSON.stringify({
+      role: role,
+      prompt: prompt,
+      provider: provider,
+      model: model,
+      effort: effort,
+      mode: mode,
+      track: currentTrack,
+      user_confirmed: !approval
+    })
   });
   document.getElementById("spawn-role").value = "";
   document.getElementById("spawn-prompt").value = "";
+  document.getElementById("spawn-drawer").style.display = "none";
   fetchStatus();
 }
 
@@ -2712,8 +3244,37 @@ function switchTrack(trackName) {
   loadTrackFeed();
 }
 
+async function approveWorker(id) {
+  try {
+    await fetch("/api/approve_worker", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: id})
+    });
+    fetchStatus();
+    loadTrackFeed();
+  } catch (e) {
+    alert("Approval failed: " + e);
+  }
+}
+
+async function rejectWorker(id) {
+  const reason = prompt("Enter rejection reason (optional):") || "";
+  try {
+    await fetch("/api/reject_worker", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: id, reason: reason})
+    });
+    fetchStatus();
+    loadTrackFeed();
+  } catch (e) {
+    alert("Rejection failed: " + e);
+  }
+}
+
 async function viewWorkerLog(id) {
-  document.getElementById("modal-title").innerText = `Log Tail: ${id}`;
+  document.getElementById("modal-title").innerText = `Log Output: ${id}`;
   document.getElementById("modal-content").innerText = "Loading...";
   document.getElementById("modal-overlay").style.display = "flex";
   try {
@@ -2728,6 +3289,10 @@ async function viewWorkerLog(id) {
 function closeModal() {
   document.getElementById("modal-overlay").style.display = "none";
 }
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
 
 fetchStatus();
 loadTrackFeed();
@@ -2843,13 +3408,28 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"result": res})
             return
 
+        if path == "/api/approve_worker":
+            res = t_approve_worker(worker_id=payload.get("id", ""))
+            self.send_json({"result": res})
+            return
+
+        if path == "/api/reject_worker":
+            res = t_reject_worker(worker_id=payload.get("id", ""), reason=payload.get("reason", ""))
+            self.send_json({"result": res})
+            return
+
         if path == "/api/spawn":
             res = t_spin_worker(
                 role=payload.get("role", ""),
                 prompt=payload.get("prompt", ""),
                 provider=payload.get("provider", "auto"),
+                model=payload.get("model", ""),
+                effort=payload.get("effort", "auto"),
+                mode=payload.get("mode", "standard"),
                 track=payload.get("track", "main"),
                 project_dir=payload.get("project_dir", ""),
+                user_confirmed=payload.get("user_confirmed", True),
+                permission_mode=payload.get("permission_mode", "auto_safe"),
             )
             self.send_json({"result": res})
             return
@@ -2980,16 +3560,32 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}},
     }),
     "spin_worker": (t_spin_worker, {
-        "description": "Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) with adaptive effort and God Mode.",
+        "description": "Spawn an autonomous worker subagent (Claude Code, OpenCode, or Antigravity) with adaptive effort, model selection, and permission safety.",
         "inputSchema": {"type": "object", "required": ["role", "prompt"], "properties": {
             "role": {"type": "string", "description": "Brief 2-5 word job title for the worker (e.g. 'Unit Tester')."},
             "prompt": {"type": "string", "description": "Clear actionable instruction for the subagent."},
             "provider": {"type": "string", "enum": ["auto", "claude", "opencode", "antigravity", "god"], "default": "auto"},
+            "model": {"type": "string", "description": "Target model alias (e.g. 'opus', 'sonnet', 'haiku', 'claude-opus-5.5', 'gemini-3.8')."},
             "track": {"type": "string", "default": "main", "description": "Shared context track name."},
             "project_dir": {"type": "string", "description": "Working directory (default: current workspace)."},
             "timeout_seconds": {"type": "integer", "default": 600},
             "effort": {"type": "string", "enum": ["auto", "low", "medium", "high", "max"], "default": "auto"},
             "mode": {"type": "string", "enum": ["standard", "god", "ultracode"], "default": "standard"},
+            "user_confirmed": {"type": "boolean", "default": False, "description": "Set true only after receiving explicit user confirmation in chat to spawn external agents."},
+            "permission_mode": {"type": "string", "enum": ["auto_safe", "dangerously_skip", "standard"], "default": "auto_safe"},
+        }},
+    }),
+    "approve_worker": (t_approve_worker, {
+        "description": "Authorize and launch a pending worker subagent queued in pending_approval state.",
+        "inputSchema": {"type": "object", "required": ["worker_id"], "properties": {
+            "worker_id": {"type": "string", "description": "Worker ID to approve."},
+        }},
+    }),
+    "reject_worker": (t_reject_worker, {
+        "description": "Reject and cancel a pending worker subagent.",
+        "inputSchema": {"type": "object", "required": ["worker_id"], "properties": {
+            "worker_id": {"type": "string", "description": "Worker ID to reject."},
+            "reason": {"type": "string", "description": "Cancellation reason."},
         }},
     }),
     "worker_status": (t_worker_status, {
@@ -3004,6 +3600,23 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {
             "track": {"type": "string", "default": "main", "description": "Track name or 'all'."},
             "wait": {"type": "boolean", "default": False, "description": "Wait up to 15s for running workers to finish."},
+        }},
+    }),
+    "estimate_complexity": (t_estimate_complexity, {
+        "description": "Evaluate task complexity and return recommended effort, tier, and provider.",
+        "inputSchema": {"type": "object", "required": ["prompt"], "properties": {
+            "prompt": {"type": "string", "description": "Task description to evaluate."},
+            "role": {"type": "string", "description": "Optional worker role."},
+        }},
+    }),
+    "escalate_worker": (t_escalate_worker, {
+        "description": "Dynamically escalate worker reasoning effort or dispatch an escalated successor.",
+        "inputSchema": {"type": "object", "required": ["worker_id"], "properties": {
+            "worker_id": {"type": "string", "description": "Target worker ID to escalate."},
+            "new_effort": {"type": "string", "enum": ["medium", "high", "max"], "default": "max"},
+            "new_mode": {"type": "string", "enum": ["standard", "god", "ultracode"], "default": "god"},
+            "reason": {"type": "string", "description": "Why escalation was triggered."},
+            "successor_provider": {"type": "string", "enum": ["auto", "claude", "opencode", "antigravity"], "default": "auto"},
         }},
     }),
     "join_track": (t_join_track, {
@@ -3120,6 +3733,35 @@ def main() -> None:
         if arg in ("--uninstall", "--remove", "uninstall"):
             from install import remove_all
             remove_all()
+            return
+        if arg in ("approve", "--approve"):
+            if len(sys.argv) < 3:
+                print("Usage: subway-context approve <worker_id>")
+                return
+            print(t_approve_worker(sys.argv[2]))
+            return
+        if arg in ("reject", "--reject"):
+            if len(sys.argv) < 3:
+                print("Usage: subway-context reject <worker_id> [reason]")
+                return
+            reason = sys.argv[3] if len(sys.argv) > 3 else ""
+            print(t_reject_worker(sys.argv[2], reason=reason))
+            return
+        if arg in ("workers", "--workers"):
+            print(t_worker_status())
+            return
+        if arg in ("tail", "--tail", "log", "--log"):
+            if len(sys.argv) < 3:
+                print("Usage: subway-context tail <worker_id>")
+                return
+            print(t_worker_status(worker_id=sys.argv[2]))
+            return
+        if arg in ("locks", "--locks"):
+            print(t_list_locks())
+            return
+        if arg in ("track", "--track"):
+            tname = sys.argv[2] if len(sys.argv) > 2 else "main"
+            print(t_read_track(track=tname))
             return
         name = arg
         args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}

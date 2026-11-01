@@ -295,6 +295,25 @@ Subway Context enables agents to dynamically delegate tasks and spin up backgrou
 - Automatically routes stdout/stderr into structured logs (`~/.subway-context/workers/<worker_id>.log`).
 - Broadcasts the worker launch to the shared context track.
 
+### God Mode (Experimental High-Reasoning Tier)
+
+When an architectural overhaul or critical multi-file refactor demands maximum autonomous reasoning, agents can launch workers in **God Mode**:
+
+```python
+spin_worker(
+    role="Principal Architect",
+    prompt="Audit all auth flows, refactor token expiration, and add RS256 rotation tests",
+    mode="god",
+    effort="max"
+)
+```
+
+> **Warning (Cost & Token Consumption)**: God Mode is experimental. It commands maximum reasoning depth on frontier models (e.g. Claude Opus Extended Thinking / Flagship reasoning models across all spawned workers). Subway Context automatically broadcasts a cost warning to the decision track:
+> ```text
+> [WARNING: GOD MODE ACTIVE] Maximum frontier reasoning effort and multi-agent autonomy enabled.
+> High token velocity and cost consumption. Use with experimental caution.
+> ```
+
 ### `worker_status(worker_id)` & `collect_reports(track, wait=True)`
 - Tracks worker lifecycle (`running`, `completed`, `failed`).
 - Extracts decision tails and files touched so parent agents can review work immediately.
