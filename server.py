@@ -8788,7 +8788,7 @@ def get_chat_context(session_id: Optional[str] = None) -> Optional[Dict[str, Any
     }
 
 
-def get_hud_data(project: str = "") -> Dict[str, Any]:
+def _compile_hud_data(project: str = "") -> Dict[str, Any]:
     """Compile a full snapshot of the Subway transit network for the HUD."""
     _ensure_subway_dir()
     state = load_locks()
@@ -8859,6 +8859,7 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
     hud_dict = {
         "version": VERSION,
         "timestamp": now,
+        "fetched_at": now,
         "time_iso": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
         "locks": state["locks"],
         "signoffs": lease_files,
@@ -8884,6 +8885,44 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
     if chat_ctx is not None:
         hud_dict["chat_context"] = chat_ctx
     return hud_dict
+
+
+_hud_cache_lock = threading.Lock()
+_hud_cache: Dict[str, Dict[str, Any]] = {}  # project -> {"data", "at", "stale", "busy"}
+
+
+def mark_hud_cache_stale() -> None:
+    """Mark every HUD snapshot stale so the next request refreshes in the background."""
+    with _hud_cache_lock:
+        for entry in _hud_cache.values():
+            entry["stale"] = True
+
+
+def _bg_refresh_hud(project: str = "") -> None:
+    try:
+        data = _compile_hud_data(project)
+        with _hud_cache_lock:
+            _hud_cache[project] = {"data": data, "at": data.get("fetched_at", time.time()), "stale": False, "busy": False}
+    except Exception:
+        with _hud_cache_lock:
+            if project in _hud_cache:
+                _hud_cache[project]["busy"] = False
+
+
+def get_hud_data(project: str = "") -> Dict[str, Any]:
+    """The HUD snapshot for a project: the last one at once, refreshed in the background when over 10 s old or stale.
+    Only the HUD reads this; routing and budgets read live data."""
+    with _hud_cache_lock:
+        entry = _hud_cache.get(project)
+        if entry is not None:
+            if (entry["stale"] or time.time() - entry["at"] > 10.0) and not entry["busy"]:
+                entry["busy"] = True
+                threading.Thread(target=_bg_refresh_hud, args=(project,), daemon=True).start()
+            return entry["data"]
+    data = _compile_hud_data(project)  # First call for this project: build it outside the lock.
+    with _hud_cache_lock:
+        _hud_cache[project] = {"data": data, "at": data.get("fetched_at", time.time()), "stale": False, "busy": False}
+    return data
 
 
 def t_hud_status(project: str = "") -> str:
@@ -9159,13 +9198,16 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
 
     def send_json(self, data: Any, status: int = 200) -> None:
-        payload = json.dumps(data).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._security_headers()
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            payload = json.dumps(data).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _deny(self, status: int, message: str) -> None:
         self.send_json({"error": message}, status)
@@ -9206,12 +9248,15 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             return
         nonce = secrets.token_urlsafe(16)
         payload = page.replace("__SUBWAY_TOKEN__", hud_token()).replace("__CSP_NONCE__", nonce).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._security_headers(nonce)
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._security_headers(nonce)
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _serve_asset(self, path: str) -> None:
         """The HUD's own modules and styles, with no secrets in them, from hud/ and nowhere else."""
@@ -9225,12 +9270,15 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             return
         with open(full, "rb") as f:
             payload = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", f"{kind}; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._security_headers()
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", f"{kind}; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _stream_events(self) -> None:
         """Server-sent events: the HUD is told about a change the moment it happens."""
@@ -9485,6 +9533,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._deny(404, "Not found")
             return
+        mark_hud_cache_stale()
         self.send_json({"result": res})
 
 
@@ -9504,6 +9553,12 @@ def archive_history() -> str:
 
 class SubwayHUDServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        _cls, val, _tb = sys.exc_info()
+        if isinstance(val, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 _hud_server_instance: Optional[http.server.HTTPServer] = None
