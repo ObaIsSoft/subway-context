@@ -7490,11 +7490,11 @@ def _process_cpu_time(proc: Any) -> Optional[float]:
         if result.returncode:
             return None
         value = result.stdout.strip()
-        match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", value)
+        match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", value)
         if not match:
             return None
-        days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
-        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+        days, hours, minutes = (int(part or 0) for part in match.groups()[:3])
+        return days * 86400 + hours * 3600 + minutes * 60 + float(match.group(4))
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
 
@@ -7508,19 +7508,32 @@ def _file_activity_signature(path: str) -> Tuple[bool, int, int]:
 
 
 def _worker_folder_activity(meta: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+    """A cheap change fingerprint of the worker's folder: git status plus each changed path's size and mtime."""
     folder = meta.get("worktree") or meta.get("project_dir")
     if not folder or not os.path.isdir(folder):
         return None
+    real = os.path.realpath(folder)
+    if real in (os.path.realpath(HOME), os.path.realpath(os.sep)):
+        return None  # Too big to watch; the other signals decide.
     try:
-        fingerprint = _git_change_fingerprint(folder)
+        status = subprocess.run(["git", "status", "--porcelain=1", "-z", "--untracked-files=all"],
+                                cwd=real, capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        fingerprint = None
-    if fingerprint is not None:
-        return "git", fingerprint
-    newest_mtime = 0
-    for root, dirs, files in os.walk(folder):
+        status = None
+    if status is not None and status.returncode == 0:
+        digest = hashlib.sha256(status.stdout)
+        for entry in status.stdout.split(b"\0"):
+            path = entry[3:].decode("utf-8", "replace") if len(entry) > 3 else ""
+            if path:
+                digest.update(repr(_file_activity_signature(os.path.join(real, path))).encode())
+        return "git", digest.hexdigest()
+    newest_mtime, seen = 0, 0
+    for root, dirs, files in os.walk(real):
         dirs[:] = [name for name in dirs if name not in (".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__")]
         for name in files:
+            seen += 1
+            if seen > 5000:
+                return "mtime", newest_mtime
             try:
                 newest_mtime = max(newest_mtime, os.stat(os.path.join(root, name)).st_mtime_ns)
             except OSError:
@@ -7564,9 +7577,7 @@ def _worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at: float)
     if log_path:
         signals["output"] = _file_activity_signature(log_path)
     if meta.get("provider") == "copilot" and meta.get("copilot_session_id"):
-        events_path = os.path.join(
-            HOME, ".copilot", "session-state", str(meta["copilot_session_id"]), "events.jsonl",
-        )
+        events_path = os.path.join(COPILOT_DIR, "session-state", str(meta["copilot_session_id"]), "events.jsonl")
         signals["copilot_events"] = _file_activity_signature(events_path)
     if meta.get("provider") == "opencode":
         activity = _opencode_worker_session_activity(meta, started_at)
@@ -8016,6 +8027,8 @@ def supervise_worker(worker_id: str) -> int:
                 opencode_retries_seen: Set[Tuple[str, str]] = set()
                 previous_activity = _worker_activity_signals(meta, proc, worker_started_at)
                 last_activity = {signal: start_time for signal in previous_activity}
+                signal_interval = min(5.0, max(0.05, stall_timeout / 20))
+                next_signal_check = start_time + signal_interval
 
                 def quota_handler(text: str, source: str) -> None:
                     q_err = check_quota_error(str(meta.get("provider") or ""), text, source=source)
@@ -8039,7 +8052,7 @@ def supervise_worker(worker_id: str) -> int:
                             quota_handler(line, "stderr")
 
                 def stall_watchdog() -> None:
-                    nonlocal next_opencode_check, previous_activity
+                    nonlocal next_opencode_check, previous_activity, next_signal_check
                     while not stall_event.is_set() and not stopped["flag"]:
                         now = time.time()
                         if is_acp and meta.get("provider") == "opencode" and now >= next_opencode_check:
@@ -8057,10 +8070,14 @@ def supervise_worker(worker_id: str) -> int:
                                 if proc.poll() is None:
                                     proc.terminate()
                                 return
-                        signals = _worker_activity_signals(meta, proc, worker_started_at)
-                        _update_worker_activity(previous_activity, last_activity, signals, now)
+                        if now >= next_signal_check:
+                            # git, ps and the OpenCode DB are too costly to read every half second.
+                            next_signal_check = now + signal_interval
+                            signals = _worker_activity_signals(meta, proc, worker_started_at)
+                            _update_worker_activity(previous_activity, last_activity, signals, now)
                         if _worker_is_stalled(last_activity, now, stall_timeout):
-                            stopped["stall"] = "stalled"
+                            quiet = ", ".join(sorted(last_activity)) or "no signals"
+                            stopped["stall"] = f"No activity for {int(stall_timeout)}s from any signal ({quiet})."
                             stopped["flag"] = True
                             if is_acp and run.get("conversation") and proc.poll() is None:
                                 with contextlib.suppress(Exception):

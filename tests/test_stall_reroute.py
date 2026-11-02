@@ -265,6 +265,7 @@ class TestStallAndReroute(unittest.TestCase):
         }
         proc = mock.Mock(pid=123)
         with mock.patch.object(server, "_worker_folder_activity", return_value=None), \
+             mock.patch.object(server, "COPILOT_DIR", os.path.join(self.temp_dir, ".copilot")), \
              mock.patch.object(server, "_process_cpu_time", return_value=None):
             previous = server._worker_activity_signals(meta, proc, 0)
             last_active = {key: 10.0 for key in previous}
@@ -953,3 +954,34 @@ class TestStallAndReroute(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestActivitySignalHelpers(unittest.TestCase):
+    def test_cpu_time_parses_macos_fractional_seconds(self):
+        proc = mock.MagicMock(pid=4242)
+        for text, expected in (("  0:00.01\n", 0.01), ("225:57.98\n", 225 * 60 + 57.98), ("1-02:03:04\n", 93784.0)):
+            done = mock.MagicMock(returncode=0, stdout=text)
+            with mock.patch("builtins.open", side_effect=OSError("no /proc")), \
+                 mock.patch.object(server.subprocess, "run", return_value=done):
+                self.assertAlmostEqual(server._process_cpu_time(proc), expected, places=2)
+
+    def test_folder_activity_never_watches_home_or_root(self):
+        with mock.patch.object(server.subprocess, "run") as run, mock.patch.object(server.os, "walk") as walk:
+            self.assertIsNone(server._worker_folder_activity({"project_dir": server.HOME}))
+            self.assertIsNone(server._worker_folder_activity({"project_dir": os.sep}))
+            run.assert_not_called()
+            walk.assert_not_called()
+
+    def test_folder_activity_changes_when_a_changed_file_grows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server.subprocess.run(["git", "init", "-q"], cwd=folder, check=True)
+            path = os.path.join(folder, "a.txt")
+            with open(path, "w") as f:
+                f.write("one")
+            first = server._worker_folder_activity({"project_dir": folder})
+            with open(path, "a") as f:
+                f.write(" two")
+            os.utime(path, (time.time() + 5, time.time() + 5))
+            second = server._worker_folder_activity({"project_dir": folder})
+            self.assertEqual(first[0], "git")
+            self.assertNotEqual(first, second)
