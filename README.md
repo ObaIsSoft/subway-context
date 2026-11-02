@@ -54,7 +54,13 @@ cd ~/Documents/dev/subway-context
 
 ### 2. Universal 1-Click Auto-Connect
 
-Run the universal installer to automatically detect and register Subway Context across all installed agents (**Claude Code**, **Antigravity**, and **OpenCode**) in one step:
+Install subway-context directly via npm (v1.2.0):
+
+```bash
+npx -y subway-context install
+```
+
+Or run the universal installer script locally:
 
 ```bash
 python3 install.py
@@ -290,7 +296,8 @@ Subway Context tracks live rate limits, token usage, and session windows across 
 
 ### Budgets & Capacity
 
-- **Budgets**: `budget_session_pct` and `budget_weekly_pct` are points a worker may use, checked before it starts and enforced while it runs, with status `budget_stopped`. Pools are shared, so other work in a pool counts too. `max_tokens` caps Antigravity workers. `max_budget_usd` caps Claude workers.
+- **Budgets**: `subway-context budget` shows active budgets. `subway-context budget <chat|provider> <tokens>` sets them. Warnings trigger at 80% and execution stops at 100%. The HUD pings once when a limit is reached; the HUD can raise budgets, but agents cannot.
+- **Enforcement**: Claude Code can block the chat as you type through hooks. Antigravity and OpenCode have no such hook, so there the block happens on the next Subway tool call.
 - **Capacity**: 4 running workers per chat. Per machine: 2 up to 8 GB, 6 up to 16 GB, 10 above, or set `max_workers` in `config.json`. A worker over the limit stays queued.
 
 ---
@@ -312,20 +319,22 @@ Workers **always require user approval** before any execution begins:
 ### Provider Dispatch & Antigravity CLI Note
 
 - **Claude Workers**: Run via the `claude` CLI with `--effort`, `--model`, and custom tool permissions.
-- **OpenCode Workers**: Run via `opencode run`.
-- **Custom Providers**: Add a CLI to `providers.json` with `id`, `name`, `bin`, `args` using `{prompt}`, `model_args` using `{model}`, and `skills`. It's detected, shown and dispatched with no code change, with no usage data or permission relay.
+- **OpenCode Workers**: Run through ACP, so they ask permission and can be denied.
+- **Custom Providers**: Add a CLI to `providers.json` with `id`, `name`, `bin`, `args` using `{prompt}`, `model_args` using `{model}`, and `skills`. Custom providers have no token reporting, so they use a time cap instead.
 - **Antigravity Workers**: Run through the **`agy` CLI binary** (`agy --print ...`). Note that `agy` runs detached batch CLI sessions and **cannot continue an active Antigravity IDE conversation**.
 - **God Mode (`mode="god"`)**: Available only with explicit user consent. Disables interactive permission pauses on high-tier models.
 
-### Three Permission Modes
+### Permission Modes
 
-Workers run under one of three permission modes (configurable in HUD, CLI, or per-worker):
+Workers use permission modes to govern actions:
+- **ask (Default)**: Always ask before running actions.
+- **auto_safe**: Automatically approves safe read-only and diagnostic commands.
+- **auto_approve**: Auto-approves actions only if the user explicitly chooses it. Agents cannot enable this mode on their own.
 
-1. **`ask` (Default)**: Every tool or command requiring permission generates a request sent to the launching chat and displayed on the HUD.
-2. **`auto_safe`**: Automatically approves a curated list of read-only and diagnostic commands (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `mkdir`, `git status`, `git diff`, `git log`, `pytest`, `npm test`, `python3 -m unittest`), while pausing and asking for anything else.
-3. **`auto_approve`**: Never asks; auto-approves all actions. Only used when the user explicitly requests prompts to be disabled.
+### Platform Support
 
-> **Oversight Rule**: Set the default mode with `subway-context mode <name>` or via the HUD. **Agents cannot change the default permission mode themselves through MCP.**
+- macOS and Linux are supported.
+- Windows support is written but untested.
 
 ### Permission Relay & Commands
 

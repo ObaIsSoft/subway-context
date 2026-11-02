@@ -840,7 +840,7 @@ class TestMCPAndPermissions(SubwayTestCase):
         self.assertIn("--dangerously-skip-permissions", cmd_claude_appr)
 
         cmd_open_appr = server._worker_command("opencode", "opencode", "default", "medium", False, ["files:read"], "auto_approve", "task", None, "")
-        self.assertIn("--auto", cmd_open_appr)
+        self.assertEqual(cmd_open_appr[-1], "acp")  # Asking is set through the environment, not a flag.
 
         # set_permission_mode is NOT exposed as an MCP tool
         self.assertNotIn("set_permission_mode", server.TOOLS)
@@ -1001,7 +1001,7 @@ class TestInstaller(SubwayTestCase):
             s_data = json.load(f)
         pre_tool = s_data.get("hooks", {}).get("PreToolUse", [])
         hook_count = sum(1 for e in pre_tool for h in e.get("hooks", []) if "hook-guard" in h.get("command", ""))
-        self.assertEqual(hook_count, 1)
+        self.assertEqual(hook_count, 1)  # One guard on every tool: it covers leases and budgets.
 
         # 4. Remove cleans up
         rem_ok = install.remove_target("claude")
@@ -1054,13 +1054,25 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertFalse(server.local_fit("small", {"running": False})[0])
 
     def test_routing_follows_the_task_not_the_role(self):
-        job = "Add unit tests for the parser"
-        arch_res = server.route_task(job, role="Principal Architect")
-        writer_res = server.route_task(job, role="Technical Writer")
+        code_job = "Refactor the database layer and authentication flow"
+        write_job = "Write the documentation and release notes"
+        arch_res = server.route_task(code_job, role="Principal Architect")
+        writer_res = server.route_task(write_job, role="Technical Writer")
         self.assertEqual(arch_res["skill"], "coding")
         self.assertEqual(writer_res["skill"], "writing")
         self.assertNotEqual(arch_res["skill"], writer_res["skill"])
         self.assertNotEqual(arch_res["order"], writer_res["order"])
+
+    def test_spin_swarm_spreads_providers(self):
+        res = server.t_spin_swarm(role="Reviewer", prompt="Review the codebase", provider="auto",
+                                  subtasks=["subtask 1", "subtask 2"])
+        self.assertIn("[SWARM]", res)
+        workers = [w for w in server._all_workers() if "Reviewer" in w.get("role", "")]
+        self.assertGreaterEqual(len(workers), 2)
+        # Check reasons
+        for w in workers[-2:]:
+            self.assertTrue(bool(w.get("route")))
+            self.assertIn("Assigned to", w.get("route"))
 
     def test_senior_engineer_refactor_routing(self):
         providers = [
@@ -1242,6 +1254,156 @@ class TestLocalAndRouting(SubwayTestCase):
 
     def test_chunks_cover_all_text(self):
         self.assertEqual("".join(server._chunks("abcdefghij", 3)), "abcdefghij")
+
+    def _create_fake_opencode2(self):
+        script_path = os.path.join(self.test_dir, "fake_opencode2.py")
+        code = (
+            "import sys, json, time\n"
+            "def send(msg):\n"
+            "    sys.stdout.write(json.dumps(msg) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "prompt_id = None\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line:\n"
+            "        continue\n"
+            "    try:\n"
+            "        req = json.loads(line)\n"
+            "    except Exception:\n"
+            "        continue\n"
+            "    method = req.get('method')\n"
+            "    req_id = req.get('id')\n"
+            "    if method == 'initialize':\n"
+            "        send({'jsonrpc': '2.0', 'id': req_id, 'result': {'protocolVersion': 1}})\n"
+            "    elif method == 'session/new':\n"
+            "        send({'jsonrpc': '2.0', 'id': req_id, 'result': {'sessionId': 'fake_ses_01', 'configOptions': []}})\n"
+            "    elif method == 'session/set_config_option':\n"
+            "        send({'jsonrpc': '2.0', 'id': req_id, 'result': {}})\n"
+            "    elif method == 'session/prompt':\n"
+            "        prompt_id = req_id\n"
+            "        prompt_text = ''\n"
+            "        for p in (req.get('params') or {}).get('prompt') or []:\n"
+            "            if isinstance(p, dict) and p.get('type') == 'text':\n"
+            "                prompt_text += p.get('text', '')\n"
+            "        if 'test_allow' in prompt_text:\n"
+            "            send({'jsonrpc': '2.0', 'id': 201, 'method': 'session/request_permission',\n"
+            "                  'params': {'sessionId': 'fake_ses_01', 'toolCall': {'title': 'Bash', 'rawInput': 'echo 123'},\n"
+            "                             'options': [{'kind': 'allow_once', 'optionId': 'opt_allow'}, {'kind': 'reject_once', 'optionId': 'opt_deny'}]}})\n"
+            "        elif 'test_deny' in prompt_text:\n"
+            "            send({'jsonrpc': '2.0', 'id': 202, 'method': 'session/request_permission',\n"
+            "                  'params': {'sessionId': 'fake_ses_01', 'toolCall': {'title': 'rm', 'rawInput': 'rm file'},\n"
+            "                             'options': [{'kind': 'allow_once', 'optionId': 'opt_allow'}, {'kind': 'reject_once', 'optionId': 'opt_deny'}]}})\n"
+            "        elif 'test_cap' in prompt_text:\n"
+            "            while True:\n"
+            "                time.sleep(0.5)\n"
+            "    elif req.get('result') is not None:\n"
+            "        res = req.get('result') or {}\n"
+            "        outcome = res.get('outcome') or {}\n"
+            "        chosen = outcome.get('optionId')\n"
+            "        if req_id == 201:\n"
+            "            send({'jsonrpc': '2.0', 'method': 'session/update',\n"
+            "                  'params': {'sessionId': 'fake_ses_01', 'update': {'sessionUpdate': 'tool_call', 'toolCall': {'title': 'Bash', 'rawInput': 'echo 123'}}}})\n"
+            "            send({'jsonrpc': '2.0', 'id': prompt_id, 'result': {'response': 'Report: allowed and finished'}})\n"
+            "        elif req_id == 202:\n"
+            "            send({'jsonrpc': '2.0', 'id': prompt_id, 'result': {'response': f'Report: answer was {chosen}'}})\n"
+            "    elif method == 'session/cancel':\n"
+            "        sys.exit(0)\n"
+        )
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        return script_path
+
+    def test_opencode_acp_allow_runs_and_reports(self):
+        script_path = self._create_fake_opencode2()
+        worker_id = "worker_a0c001"
+        meta = {
+            "id": worker_id,
+            "role": "ACP Worker",
+            "provider": "opencode",
+            "cmd": [sys.executable, script_path, "acp"],
+            "project_dir": self.test_dir,
+            "log_file": server._log_file(worker_id),
+            "status": "running",
+            "prompt": "test_allow",
+            "timeout_seconds": 10,
+        }
+        server._save_worker(meta)
+        def answer_thread():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                perms = server._pending_permissions(worker_id)
+                if perms:
+                    server._answer_permission(perms[0]["id"], "allow", "tester")
+                    return
+                time.sleep(0.05)
+        threading.Thread(target=answer_thread, daemon=True).start()
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("Report: allowed and finished", updated.get("report", ""))
+
+    def test_opencode_acp_deny_is_sent_as_reject_once(self):
+        script_path = self._create_fake_opencode2()
+        worker_id = "worker_a0c002"
+        meta = {
+            "id": worker_id,
+            "role": "ACP Worker",
+            "provider": "opencode",
+            "cmd": [sys.executable, script_path, "acp"],
+            "project_dir": self.test_dir,
+            "log_file": server._log_file(worker_id),
+            "status": "running",
+            "prompt": "test_deny",
+            "timeout_seconds": 10,
+        }
+        server._save_worker(meta)
+        def answer_thread():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                perms = server._pending_permissions(worker_id)
+                if perms:
+                    server._answer_permission(perms[0]["id"], "deny", "tester")
+                    return
+                time.sleep(0.05)
+        threading.Thread(target=answer_thread, daemon=True).start()
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("opt_deny", updated.get("report", ""))
+
+    def test_opencode_acp_cap_stops_it(self):
+        script_path = self._create_fake_opencode2()
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE IF NOT EXISTS session_v2 (id TEXT, model TEXT, time_updated INTEGER, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER)")
+            con.execute("INSERT INTO session_v2 (id, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read) VALUES (?, ?, ?, ?, ?)",
+                        ("fake_ses_01", 300, 300, 50, 0))
+            con.commit()
+        finally:
+            con.close()
+
+        worker_id = "worker_a0c003"
+        meta = {
+            "id": worker_id,
+            "role": "ACP Worker",
+            "provider": "opencode",
+            "cmd": [sys.executable, script_path, "acp"],
+            "project_dir": self.test_dir,
+            "log_file": server._log_file(worker_id),
+            "budget": {"max_tokens": 500},
+            "status": "running",
+            "prompt": "test_cap",
+            "timeout_seconds": 10,
+        }
+        server._save_worker(meta)
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "budget_stopped")
+        self.assertIn("token cap", updated.get("report", ""))
 
 
 if __name__ == "__main__":

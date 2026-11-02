@@ -1,5 +1,5 @@
 /* Shell, routing and polling. */
-import { api, duration, get, h, icon, listen, set, subscribe, tickAll, toast } from "./lib.js";
+import { api, duration, get, h, icon, listen, set, subscribe, tickAll, toast, tokens } from "./lib.js";
 import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, usagePage, workersPage } from "./views.js";
 
 const POLL_MS = 1000;
@@ -130,6 +130,7 @@ function refresh() {
       linkText.textContent = `Ping ${ping} ms · v${d.version}`;
       alertBar.hidden = true;
       pingLowLimits(d.settings?.low_limits || []);
+      pingBudgets(d.settings?.budgets || []);
     } catch (e) {
       linkDot.className = "dot bad";
       linkText.textContent = "Disconnected";
@@ -153,6 +154,26 @@ function pingLowLimits(items) {
     seen[key] = 1;
     const reset = item.resets_at ? ` Resets in ${duration(item.resets_at - Date.now() / 1000)}.` : "";
     toast(`${item.provider}: ${item.label} limit at ${Math.round(item.left_pct)}%.${reset}`);
+  }
+  try { localStorage.setItem("subway-pings", JSON.stringify(seen)); } catch (e) { /* Private windows can refuse storage. */ }
+}
+
+export function pingBudgets(data) {
+  const items = Array.isArray(data) ? data : (data?.settings?.budgets || []);
+  let seen = {};
+  try { seen = JSON.parse(localStorage.getItem("subway-pings") || "{}"); } catch (e) { seen = {}; }
+  for (const b of items) {
+    if (b.status !== "warning" && b.status !== "reached") continue;
+    const key = `budget|${b.scope}|${b.status}|${b.limit}`;
+    if (seen[key]) continue;
+    seen[key] = 1;
+    const x = tokens(b.used || 0);
+    const y = tokens(b.limit || 0);
+    if (b.status === "warning") {
+      toast(`Budget almost gone: ${b.scope} at ${x} of ${y}. Add more on Overview.`);
+    } else if (b.status === "reached") {
+      toast(`Budget reached: ${b.scope} at ${x} of ${y}. Work has stopped. Add more on Overview.`);
+    }
   }
   try { localStorage.setItem("subway-pings", JSON.stringify(seen)); } catch (e) { /* Private windows can refuse storage. */ }
 }

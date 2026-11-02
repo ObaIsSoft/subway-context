@@ -185,6 +185,14 @@ details ul { list-style: none; padding-top: 4px; font-size: 11px; color: var(--m
 
 .bar { height: 8px; border-radius: 4px; background: var(--line-soft); overflow: hidden; }
 .bar-fill { height: 100%; background: var(--gold); border-radius: 4px; transition: width .3s ease; }
+.bar-fill.bad { background: var(--red); }
+
+/* Budgets */
+.budget-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.budget-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.budget-form { display: flex; align-items: center; gap: 8px; }
+.budget-form input { flex: 1 1 auto; min-width: 0; }
+.budget-form .btn { flex: none; white-space: nowrap; }
 
 /* Chart */
 .chart { width: 100%; height: auto; }
@@ -280,6 +288,12 @@ pre { padding: 14px; border-radius: var(--radius-sm); background: var(--bg); fon
   color: var(--text-muted, #888);
   font-weight: 600;
 }
+.meter-label .meter-full {
+  display: none;
+}
+.meter-label .meter-short {
+  display: inline;
+}
 .meter-dots {
   display: flex;
   gap: 3px;
@@ -314,6 +328,12 @@ pre { padding: 14px; border-radius: var(--radius-sm); background: var(--bg); fon
     align-items: center;
     gap: 12px;
   }
+  .meter-label .meter-full {
+    display: inline;
+  }
+  .meter-label .meter-short {
+    display: none;
+  }
 }
 
 /* Tablet */
@@ -333,6 +353,8 @@ pre { padding: 14px; border-radius: var(--radius-sm); background: var(--bg); fon
   .row > .btns { grid-column: 2; grid-row: 1 / span 2; justify-content: flex-end; }
   .model-row { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 16px; }
   .model-scores { width: 270px; flex: none; }
+  .budget-form { justify-content: flex-end; }
+  .budget-form input { width: auto; max-width: 14rem; }
   .toast { left: auto; right: 24px; bottom: 24px; width: 420px; }
 }
 @media (min-width: 768px) {

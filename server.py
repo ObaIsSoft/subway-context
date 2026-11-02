@@ -65,7 +65,7 @@ try:
 except ImportError:  # Windows: state stays atomic per write, but not serialized across processes.
     fcntl = None  # type: ignore[assignment]
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("SUBWAY_CLAUDE_DIR", os.path.join(HOME, ".claude"))
 CLAUDE_JSON = os.environ.get("SUBWAY_CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
@@ -2008,9 +2008,45 @@ def t_list_locks() -> str:
 
 
 def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Claude Code PreToolUse hook: deny an edit to a file another agent holds a lease on."""
+    """Claude Code PreToolUse hook: deny an edit to a file another agent holds a lease on, or stop if chat budget reached."""
+    cfg = _load_json("config.json")
+    limit = cfg.get("chat_budget_tokens")
+    if limit:
+        limit = int(limit)
+        sid = event.get("session_id")
+        used = chat_tokens_used(sid)
+        if used is not None and used >= limit:
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD.",
+            }}
+
+    tool_name = event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
-    filepath = tool_input.get("file_path") or tool_input.get("notebook_path")
+    cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if (tool_name == "Bash" or cmd is not None) and isinstance(cmd, str):
+        if re.search(r"(subway-context|server\.py)\s+budget\s+\S+\s+\d", cmd):
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Budgets are the user's to change. Ask them to run it, or use the HUD.",
+            }}
+
+    filepath = (tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path")) if isinstance(tool_input, dict) else None
+    if filepath and isinstance(filepath, str):
+        cpath = _canon_path(filepath, event.get("cwd") or "")
+        sdir = os.path.abspath(os.path.expanduser(SUBWAY_DIR))
+        sreal = os.path.realpath(sdir)
+        creal = os.path.realpath(cpath)
+        if (cpath == sdir or cpath.startswith(sdir + os.sep)
+                or creal == sreal or creal.startswith(sreal + os.sep)):
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Budgets are the user's to change. Ask them to run it, or use the HUD.",
+            }}
+
     if not filepath:
         return None
     lease = load_locks()["locks"].get(_canon_path(filepath, event.get("cwd") or ""))
@@ -2411,7 +2447,25 @@ def benchmark_strengths(rows: List[Dict[str, Any]], models: List[Dict[str, Any]]
     matched_ratings: Dict[str, float] = {}
 
     def matches_model(m_id: str, row_name: str) -> bool:
-        r = row_name.lower()
+        r = row_name.lower().strip()
+        m = m_id.lower().strip()
+        if not r or not m:
+            return False
+        if "gemini" in m or "gemini" in r:
+            is_m_flash = "flash" in m
+            is_r_flash = "flash" in r
+            is_m_pro = "pro" in m
+            is_r_pro = "pro" in r
+            if (is_m_flash and is_r_pro) or (is_m_pro and is_r_flash):
+                return False
+            m_vers = re.findall(r"\d+(?:\.\d+)?", m)
+            r_vers = re.findall(r"\d+(?:\.\d+)?", r)
+            if m_vers and r_vers and set(m_vers).isdisjoint(set(r_vers)):
+                return False
+            clean_m = re.sub(r"-(?:low|medium|high|preview|thinking|latest)$", "", m)
+            clean_r = re.sub(r"-(?:low|medium|high|preview|thinking|latest)$", "", r)
+            if clean_m in r or clean_r in m:
+                return True
         if m_id == "claude-opus":
             return "opus" in r
         elif m_id == "claude-sonnet":
@@ -2428,7 +2482,7 @@ def benchmark_strengths(rows: List[Dict[str, Any]], models: List[Dict[str, Any]]
                 clean = clean[:-len("-free")]
             return clean.lower() in r
         else:
-            return m_id.lower() in r
+            return m in r
 
     for m in models:
         m_id = m.get("model") or ""
@@ -2716,6 +2770,35 @@ def _pool_left(providers: List[Dict[str, Any]], provider: str, model: str) -> Op
     return min(values) if values else None
 
 
+def _mark_model_bad(model: str, reason: str = "") -> None:
+    if not model:
+        return
+    with _state_lock("bad_models"):
+        bad = _load_json("bad_models.json")
+        bad[model] = {"timestamp": time.time(), "reason": str(reason or "")}
+        _save_json("bad_models.json", bad)
+
+
+def _model_is_bad(model: str) -> bool:
+    if not model:
+        return False
+    bad = _load_json("bad_models.json")
+    entry = bad.get(model)
+    if not entry:
+        if "/" in model:
+            entry = bad.get(model.split("/", 1)[1])
+        else:
+            entry = next((v for k, v in bad.items() if k.endswith("/" + model)), None)
+    if not entry:
+        return False
+    ts = entry.get("timestamp") if isinstance(entry, dict) else entry
+    try:
+        ts_val = float(ts)
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - ts_val) < 24 * 3600
+
+
 def route_task(prompt: str, role: str = "", private: bool = False, god: bool = False,
                providers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Pick models using all three signals:
@@ -2728,7 +2811,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     bulk = scale >= 100 and _has_any(text, BULK_WORDS)
     skill, skill_from = _skill_for(role, prompt)
     if private or _has_any(text, PRIVATE_WORDS):
-        return {"order": ["local"], "picks": [{"provider": "local", "model": ""}], "tier": c["tier"], "effort": c["effort"],
+        local_model = choose_local_model(need_tools=False) or "local"
+        return {"order": ["local"], "picks": [{"provider": "local", "model": local_model}], "tier": c["tier"], "effort": c["effort"],
                 "private": True, "skill": skill, "reason": "Private data, so it stays on this machine."}
 
     tier = "frontier" if god else c["tier"]
@@ -2741,21 +2825,59 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     for m in model_catalog():
         if m["provider"] not in usable:
             continue
-        strength = int(m.get(skill, 1))
-        left = _pool_left(providers, m["provider"], m["model"])
+        model_name = (m.get("model") or "").strip()
+        if not model_name:
+            if m["provider"] == "local":
+                model_name = choose_local_model(need_tools=False) or "local"
+            elif m["provider"] == "opencode":
+                oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om)]
+                model_name = oc_cand[0] if oc_cand else ""
+            else:
+                model_name = m["provider"]
+        if not model_name or _model_is_bad(model_name):
+            continue
+        m_entry = dict(m, model=model_name)
+        strength = int(m_entry.get(skill, 1))
+        left = _pool_left(providers, m_entry["provider"], m_entry["model"])
         if left is not None and left <= 0:
             continue
-        ranked.append((strength, left if left is not None else 50.0, m))
+        ranked.append((strength, left if left is not None else 50.0, m_entry))
     enough = [r for r in ranked if r[0] >= need]
     if not enough:
         enough = sorted(ranked, key=lambda r: -r[0])[:3]  # Nothing is strong enough: offer the strongest available.
+
+    is_code_edit = (skill == "coding" and not _has_any(text, ["review", "audit"]))
+
+    def _pref(m_info: Dict[str, Any]) -> int:
+        prov = m_info.get("provider", "")
+        m_name = m_info.get("model", "")
+        is_free = bool(m_info.get("free") or m_name.endswith("-free") or prov == "local")
+        if is_code_edit:
+            if is_free or prov == "local":
+                return 3
+            if prov == "antigravity":
+                return 0
+            if prov == "claude":
+                return 1
+            return 2
+        else:
+            if is_free or prov == "local":
+                return 0
+            if prov == "antigravity":
+                return 1
+            if prov == "claude":
+                return 3
+            return 2
+
     if need >= 4:
-        # Hard work: the strongest model, and a scarce one only if nothing else is as strong.
-        enough.sort(key=lambda r: (-r[0], bool(r[2].get("scarce")), -r[1]))
+        # Hard work: the strongest model, and a scarce one only if nothing else is as strong. Free models last on code edits.
+        enough.sort(key=lambda r: (1 if is_code_edit and (r[2].get("free") or r[2]["model"].endswith("-free") or r[2]["provider"] == "local") else 0,
+                                   -r[0], bool(r[2].get("scarce")), -r[1]))
     else:
-        # Everyday work: the weakest model that's good enough, saving the strong allowances.
-        enough.sort(key=lambda r: (r[0], -r[1]))
-    picks = [{"provider": r[2]["provider"], "model": r[2]["model"]} for r in enough]
+        # Everyday work: prefer provider tier according to task type, then weakest good enough, saving strong allowances.
+        enough.sort(key=lambda r: (_pref(r[2]), r[0], -r[1]))
+
+    picks = [{"provider": r[2]["provider"], "model": r[2]["model"]} for r in enough if (r[2].get("model") or "").strip() and not _model_is_bad(r[2].get("model") or "")]
     first = picks[0] if picks else {}
     label = first.get("model") or first.get("provider", "no agent")
     if bulk:
@@ -2822,16 +2944,7 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
         return cmd + ["--output-format", "stream-json", "--verbose", "-p", text]
 
     if provider == "opencode":
-        cmd = [bin_path, "run", "--title", f"Subway: {prompt[:40]}"]
-        if thread_id:
-            cmd.extend(["--session", thread_id])
-        if model and model != "default":
-            # Effort is a model variant (provider/model#variant), but variants differ per model and a wrong one
-            # stalls the run. Name one in the model itself to use it.
-            cmd.extend(["--model", model])
-        if skip_permissions:
-            cmd.append("--auto")  # Auto-approves everything not denied, so it's never a default.
-        return cmd + [text]
+        return [bin_path, "acp"]
 
     cp = next((p for p in load_custom_providers() if p["id"] == provider), None)
     if cp:
@@ -2875,31 +2988,265 @@ def get_permission_mode() -> str:
     return mode if mode in PERMISSION_MODES else "ask"
 
 
-def chat_tokens_used() -> Optional[int]:
+def chat_tokens_used(session_id: Optional[str] = None) -> Optional[int]:
+    if session_id:
+        matches = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{session_id}.jsonl"))
+        if matches:
+            total = 0
+            for ts, inp, out, cache_read in _parse_claude_usage(matches[0]):
+                total += inp + out
+            return total
+        return None
     ident = detect_self()
-    if not ident or ident.get("source") != "claude":
+    if not ident:
         return None
+    source = ident.get("source")
     cid = ident.get("id")
-    if not cid:
-        return None
-    matches = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{cid}.jsonl"))
-    if not matches:
-        return None
+    if source == "claude":
+        if not cid:
+            return None
+        matches = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{cid}.jsonl"))
+        if not matches:
+            return None
+        total = 0
+        for ts, inp, out, cache_read in _parse_claude_usage(matches[0]):
+            total += inp + out
+        return total
+    if source in ("antigravity", "gemini", "agy"):
+        if not cid or ident.get("synthetic") or cid.startswith("agy-"):
+            return None
+        candidates = [
+            os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"),
+            os.path.expanduser(f"~/.gemini/antigravity/brain/{cid}/.system_generated/logs/transcript.jsonl"),
+            os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/transcript.jsonl"),
+            os.path.expanduser(f"~/.gemini/antigravity/brain/{cid}/transcript.jsonl"),
+        ]
+        matches = [p for p in candidates if os.path.exists(p)]
+        if not matches:
+            matches = glob.glob(os.path.expanduser(f"~/.gemini/**/{cid}/**/transcript*.jsonl"), recursive=True)
+        if not matches:
+            return None
+        t_file = max(matches, key=os.path.getmtime)
+        total = 0
+        try:
+            with open(t_file, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ent = json.loads(line)
+                        total += int(ent.get("input_tokens") or 0) + int(ent.get("output_tokens") or 0)
+                    except Exception:
+                        continue
+            return total
+        except Exception:
+            return None
+    if source in ("opencode", "opencode2"):
+        db_path = os.path.expanduser("~/.local/share/opencode/opencode.db")
+        if not os.path.exists(db_path):
+            return None
+        try:
+            import sqlite3
+            cwd = os.path.realpath(os.getcwd())
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cols = [c[1] for c in cur.execute("PRAGMA table_info(session_v2)").fetchall()]
+            dir_col = next((c for c in ("directory", "path", "cwd", "project_dir", "project_path") if c in cols), None)
+            time_col = next((c for c in ("updated_at", "created_at", "time", "timestamp") if c in cols), "rowid")
+            query = "SELECT * FROM session_v2"
+            params = []
+            if dir_col:
+                query += f" WHERE {dir_col} = ? OR {dir_col} = ?"
+                params = [cwd, os.getcwd()]
+            query += f" ORDER BY {time_col} DESC LIMIT 1"
+            row = cur.execute(query, params).fetchone()
+            if not row and dir_col:
+                row = cur.execute(f"SELECT * FROM session_v2 ORDER BY {time_col} DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            rdict = dict(zip(cols, row))
+            total = 0
+            if "tokens" in rdict and isinstance(rdict["tokens"], (int, float)):
+                total = int(rdict["tokens"])
+            elif "total_tokens" in rdict and isinstance(rdict["total_tokens"], (int, float)):
+                total = int(rdict["total_tokens"])
+            else:
+                for k, v in rdict.items():
+                    if ("token" in k or "usage" in k) and isinstance(v, (int, float)):
+                        total += int(v)
+                    elif ("token" in k or "usage" in k) and isinstance(v, str):
+                        try:
+                            p = json.loads(v)
+                            if isinstance(p, dict):
+                                total += int(p.get("input", 0) or p.get("input_tokens", 0) or p.get("total", 0)) + int(p.get("output", 0) or p.get("output_tokens", 0))
+                        except Exception:
+                            pass
+            return total if total > 0 else None
+        except Exception:
+            return None
+    return None
+
+def _provider_5h_tokens(provider: str) -> int:
+    prov = (provider or "").lower().strip()
+    norm = {"agy": "antigravity", "gemini": "antigravity", "opencode2": "opencode", "claude-code": "claude"}.get(prov, prov)
+    try:
+        data = None
+        if norm == "claude":
+            data = _fetch_claude_tokens()
+        elif norm == "antigravity":
+            data = _fetch_agy_tokens()
+        elif norm == "opencode":
+            data = _fetch_opencode_usage()
+        if data and isinstance(data, dict):
+            h5 = data.get("5h") or {}
+            if isinstance(h5, dict):
+                inp = int(h5.get("input") or 0)
+                out = int(h5.get("output") or 0)
+                return inp + out
+    except Exception:
+        pass
     total = 0
-    for ts, inp, out, cache_read in _parse_claude_usage(matches[0]):
-        total += inp + out
+    try:
+        cutoff = time.time() - 5 * 3600
+        for w in _all_workers():
+            w_prov = (w.get("provider") or "").lower().strip()
+            if w_prov in (prov, norm):
+                c_ts = 0
+                if w.get("created_at"):
+                    try:
+                        c_ts = _dt.datetime.fromisoformat(w["created_at"]).timestamp()
+                    except Exception:
+                        pass
+                if not c_ts or c_ts >= cutoff:
+                    u = w.get("usage") or {}
+                    total += int(u.get("input") or 0) + int(u.get("output") or 0)
+    except Exception:
+        pass
     return total
 
-def set_chat_budget(tokens: int) -> str:
+def set_budget(scope: str, tokens: int) -> str:
     tokens = max(0, int(tokens))
+    scope = (scope or "").lower().strip()
     with _state_lock("config"):
         data = _load_json("config.json")
-        if tokens > 0:
-            data["chat_budget_tokens"] = tokens
+        if scope == "chat":
+            if tokens > 0:
+                data["chat_budget_tokens"] = tokens
+            else:
+                data.pop("chat_budget_tokens", None)
         else:
-            data.pop("chat_budget_tokens", None)
+            budgets = data.setdefault("budgets", {})
+            if tokens > 0:
+                budgets[scope] = tokens
+            else:
+                budgets.pop(scope, None)
         _save_json("config.json", data)
-    return f"[CHAT BUDGET] Set to {tokens:,} tokens." if tokens > 0 else "[CHAT BUDGET] Cleared."
+    return f"[BUDGET] Set {scope} budget to {tokens:,} tokens." if tokens > 0 else f"[BUDGET] Cleared {scope} budget."
+
+def set_chat_budget(tokens: int) -> str:
+    return set_budget("chat", tokens)
+
+def budget_state() -> List[Dict[str, Any]]:
+    cfg = _load_json("config.json")
+    res = []
+    chat_limit = cfg.get("chat_budget_tokens")
+    if chat_limit:
+        limit = int(chat_limit)
+        used = chat_tokens_used() or 0
+        pct = round((used / limit) * 100, 1) if limit > 0 else 0.0
+        status = "reached" if (limit > 0 and used >= limit) else "warning" if (limit > 0 and used >= 0.8 * limit) else "ok"
+        res.append({
+            "scope": "chat",
+            "used": used,
+            "limit": limit,
+            "pct": pct,
+            "status": status,
+        })
+    budgets = cfg.get("budgets") or {}
+    for prov, b_limit in budgets.items():
+        limit = int(b_limit or 0)
+        if limit <= 0:
+            continue
+        used = _provider_5h_tokens(prov)
+        pct = round((used / limit) * 100, 1) if limit > 0 else 0.0
+        status = "reached" if used >= limit else "warning" if used >= 0.8 * limit else "ok"
+        res.append({
+            "scope": prov,
+            "used": used,
+            "limit": limit,
+            "pct": pct,
+            "status": status,
+        })
+    return res
+
+def budget_rows() -> List[Dict[str, Any]]:
+    """budget_state plus an empty row for each scope with no budget, so the HUD can set the first one."""
+    rows = budget_state()
+    have = {r["scope"] for r in rows}
+    scopes = ["chat", "claude", "antigravity", "opencode", "local"]
+    with contextlib.suppress(Exception):
+        scopes += [str(c.get("id")) for c in load_custom_providers() if isinstance(c, dict) and c.get("id")]
+    return rows + [{"scope": x, "used": 0, "limit": 0, "pct": 0.0, "status": "ok"} for x in scopes if x not in have]
+
+
+def budget_ping_notice(scope: str, used: int, limit: int) -> str:
+    if not limit or limit <= 0:
+        return ""
+    pct = (used / limit) * 100
+    if pct < 80 or pct >= 100:
+        return ""
+    level = 90 if pct >= 90 else 80
+    key = f"budget_warning|{scope}|{limit}|{level}"
+    now = time.time()
+    with _state_lock("pings"):
+        sent = _load_json("limit_pings.json")
+        if key in sent:
+            return ""
+        sent[key] = now
+        _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+    return (f"[BUDGET] Warning: {scope} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
+            f"Add more with: subway-context budget {scope} <tokens>, or in the HUD.")
+
+def enforce_budgets() -> None:
+    try:
+        cfg = _load_json("config.json")
+        budgets = cfg.get("budgets") or {}
+        custom_ids = {p.get("id") for p in load_custom_providers()} if "load_custom_providers" in globals() else set()
+        for w in _all_workers():
+            if w.get("status") != "running":
+                continue
+            prov = (w.get("provider") or "").lower().strip()
+            if prov in budgets:
+                p_limit = int(budgets[prov] or 0)
+                if p_limit > 0 and _provider_5h_tokens(prov) >= p_limit:
+                    t_stop_worker(w["id"], reason="budget")
+                    continue
+            w_budget = w.get("budget") or {}
+            max_tok = int(w_budget.get("max_tokens") or 0)
+            if max_tok > 0:
+                usage = w.get("usage") or {}
+                used_tok = int(usage.get("input") or 0) + int(usage.get("output") or 0)
+                if used_tok >= max_tok:
+                    t_stop_worker(w["id"], reason="budget")
+                    continue
+            max_sec = int(w_budget.get("max_seconds") or 0)
+            if max_sec > 0 and (prov in custom_ids or prov not in ("claude", "antigravity", "opencode", "local")):
+                st = 0
+                s_at = w.get("started_at")
+                if s_at:
+                    if isinstance(s_at, (int, float)):
+                        st = float(s_at)
+                    else:
+                        try:
+                            st = _dt.datetime.fromisoformat(s_at).timestamp()
+                        except Exception:
+                            st = 0
+                if st > 0 and (time.time() - st) >= max_sec:
+                    t_stop_worker(w["id"], reason="budget")
+                    continue
+    except Exception as e:
+        log("enforce_budgets error:", e)
 
 def set_permission_mode(mode: str) -> str:
     """Only the HUD and terminal call this: agents can't loosen oversight for themselves."""
@@ -2930,7 +3277,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
                   capabilities: Optional[List[str]] = None,
                   budget_session_pct: Optional[float] = None, budget_weekly_pct: Optional[float] = None,
                   max_budget_usd: Optional[float] = None, thread: str = "", private: bool = False,
-                  max_tokens: int = 0, swarm_id: str = "", isolate: bool = False) -> str:
+                  max_tokens: int = 0, max_seconds: int = 0, swarm_id: str = "", isolate: bool = False, route_reason: str = "") -> str:
     """Queue a worker for user approval. Agents can request workers, but only the user can launch them."""
     if not role or not prompt:
         return "Error: role and prompt are required."
@@ -2989,14 +3336,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         model = next((p["model"] for p in route["picks"] if p["provider"] == selected_provider), "")
     if route["private"] and selected_provider not in ("auto", "local"):
         return f"Error: this task is private, so it can't go to {selected_provider}. Use provider='local'."
-    # OpenCode runs tools without asking, and its requests can't be relayed yet, so "ask" can't be honoured there.
-    unasked = ("opencode", "local")
-    if selected_provider in unasked and permission_mode != "auto_approve" and not is_god_mode:
-        return (f"Error: {selected_provider} workers can't ask before acting yet. In '{permission_mode}' mode that would skip your "
-                f"oversight, so this was refused. Use permission_mode='auto_approve' to accept that, or another provider.")
     if selected_provider == "auto":
-        candidates = [p for p in route["picks"] if binaries[p["provider"]]
-                      and (p["provider"] not in unasked or permission_mode == "auto_approve" or is_god_mode)]
+        candidates = [p for p in route["picks"] if binaries[p["provider"]]]
         if not candidates:
             return "Error: no agent available for this task. " + route["reason"]
     else:
@@ -3070,6 +3411,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             "weekly_pct": budget_weekly_pct,
             "max_usd": max_budget_usd,
             "max_tokens": int(max_tokens or 0),
+            "max_seconds": int(max_seconds or 0),
             "preflight": budget_msg,
         },
         "track": track,
@@ -3078,7 +3420,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "launched_by": _self_id(),
         "swarm_id": swarm_id,
         "isolate": bool(isolate),
-        "route": route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}.",
+        "route": route_reason or (route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}."),
         "usage": {"input": 0, "output": 0, "cache_read": 0},
         "status": "pending_approval",
         "cmd": cmd,
@@ -3134,6 +3476,8 @@ def capacity() -> Dict[str, int]:
 def _capacity_block(meta: Dict[str, Any]) -> str:
     running = [w for w in _all_workers() if w.get("status") in ("running", "launching", "stopping")]
     cap = capacity()
+    if meta.get("mode") == "god":  # God mode has no worker count: only free memory can hold it back.
+        return f"[CAPACITY] Only {cap['available'] / GB:.1f} GB of memory is free. It stays queued." if cap["available"] < WORKER_RAM else ""
     if len(running) >= cap["machine"]:
         return f"[CAPACITY] {len(running)} workers are running, and this machine's limit is {cap['machine']}. It stays queued."
     chats = {w.get("launched_by") for w in running}
@@ -3208,9 +3552,13 @@ def _launch_worker(worker_id: str) -> str:
             try:
                 _prepare_worktree(meta)
             except (OSError, subprocess.SubprocessError) as exc:
-                meta["status"] = "pending_approval"
-                _save_worker(meta)
-                return f"Error: couldn't create a worktree: {exc}"
+                in_repo = subprocess.run(["git", "-C", str(meta.get("project_dir")), "rev-parse", "--is-inside-work-tree"],
+                                         capture_output=True).returncode == 0
+                if in_repo:
+                    meta["status"] = "pending_approval"
+                    _save_worker(meta)
+                    return f"Error: couldn't create a worktree: {exc}"
+                meta["isolate"] = False  # Not a git folder, so there's nothing to copy: it works in place.
         _save_worker(meta)
 
     try:
@@ -3407,6 +3755,16 @@ def _agy_rules(command: str) -> List[str]:
     return list(dict.fromkeys(rules))
 
 
+def _claude_resume(cmd: List[str], conversation: str, prompt: str) -> List[str]:
+    out = list(cmd)
+    out[out.index("-p") + 1] = prompt
+    if "--resume" in out:
+        out[out.index("--resume") + 1] = conversation
+    else:
+        out[out.index("-p"):out.index("-p")] = ["--resume", conversation]
+    return out
+
+
 def _agy_resume(cmd: List[str], conversation: str, prompt: str, extra_rules: List[str]) -> List[str]:
     out = list(cmd)
     out[out.index("--print") + 1] = prompt
@@ -3432,6 +3790,19 @@ def _add_usage(meta: Dict[str, Any], u: Dict[str, Any]) -> None:
     usage["cache_read"] += int(u.get("cache_read_tokens") or 0)
 
 
+def _check_cap(run: Dict[str, Any]) -> None:
+    """Tell a worker to wrap up at two thirds of its cap, and never start a call that would pass the cap."""
+    cap, spent = run.get("cap"), run.get("spent", 0)
+    if not cap:
+        return
+    if spent >= cap:
+        run["on_cap"](f"Stopped at its token cap of {cap:,}.")
+    elif run.get("soft") and spent >= run["soft"]:
+        run["on_cap"](f"Told to wrap up at {spent:,} of its {cap:,} token budget.")
+    elif spent + run.get("last_step", 0) >= cap:  # Every call resends the whole context.
+        run["on_cap"](f"Stopped at {spent:,} of its {cap:,} token budget: the next call would pass it.")
+
+
 def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
     """Read Claude's stream-json output, log text, track tokens and caps."""
     def write(text: str) -> None:
@@ -3448,12 +3819,18 @@ def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             write(line)
             continue
         kind = ev.get("type")
+        run["conversation"] = ev.get("session_id") or run.get("conversation")  # A stopped run never reaches its result.
         if kind == "assistant":
             msg = ev.get("message") or {}
             usage = msg.get("usage") or {}
-            run["spent"] = run.get("spent", 0) + int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
-            if run.get("cap") and run["spent"] >= run["cap"]:
-                run["on_cap"](f"Stopped at its token cap of {run['cap']:,}.")
+            # One message arrives as several events with growing usage, so only count what's new.
+            seen = run.setdefault("seen_messages", {})
+            step_cost = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+            new_cost = max(0, step_cost - seen.get(msg.get("id"), 0))
+            seen[msg.get("id")] = max(step_cost, seen.get(msg.get("id"), 0))
+            run["spent"] = run.get("spent", 0) + new_cost
+            run["last_step"] = step_cost or run.get("last_step", 0)
+            _check_cap(run)
             for block in msg.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "text":
                     write(block.get("text", ""))
@@ -3493,9 +3870,10 @@ def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
         elif kind == "step_update":
             st = ev.get("step_update") or {}
             used = st.get("usage") or {}
-            run["spent"] = run.get("spent", 0) + int(used.get("input_tokens") or 0) + int(used.get("output_tokens") or 0)
-            if run.get("cap") and run["spent"] >= run["cap"]:
-                run["on_cap"](f"Stopped at its token cap of {run['cap']:,}.")
+            step_cost = int(used.get("input_tokens") or 0) + int(used.get("output_tokens") or 0)
+            run["spent"] = run.get("spent", 0) + step_cost
+            run["last_step"] = step_cost or run.get("last_step", 0)
+            _check_cap(run)
             params = (st.get("tool_info") or {}).get("parameters") or {}
             detail = params.get("CommandLine") or params.get("TargetFile") or params.get("Path") or json.dumps(params)[:200]
             if st.get("step_type") == "tool":
@@ -3525,6 +3903,10 @@ def supervise_worker(worker_id: str) -> int:
     def _on_term(_sig: int, _frame: Any) -> None:
         stopped["flag"] = True
         proc = current["proc"]
+        if is_acp and run.get("conversation") and proc and proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                proc.stdin.flush()
         if proc and proc.poll() is None:
             proc.terminate()
 
@@ -3535,14 +3917,20 @@ def supervise_worker(worker_id: str) -> int:
     is_agy = meta.get("provider") == "antigravity"
     is_claude = meta.get("provider") == "claude"
     is_local = meta.get("provider") == "local"
+    is_acp = meta.get("provider") in ("opencode", "local")
     cmd = list(meta["cmd"])
     budget = meta.get("budget") or {}
     shared_spent: Dict[str, Any] = {"spent": sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output"))}
+    run: Dict[str, Any] = shared_spent
 
     def budget_stop(reason: str) -> None:
         stopped["budget"] = reason  # type: ignore[assignment]
         stopped["flag"] = True
         proc = current["proc"]
+        if is_acp and run.get("conversation") and proc and proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                proc.stdin.flush()
         if proc and proc.poll() is None:
             proc.terminate()
 
@@ -3604,6 +3992,7 @@ def supervise_worker(worker_id: str) -> int:
     result: Dict[str, Any] = {}
     retries = 0
     wrapped_up = False
+    turn_cap = 0
     final_reason = ""
     if meta.get("kind") == "batch":
         result = run_batch(meta, stopped, deadline, save_progress)
@@ -3616,26 +4005,32 @@ def supervise_worker(worker_id: str) -> int:
     try:
         with open(meta["log_file"], "ab") as out:
             while True:
-                run: Dict[str, Any] = shared_spent
+                run = shared_spent
                 workdir = meta.get("worktree") or meta.get("project_dir") or HOME
-                proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.DEVNULL, env=dict(os.environ, PWD=workdir),  # OpenCode reads PWD.
-                                        stdout=subprocess.PIPE if (is_agy or is_claude) else out, stderr=subprocess.STDOUT)
+                env = dict(os.environ, PWD=workdir)
+                if is_acp and not meta.get("skip_permissions"):
+                    env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
+                proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
+                                        stdout=subprocess.PIPE if (is_agy or is_claude or is_acp) else out, stderr=subprocess.STDOUT)
                 current["proc"] = proc
-                relay_done = threading.Event()
-                if meta.get("provider") in ("opencode", "local") and not meta.get("skip_permissions"):
-                    threading.Thread(target=_opencode_relay, args=(meta, stopped, relay_done, budget_stop),
-                                     daemon=True).start()
                 pump = None
-                if is_agy or is_claude:
-                    run["spent"] = sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output"))
-                    run["cap"], run["on_cap"] = int(budget.get("max_tokens") or 0), budget_stop
-                    target_pump = _pump_agy if is_agy else _pump_claude
-                    pump = threading.Thread(target=target_pump, args=(proc, out, run), daemon=True)
+                if is_agy or is_claude or is_acp:
+                    run["spent"] = max(run.get("spent", 0), sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output")))
+                    run["cap"], run["on_cap"] = turn_cap or int(budget.get("max_tokens") or 0), budget_stop
+                    run["soft"] = run["cap"] * 2 // 3 if not wrapped_up else 0
+                    if is_acp:
+                        pump = threading.Thread(target=_pump_opencode, args=(proc, out, run, meta, stopped), daemon=True)
+                    else:
+                        target_pump = _pump_agy if is_agy else _pump_claude
+                        pump = threading.Thread(target=target_pump, args=(proc, out, run), daemon=True)
                     pump.start()
                 try:
                     code = proc.wait(timeout=remaining())
                 except subprocess.TimeoutExpired:
-                    relay_done.set()
+                    if is_acp and run.get("conversation") and proc.poll() is None:
+                        with contextlib.suppress(Exception):
+                            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                            proc.stdin.flush()
                     proc.terminate()
                     try:
                         code = proc.wait(timeout=10)
@@ -3644,7 +4039,6 @@ def supervise_worker(worker_id: str) -> int:
                         code = proc.wait()
                     result = {"status": "timed_out", "exit_code": code, "reason": f"Stopped after the {limit}s timeout."}
                     break
-                relay_done.set()
                 if pump:
                     pump.join(timeout=5)
                     if run.get("usage"):
@@ -3653,21 +4047,28 @@ def supervise_worker(worker_id: str) -> int:
 
                 if stopped["flag"]:
                     why = stopped.get("budget")
-                    if why and is_agy and run.get("conversation") and not wrapped_up:
+                    token_cap = int(budget.get("max_tokens") or 0)
+                    # One call costs the whole context, so the save turn only runs if a call of that size still fits.
+                    room = not token_cap or run.get("spent", 0) + run.get("last_step", 0) < token_cap
+                    if why and token_cap and not room and why.startswith("Told to wrap up"):
+                        why = f"Stopped at {run.get('spent', 0):,} of its {token_cap:,} token budget: no room left to wrap up."
+                    if why and (is_agy or is_claude) and run.get("conversation") and not wrapped_up and room:
                         # Spending the cap shouldn't lose the work: one last short turn to save what it found.
                         wrapped_up = True
                         final_reason = why
                         stopped["flag"] = False
                         stopped.pop("budget", None)
-                        budget["max_tokens"] = 0
-                        cmd = _agy_resume(cmd, run["conversation"], "You reached your token budget. Stop working now. Without using more "
-                                          "tools than needed, save your findings and any unfinished work to files, then report what's done "
-                                          "and what isn't in under 10 lines.", [])
+                        turn_cap = token_cap or run.get("spent", 0) + 20000
+                        left = token_cap - run.get("spent", 0) if token_cap else 20000
+                        ask_wrap = (f"You've used most of your token budget: about {left:,} tokens are left, and every tool call costs "
+                                    "your whole context. Finish the change you're on, start nothing new, save anything unfinished to "
+                                    "files, then report what's done and what isn't in under 10 lines.")
+                        cmd = _agy_resume(cmd, run["conversation"], ask_wrap, []) if is_agy else _claude_resume(cmd, run["conversation"], ask_wrap)
                         continue
-                    result = {"status": "budget_stopped" if why else "stopped", "exit_code": code, "reason": why or "Stopped on request."}
+                    result = {"status": "budget_stopped" if why else "stopped", "exit_code": code, "reason": why or final_reason or "Stopped on request."}
                     break
-                if final_reason:
-                    result = {"status": "budget_stopped", "exit_code": code, "reason": final_reason}
+                if final_reason:  # It finished inside the budget after being told to wrap up.
+                    result = {"status": "completed", "exit_code": code, "reason": final_reason}
                     break
                 denied = run.get("last_error")
                 if is_agy and code == 0 and denied and not run.get("response") and run.get("conversation"):
@@ -3701,9 +4102,11 @@ def supervise_worker(worker_id: str) -> int:
                     cmd = _agy_resume(cmd, run["conversation"], "Your connection dropped. Continue your task "
                                       "from where you stopped.", [])
                     continue
+                if is_acp and run.get("finished"):
+                    code = 0
                 if code != 0:
                     result = {"status": "failed", "exit_code": code}
-                elif is_agy and not run.get("response"):
+                elif (is_agy or is_acp) and not run.get("response"):
                     result = {"status": "failed", "exit_code": 0, "reason": "The agent finished without producing a result."}
                 else:
                     result = {"status": "completed", "exit_code": 0}
@@ -3807,6 +4210,10 @@ def run_batch(meta: Dict[str, Any], stopped: Dict[str, bool], deadline: Optional
                     continue
                 if stopped["flag"]:
                     return {"status": "stopped", "exit_code": None, "reason": f"Stopped. Run it again to resume: {prog}"}
+                b_max = int((meta.get("budget") or {}).get("max_tokens") or 0)
+                if b_max > 0 and (usage["input"] + usage["output"]) >= b_max:
+                    save_progress(progress=prog, usage=usage)
+                    return {"status": "budget_stopped", "exit_code": None, "reason": f"Budget reached ({usage['input'] + usage['output']:,} of {b_max:,} tokens). Run it again to resume: {prog}"}
                 if deadline and time.time() > deadline:
                     return {"status": "timed_out", "exit_code": None, "reason": f"Timed out. Run it again to resume: {prog}"}
                 if not _wait_for_memory(model, stopped, 900):
@@ -3866,6 +4273,10 @@ def run_batch(meta: Dict[str, Any], stopped: Dict[str, bool], deadline: Optional
             for grp in groups:
                 if stopped["flag"]:
                     return {"status": "stopped", "exit_code": None, "reason": f"Stopped. Run it again to resume: {prog}"}
+                b_max = int((meta.get("budget") or {}).get("max_tokens") or 0)
+                if b_max > 0 and (usage["input"] + usage["output"]) >= b_max:
+                    save_progress(progress=prog, usage=usage)
+                    return {"status": "budget_stopped", "exit_code": None, "reason": f"Budget reached ({usage['input'] + usage['output']:,} of {b_max:,} tokens). Run it again to resume: {prog}"}
                 if deadline and time.time() > deadline:
                     return {"status": "timed_out", "exit_code": None, "reason": f"Timed out. Run it again to resume: {prog}"}
                 if not _wait_for_memory(model, stopped, 900):
@@ -3916,73 +4327,261 @@ def _opencode_api(method: str, path: str, directory: str, body: Optional[Dict[st
     return json.loads(raw) if raw else {}
 
 
-def _opencode_relay(meta: Dict[str, Any], stopped: Dict[str, Any], done: threading.Event,
-                    on_limit: Optional[Callable[[str], None]] = None) -> None:
-    """Bring an OpenCode worker's permission requests to the user, and send their answer back."""
-    directory = os.path.realpath(meta.get("project_dir") or HOME)
-    replies = {"allow": "once", "allow_always": "always", "deny": "reject"}
-    seen: Set[str] = set()
-    began = time.time()
-    budget = meta.get("budget") or {}
-    cap = int(budget.get("max_tokens") or 0)
-    while not done.is_set() and not stopped["flag"]:
-        hit = None
-        with contextlib.suppress(Exception):
-            hit = _fetch_opencode_usage().get("limit_hit")
-        if on_limit and hit and hit["at"] >= began and hit.get("model") == meta.get("model"):
-            on_limit(f"OpenCode's free limit was reached, so it stopped instead of sitting in a retry loop. {hit['message']}")
-            return
-        if on_limit and cap:
-            with contextlib.suppress(Exception):
-                sessions = (_opencode_api("GET", "/api/session?limit=5", directory) or {}).get("data") or []
-                recent = [s for s in sessions if (s.get("time") or {}).get("created", 0) / 1000 >= began or (s.get("time") or {}).get("created", 0) >= began]
-                if recent:
-                    newest = max(recent, key=lambda s: (s.get("time") or {}).get("created", 0))
-                    tok = newest.get("tokens") or {}
-                    spent = int(tok.get("input") or 0) + int(tok.get("output") or 0) + int(tok.get("reasoning") or 0)
-                    if spent >= cap:
-                        on_limit(f"Stopped at its token cap of {cap:,}.")
-                        return
-        pending = []
+def _opencode_session_tokens(session_id: str) -> Dict[str, int]:
+    """Read real token spend from OpenCode's SQLite session_v2 table."""
+    p = os.path.join(OPENCODE_DIR, "opencode.db")
+    if not os.path.exists(p) or not session_id:
+        return {}
+    for uri in (f"file:{p}?mode=ro", f"file:{p}?immutable=1"):
         try:
-            loc_param = urllib.parse.quote(directory)
-            req_data = _opencode_api("GET", f"/api/permission/request?location[directory]={loc_param}", directory).get("data")
-            if req_data and isinstance(req_data, list):
-                pending.extend(req_data)
-        except (OSError, ValueError, KeyError):
+            con = sqlite3.connect(uri, uri=True, timeout=1.0)
+            try:
+                row = con.execute(
+                    "select coalesce(tokens_input, 0), coalesce(tokens_output, 0), "
+                    "coalesce(tokens_reasoning, 0), coalesce(tokens_cache_read, 0) "
+                    "from session_v2 where id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row:
+                    return {
+                        "input_tokens": int(row[0] or 0),
+                        "output_tokens": int(row[1] or 0),
+                        "thinking_tokens": int(row[2] or 0),
+                        "cache_read_tokens": int(row[3] or 0),
+                    }
+                return {}
+            finally:
+                con.close()
+        except Exception:
+            continue
+    return {}
+
+
+def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: Dict[str, Any], stopped: Dict[str, Any]) -> None:
+    """Run OpenCode / local agent via ACP protocol over stdin/stdout pipes."""
+    def write(text: str) -> None:
+        out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
+        out.flush()
+
+    workdir = meta.get("worktree") or meta.get("project_dir") or HOME
+    msg_counter = 0
+
+    def send_rpc(msg: Dict[str, Any]) -> None:
+        raw = json.dumps(msg) + "\n"
+        try:
+            proc.stdin.write(raw.encode("utf-8"))  # type: ignore[union-attr]
+            proc.stdin.flush()  # type: ignore[union-attr]
+        except (OSError, ValueError):
             pass
 
-        # Also probe session-level pending permission requests for active sessions
-        try:
-            candidate_sids = set()
-            active_data = (_opencode_api("GET", "/api/session/active", directory) or {}).get("data") or {}
-            if isinstance(active_data, dict):
-                candidate_sids.update(active_data.keys())
-            sessions_list = (_opencode_api("GET", "/api/session?limit=5", directory) or {}).get("data") or []
-            for s in sessions_list:
-                s_created = (s.get("time") or {}).get("created", 0)
-                if s_created / 1000 >= began or s_created >= began:
-                    candidate_sids.add(s["id"])
+    msg_counter += 1
+    init_id = msg_counter
+    send_rpc({"jsonrpc": "2.0", "id": init_id, "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {}}})
 
-            for sid in candidate_sids:
-                s_perms = (_opencode_api("GET", f"/api/session/{sid}/permission", directory) or {}).get("data") or []
-                if isinstance(s_perms, list):
-                    for p in s_perms:
-                        if isinstance(p, dict) and p.get("id") and not any(existing.get("id") == p["id"] for existing in pending):
-                            pending.append(p)
-        except (OSError, ValueError, KeyError) as e:
-            log("OpenCode relay:", e)
-        for r in pending:
-            if r["id"] in seen:
+    session_new_id = None
+    prompt_id = None
+    session_id = None
+    config_ops: List[Tuple[str, str]] = []
+
+    model_val = meta.get("model")
+    if meta.get("provider") == "local":
+        if model_val and not str(model_val).startswith("ollama/"):
+            model_val = f"ollama/{model_val}"
+    if model_val and model_val != "default":
+        config_ops.append(("model", str(model_val)))
+
+    effort = meta.get("effort")
+    if effort and effort != "auto":
+        config_ops.append(("effort", str(effort)))
+
+    curr_config_id = None
+    response_chunks: List[str] = []
+    stop_monitor = threading.Event()
+    cancel_sent = False
+
+    def send_cancel() -> None:
+        nonlocal cancel_sent
+        if not cancel_sent and session_id and proc.poll() is None:
+            cancel_sent = True
+            send_rpc({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
+
+    def monitor_tokens(sid: str) -> None:
+        nonlocal cancel_sent
+        began = time.time()
+        while not stop_monitor.is_set() and not stopped["flag"]:
+            hit = None
+            with contextlib.suppress(Exception):
+                hit = _fetch_opencode_usage().get("limit_hit")
+            if run.get("on_cap") and hit and hit.get("at", 0) >= began and hit.get("model") == meta.get("model"):
+                send_cancel()
+                run["on_cap"](f"OpenCode's free limit was reached, so it stopped instead of sitting in a retry loop. {hit['message']}")
+                return
+
+            toks = _opencode_session_tokens(sid)
+            if toks:
+                run["usage"] = toks
+                spent = toks.get("input_tokens", 0) + toks.get("output_tokens", 0) + toks.get("thinking_tokens", 0)
+                run["spent"] = spent
+                soft = run["cap"] * 2 // 3 if run.get("cap") else 0
+                if soft and spent >= soft and spent < run["cap"] and not run.get("wrapping"):
+                    run["wrapping"] = "asked"  # The cancelled turn's reply sends the wrap-up prompt.
+                    send_cancel()
+                elif run.get("cap") and spent >= run["cap"] and run.get("on_cap"):
+                    cancel_sent = False
+                    send_cancel()
+                    run["on_cap"](f"Stopped at its token cap of {run['cap']:,}.")
+                    return
+            stop_monitor.wait(2.0)
+
+    try:
+        for raw in proc.stdout:  # type: ignore[union-attr]
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
                 continue
-            seen.add(r["id"])
-            detail = " ".join(r.get("resources") or []) or json.dumps(r.get("source") or {})
-            decision = await_permission(request_permission(meta, str(r.get("action")), detail),
-                                        stop=lambda: done.is_set() or stopped["flag"])
-            with contextlib.suppress(OSError, ValueError, KeyError):
-                _opencode_api("POST", f"/api/session/{r['sessionID']}/permission/{r['id']}/reply", directory,
-                              {"reply": replies.get(decision, "reject"), "message": None})
-        done.wait(0.5)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                write(line)
+                continue
+
+            msg_id = msg.get("id")
+            method = msg.get("method")
+
+            if msg_id == init_id and msg_id is not None:
+                msg_counter += 1
+                session_new_id = msg_counter
+                send_rpc({"jsonrpc": "2.0", "id": session_new_id, "method": "session/new",
+                          "params": {"cwd": workdir, "mcpServers": []}})
+                continue
+
+            if msg_id is not None and msg_id == session_new_id:
+                res = msg.get("result") or {}
+                session_id = res.get("sessionId")
+                run["conversation"] = session_id
+                if session_id:
+                    threading.Thread(target=monitor_tokens, args=(session_id,), daemon=True).start()
+
+                if config_ops:
+                    cfg_id, cfg_val = config_ops.pop(0)
+                    msg_counter += 1
+                    curr_config_id = msg_counter
+                    send_rpc({"jsonrpc": "2.0", "id": curr_config_id, "method": "session/set_config_option",
+                              "params": {"sessionId": session_id, "configId": cfg_id, "value": cfg_val}})
+                else:
+                    msg_counter += 1
+                    prompt_id = msg_counter
+                    send_rpc({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+                              "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": meta.get("prompt", "")}]}})
+                continue
+
+            if msg_id == curr_config_id and curr_config_id is not None:
+                if config_ops:
+                    cfg_id, cfg_val = config_ops.pop(0)
+                    msg_counter += 1
+                    curr_config_id = msg_counter
+                    send_rpc({"jsonrpc": "2.0", "id": curr_config_id, "method": "session/set_config_option",
+                              "params": {"sessionId": session_id, "configId": cfg_id, "value": cfg_val}})
+                else:
+                    curr_config_id = None
+                    msg_counter += 1
+                    prompt_id = msg_counter
+                    send_rpc({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+                              "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": meta.get("prompt", "")}]}})
+                continue
+
+            if prompt_id is not None and msg_id == prompt_id:
+                res = msg.get("result") or {}
+                err = msg.get("error") or (res.get("error") if isinstance(res, dict) else None)
+                err_code = err.get("code") if isinstance(err, dict) else None
+                err_text = json.dumps(err) if isinstance(err, dict) else str(err or "")
+                if isinstance(res, dict):
+                    err_text += " " + json.dumps(res)
+                if err_code == -32000 or "Authentication required" in err_text:
+                    bad_model = meta.get("model") or ""
+                    if bad_model:
+                        _mark_model_bad(bad_model, err_text)
+                if run.get("wrapping") == "asked" and res.get("stopReason") == "cancelled":
+                    run["wrapping"] = "running"
+                    cancel_sent = False
+                    left = max(0, int(run.get("cap") or 0) - int(run.get("spent") or 0))
+                    msg_counter += 1
+                    prompt_id = msg_counter
+                    send_rpc({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt", "params": {"sessionId": session_id, "prompt": [
+                        {"type": "text", "text": f"You've used most of your token budget: about {left:,} tokens are left. Finish the change "
+                                                 "you're on, start nothing new, save anything unfinished to files, then report what's done "
+                                                 "and what isn't in under 10 lines."}]}})
+                    continue
+                reply = (res.get("response") or res.get("text") or "".join(response_chunks)).strip()
+                run["response"] = reply
+                if not reply:
+                    write(f"[no reply] OpenCode ended the turn: {res.get('stopReason') or msg.get('error') or 'no reason given'}")
+                if reply:
+                    write(reply)
+                stop_monitor.set()
+                if session_id:
+                    final_toks = _opencode_session_tokens(session_id)
+                    if final_toks:
+                        run["usage"] = final_toks
+                        run["spent"] = final_toks.get("input_tokens", 0) + final_toks.get("output_tokens", 0) + final_toks.get("thinking_tokens", 0)
+                run["finished"] = True
+                proc.terminate()
+                return
+
+            if msg_id is None and method == "session/update":
+                params = msg.get("params") or {}
+                up = params.get("update") or {}
+                s_up = up.get("sessionUpdate")
+
+                if s_up in ("tool_call", "tool_call_update"):
+                    tool_call = up.get("toolCall") if isinstance(up.get("toolCall"), dict) else up
+                    title = tool_call.get("title") or tool_call.get("name") or tool_call.get("kind") or "tool"
+                    raw = tool_call.get("rawInput") or tool_call.get("input") or ""
+                    detail = json.dumps(raw)[:200] if isinstance(raw, dict) else str(raw)
+                    run["last_tool"] = detail
+                    write(f"[tool] {title}: {one_line(detail, 200)}")
+
+                elif s_up == "agent_message_chunk":
+                    chunk_text = up.get("text") or up.get("chunk") or (up.get("content") if isinstance(up.get("content"), str) else (up.get("content") or {}).get("text")) or ""
+                    if chunk_text:
+                        response_chunks.append(chunk_text)
+
+                continue
+
+            if msg_id is not None and method == "session/request_permission":
+                params = msg.get("params") or {}
+                tool_call = params.get("toolCall") or {}
+                title = tool_call.get("title") or tool_call.get("kind") or "tool"
+                raw = tool_call.get("rawInput") or tool_call.get("input") or ""
+                detail = json.dumps(raw) if isinstance(raw, dict) else str(raw or title)
+                options = params.get("options") or []
+
+                rid = request_permission(meta, str(title), detail)
+                decision = await_permission(rid, stop=lambda: stopped["flag"])
+
+                wanted_kind = "allow_once" if decision == "allow" else "allow_always" if decision == "allow_always" else "reject_once"
+                selected_opt = next((o for o in options if o.get("kind") == wanted_kind), None)
+                if selected_opt is None:
+                    selected_opt = next((o for o in options if o.get("kind") == "reject_once"), None)
+                chosen_id = selected_opt.get("optionId") if selected_opt else (options[0].get("optionId") if options else "")
+
+                send_rpc({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "outcome": {
+                            "outcome": "selected",
+                            "optionId": chosen_id,
+                        }
+                    }
+                })
+                continue
+    finally:
+        stop_monitor.set()
+        if session_id and not run.get("usage"):
+            final_toks = _opencode_session_tokens(session_id)
+            if final_toks:
+                run["usage"] = final_toks
+                run["spent"] = final_toks.get("input_tokens", 0) + final_toks.get("output_tokens", 0) + final_toks.get("thinking_tokens", 0)
 
 
 def run_permit_server(worker_id: str) -> int:
@@ -4221,10 +4820,43 @@ def t_spin_swarm(role: str, prompt: str, provider: str = "auto", track: str = "m
         subtasks = [prompt]
     swarm_id = f"swarm_{uuid.uuid4().hex[:6]}"
     out = [f"[SWARM] `{swarm_id}`: {len(subtasks)} worker(s) for '{role}'. {plan['reason']}"]
+
+    ordered_provs = []
+    prov_picks = {}
+    truly_needs_claude = False
+    if provider == "auto":
+        c = estimate_complexity(prompt)
+        need = TIER_STRENGTH.get(c.get("tier", "everyday"), 2)
+        route = route_task(prompt, role, god=False)
+        for p in route.get("picks", []):
+            prov = p.get("provider")
+            if prov and prov not in prov_picks:
+                prov_picks[prov] = p.get("model", "")
+        providers_list = list(prov_picks.keys())
+        truly_needs_claude = (need >= 4 and not any(pr != "claude" for pr in providers_list))
+        if truly_needs_claude:
+            ordered_provs = providers_list
+        else:
+            ordered_provs = [p for p in providers_list if p != "claude"] or providers_list  # Claude only when nothing else can run it.
+
     for i, sub in enumerate(subtasks, 1):
         text = f"You are worker {i} of {len(subtasks)} on a shared task. Do only your part, and don't edit outside it.\nOverall goal: {prompt}\nYour part: {sub}"
-        res = t_spin_worker(role=f"{role} {i}", prompt=text, provider=provider, track=track, project_dir=project_dir, mode=mode,
-                            permission_mode=permission_mode, max_tokens=max_tokens_each, swarm_id=swarm_id, isolate=True)
+        if provider == "auto" and ordered_provs:
+            assigned_prov = ordered_provs[(i - 1) % len(ordered_provs)]
+            assigned_model = prov_picks.get(assigned_prov, "")
+            if assigned_prov == "claude":
+                why = ("Assigned to Claude because the task requires frontier capability."
+                       if truly_needs_claude else
+                       "Assigned to Claude as the scarcest allowance, used last after other providers with allowance.")
+            else:
+                why = f"Assigned to {assigned_prov} to spread subtasks across providers with allowance, saving Claude."
+            res = t_spin_worker(role=f"{role} {i}", prompt=text, provider=assigned_prov, model=assigned_model,
+                                track=track, project_dir=project_dir, mode=mode,
+                                permission_mode=permission_mode, max_tokens=max_tokens_each, swarm_id=swarm_id,
+                                isolate=True, route_reason=why)
+        else:
+            res = t_spin_worker(role=f"{role} {i}", prompt=text, provider=provider, track=track, project_dir=project_dir, mode=mode,
+                                permission_mode=permission_mode, max_tokens=max_tokens_each, swarm_id=swarm_id, isolate=True)
         out.append(res.splitlines()[0])
     out.append("Each worker needs approval. Workers over the capacity limit stay queued until a slot opens.")
     return "\n".join(out)
@@ -4589,6 +5221,20 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
             if 0 <= age < 24:
                 hourly[23 - age] += int(used)
         tokens["hourly"] = hourly  # type: ignore[assignment]
+        per_model: Dict[str, int] = {}
+        with contextlib.suppress(Exception):
+            for prov, mid, used in con.execute(
+                    "select json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id'),"
+                    " coalesce(sum(coalesce(json_extract(data,'$.tokens.input'),0)+coalesce(json_extract(data,'$.tokens.output'),0)),0)"
+                    " from session_message where type='assistant' and time_created>=?"
+                    " group by 1, 2",
+                    (now_ms - SEVEN_D * 1000,)):
+                if mid:
+                    cnt = int(used)
+                    key = f"{prov}/{mid}".strip("/") if prov else str(mid)
+                    per_model[key] = cnt
+                    if str(mid) not in per_model:
+                        per_model[str(mid)] = cnt
         model = ""
         with contextlib.suppress(Exception):
             raw = con.execute("select model from session_v2 order by time_updated desc limit 1").fetchone()
@@ -4632,7 +5278,7 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
         accounts = 0
         with contextlib.suppress(Exception):
             accounts = con.execute("select (select count(*) from account)+(select count(*) from credential)").fetchone()[0]
-        return {"tokens": tokens, "cost": cost, "model": model, "signed_in": accounts > 0, "limit_hit": limit_hit, "limited": limited}
+        return {"tokens": tokens, "cost": cost, "model": model, "signed_in": accounts > 0, "limit_hit": limit_hit, "limited": limited, "per_model": per_model}
     finally:
         con.close()
 
@@ -4844,6 +5490,8 @@ def _sampler_loop() -> None:
     last_slow = 0.0
     while True:
         now = time.time()
+        with contextlib.suppress(Exception):
+            enforce_budgets()
         for name, (_fn, ttl) in _SOURCES.items():
             if name == "claude_live" and now - _viewer_seen > 30:
                 continue
@@ -5168,7 +5816,7 @@ def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         when = f" OpenCode retries around {fmt_ts(hit['retry_at'])}." if hit.get("retry_at") else ""
         note = f"Free limit reached {fmt_ts(hit['at'])}.{when} Free models won't run until it clears."
     return {"plan": plan, "state": "live" if data else "unavailable", "source": "OpenCode database", "limit_hit": hit,
-            "limited": data.get("limited") or {},
+            "limited": data.get("limited") or {}, "per_model": data.get("per_model") or {},
             "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"),
             "pools": [], "tokens": data.get("tokens"), "other_sessions": _other_sessions("opencode"),
             "error": rec.get("error"), "model": data.get("model", ""),
@@ -5318,6 +5966,14 @@ def check_budget_preflight(model: str = "", provider: str = "auto",
                            budget_weekly_pct: Optional[float] = None,
                            max_budget_usd: Optional[float] = None) -> Tuple[bool, str]:
     """Check one concrete agent against its own real limits. Unknown stays unknown, never invented."""
+    cfg = _load_json("config.json")
+    budgets = cfg.get("budgets") or {}
+    if provider in budgets:
+        p_limit = int(budgets[provider] or 0)
+        if p_limit > 0:
+            p_used = _provider_5h_tokens(provider)
+            if p_used >= p_limit:
+                return False, f"[BUDGET GUARD VIOLATION] Provider '{provider}' budget reached ({p_used:,} of {p_limit:,} tokens)."
     if provider == "local":
         model_name = model or choose_local_model(need_tools=False) or ""
         if not model_name:
@@ -5501,7 +6157,7 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
         "settings": {"permission_mode": get_permission_mode(), "permission_modes": PERMISSION_MODES,
                      "capacity": capacity(), "models": model_catalog(), "benchmarks": benchmarks_meta,
                      "chat_budget": cfg_data.get("chat_budget_tokens", 0),
-                     "low_limits": low_limits},
+                     "low_limits": low_limits, "budgets": budget_rows()},
         "tracks": tracks_summary,
         "quotas": load_quotas(refresh=not _sampler_running),
     }
@@ -5869,8 +6525,9 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/stop_worker":
             res = t_stop_worker(worker_id=str(payload.get("id", "")), reason=str(payload.get("reason", "")))
         elif path == "/api/chat_budget":
-            msg = set_chat_budget(int(payload.get("tokens") or 0))
-            self._json(200, {"ok": True, "message": msg})
+            res = set_chat_budget(int(payload.get("tokens") or 0))
+        elif path == "/api/budget":
+            res = set_budget(str(payload.get("scope", "")), int(payload.get("tokens") or 0))
         elif path == "/api/settings":
             res = set_permission_mode(str(payload.get("permission_mode", "")))
         elif path == "/api/models":
@@ -6073,7 +6730,9 @@ TOOLS = {
             "private": {"type": "boolean", "default": False, "description": "The task must stay on this machine."},
             "swarm_id": {"type": "string", "description": "Set by spin_swarm. Leave empty."},
             "isolate": {"type": "boolean", "default": False, "description": "Work in a private git worktree, and return the change as a patch. Use it whenever workers share a repo."},
-            "max_tokens": {"type": "integer", "description": "Stop the worker after this many tokens. Antigravity workers only."},
+            "max_tokens": {"type": "integer", "description": "Stop the worker after this many tokens. Antigravity and OpenCode workers."},
+            "max_seconds": {"type": "integer", "description": "Stop the worker after this many seconds. For providers that report no tokens, this is the cap."},
+            "route_reason": {"type": "string", "description": "Why this worker got this provider, shown in the HUD."},
             "track": {"type": "string", "default": "main", "description": "Shared context track name."},
             "project_dir": {"type": "string", "description": "Working directory (default: current workspace)."},
             "timeout_seconds": {"type": "integer", "default": DEFAULT_WORKER_TIMEOUT, "description": "Stop the worker after this long. 0 means no limit."},
@@ -6311,6 +6970,9 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rid = req.get("id")
     if rid is None:
         return None
+    params = req.get("params")
+    if params is not None and not isinstance(params, dict):
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params: expected object"}}
     if method == "initialize":
         _note_client(req.get("params") or {})
         pv = (req.get("params") or {}).get("protocolVersion") or "2025-06-18"
@@ -6329,23 +6991,50 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "tools": [dict(name=n, **spec) for n, (_f, spec) in TOOLS.items()]}}
     if method == "tools/call":
-        p = req.get("params") or {}
+        p = req.get("params")
+        if not isinstance(p, dict):
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params: expected object"}}
         name = p.get("name")
+        if not isinstance(name, str):
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params: tool name must be a string"}}
         args = p.get("arguments") or {}
+        if not isinstance(args, dict):
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params: arguments must be a dict"}}
         if name not in TOOLS:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"unknown tool {name}"}}
         try:
+            enforce_budgets()
+            cfg = _load_json("config.json")
+            limit = cfg.get("chat_budget_tokens")
+            if limit:
+                limit = int(limit)
+                used = chat_tokens_used()
+                if used is not None and used >= limit:
+                    if name not in ("hud_status", "quota_status", "check_notes", "answer_permission"):
+                        block_msg = f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+                        return {"jsonrpc": "2.0", "id": rid, "result": {
+                            "content": [{"type": "text", "text": block_msg}],
+                            "isError": True
+                        }}
             text = TOOLS[name][0](**args)
             waiting = _pending_permissions(station=_self_id())
             if waiting and name != "permission_requests":  # Requests reach the launching chat on its next tool call.
                 text = f"{text}\n\n{permission_text(waiting)}"
             if name not in ("hud_status", "quota_status"):
-                cfg = _load_json("config.json")
-                limit = cfg.get("chat_budget_tokens")
                 if limit:
                     used = chat_tokens_used()
-                    if used is not None and used >= limit:
-                        text = f"{text}\n\n[CHAT BUDGET] This chat has used {used:,} of {limit:,} tokens. Delegate the remaining work."
+                    if used is not None:
+                        c_ping = budget_ping_notice("chat", used, limit)
+                        if c_ping:
+                            text = f"{text}\n\n{c_ping}"
+                budgets = cfg.get("budgets") or {}
+                for p_prov, p_lim in budgets.items():
+                    p_lim = int(p_lim or 0)
+                    if p_lim > 0:
+                        p_used = _provider_5h_tokens(p_prov)
+                        p_ping = budget_ping_notice(p_prov, p_used, p_lim)
+                        if p_ping:
+                            text = f"{text}\n\n{p_ping}"
                 lln = low_limit_notice()
                 if lln:
                     text = f"{text}\n\n{lln}"
@@ -6384,6 +7073,43 @@ def run_hook_guard() -> int:
         decision = hook_guard(json.load(sys.stdin))
     except Exception as e:
         log("hook guard error:", e)
+        return 0
+    if decision:
+        print(json.dumps(decision))
+    return 0
+
+def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Claude Code UserPromptSubmit hook: warn or block when chat budget is reached or close."""
+    cfg = _load_json("config.json")
+    limit = cfg.get("chat_budget_tokens")
+    if not limit:
+        return None
+    limit = int(limit)
+    sid = event.get("session_id")
+    used = chat_tokens_used(sid)
+    if used is None:
+        return None
+    if used >= limit:
+        return {
+            "decision": "block",
+            "reason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+        }
+    notice = budget_ping_notice("chat", used, limit)
+    if notice:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": notice
+            }
+        }
+    return None
+
+def run_hook_prompt() -> int:
+    """Claude Code UserPromptSubmit hook entry. Fails open."""
+    try:
+        decision = hook_prompt(json.load(sys.stdin))
+    except Exception as e:
+        log("hook prompt error:", e)
         return 0
     if decision:
         print(json.dumps(decision))
@@ -6485,6 +7211,27 @@ def run_cli(argv: List[str]) -> int:
     if arg in ("quota", "--quota", "quotas", "--quotas"):
         print(t_quota_status(source=rest[0] if rest else "all"))
         return 0
+    if arg in ("budget", "--budget"):
+        if not rest:
+            states = budget_state()
+            if not states:
+                print("No budgets set.")
+                return 0
+            for b in states:
+                print(f"[{b['scope']}] {b['used']:,} / {b['limit']:,} tokens ({b['pct']}%) — {b['status']}")
+            return 0
+        if len(rest) == 1:
+            print("Usage: subway-context budget [scope tokens]")
+            return 2
+        scope, tok_str = rest[0], rest[1]
+        try:
+            tokens = int(tok_str)
+        except ValueError:
+            print(f"Error: tokens must be an integer, got '{tok_str}'")
+            return 1
+        msg = set_budget(scope, tokens)
+        print(msg)
+        return 0
     if arg not in TOOLS:
         print(USAGE.format(version=VERSION, host=HUD_HOST), file=sys.stderr)
         return 2
@@ -6500,6 +7247,8 @@ def main() -> None:
         sys.exit(run_permit_server(argv[1]))
     if argv and argv[0] == "hook-guard":
         sys.exit(run_hook_guard())
+    if argv and argv[0] == "hook-prompt":
+        sys.exit(run_hook_prompt())
     if argv and argv[0] != "--stdio":
         sys.exit(run_cli(argv))
 

@@ -1,6 +1,6 @@
 /* One function per page. Each returns elements built from the latest status. */
-import { h, api, act, ask, field, get, icon, modal, pct, ticking, tokens } from "./lib.js";
-import { nextReset, providerCard, reachesLimit, spendChart } from "./usage.js";
+import { h, api, act, ask, field, get, icon, modal, pct, ticking, toast, tokens } from "./lib.js";
+import { nextResets, providerCard, reachesLimit, spendChart } from "./usage.js";
 
 const WORKER_STATE = {
   pending_approval: ["Awaiting approval", "gold"], launching: ["Launching", "gold"], running: ["Running", "gold"], stopping: ["Stopping", ""],
@@ -36,6 +36,91 @@ export function modeControl(settings) {
 }
 
 /* ---- Overview ---- */
+export function budgetsCard(data) {
+  const budgets = Array.isArray(data) ? data : data?.settings?.budgets;
+  if (!budgets || !budgets.length) return null;
+
+  const rows = budgets.map((b) => {
+    let tag = null;
+    if (b.status === "warning") {
+      tag = h("span", { class: "tag gold" }, "Almost gone");
+    } else if (b.status === "reached") {
+      tag = h("span", { class: "tag bad" }, "Reached, work stopped");
+    }
+
+    const hasLimit = b.limit && b.limit > 0;
+    const pctVal = hasLimit ? Math.min(100, Math.max(0, b.pct != null ? b.pct : (b.used != null ? ((b.used / b.limit) * 100) : 0))) : (b.pct != null ? Math.min(100, Math.max(0, b.pct)) : 0);
+    const tokenText = !hasLimit && b.pct == null
+      ? "No budget set"
+      : (b.used != null && hasLimit ? `${tokens(b.used)} of ${tokens(b.limit)} tokens` : pct(pctVal));
+    const barFillClass = b.status === "reached" ? "bar-fill bad" : "bar-fill";
+    const bar = h("div", { class: "bar" }, h("div", { class: barFillClass, style: `width: ${pctVal}%` }));
+
+    const input = h("input", {
+      type: "number",
+      min: 0,
+      placeholder: "Tokens",
+      value: hasLimit ? b.limit : "",
+    });
+
+    let btn;
+    const setBudget = async () => {
+      const raw = input.value.trim();
+      if (!raw || !/^\d+$/.test(raw)) {
+        toast("Enter a token number");
+        return;
+      }
+      const val = parseInt(raw, 10);
+      if (btn) btn.disabled = true;
+      input.disabled = true;
+      try {
+        const res = await api("/api/budget", { scope: b.scope, tokens: val });
+        toast(res.result || `Budget for ${b.scope} set`);
+        document.dispatchEvent(new Event("subway:refresh"));
+      } catch (e) {
+        toast(e.message);
+      } finally {
+        if (btn) btn.disabled = false;
+        input.disabled = false;
+      }
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        setBudget();
+      }
+    });
+
+    btn = h("button", {
+      class: "btn primary",
+      type: "button",
+      on: { click: setBudget },
+    }, "Set budget");
+
+    const tags = tag ? h("div", { class: "tags" }, tag) : null;
+    const head = h("div", { class: "budget-head" },
+      h("span", { class: "row-title" }, b.scope),
+      tags);
+
+    const main = h("div", { class: "budget-main" },
+      head,
+      bar,
+      h("div", { class: "row-sub num" }, tokenText));
+
+    const form = h("div", { class: "budget-form" },
+      input,
+      btn);
+
+    return h("div", { class: "row budget-row" }, main, form);
+  });
+
+  return h("section", { class: "card", "aria-labelledby": "budgets-title" },
+    h("div", { class: "card-head" },
+      h("h2", { class: "card-title", id: "budgets-title" }, "Budgets")),
+    h("div", { class: "rows" }, rows));
+}
+
 export function overview(d, link) {
   const now = d.timestamp;
   const providers = d.quotas.providers;
@@ -43,11 +128,31 @@ export function overview(d, link) {
   const pending = workers.filter((w) => w.status === "pending_approval").length;
   const running = workers.filter((w) => w.status === "running").length;
   const waiting = (d.permissions || []).length;
-  const reset = nextReset(providers, now);
+  const resets = nextResets(providers, now);
   const low = providers.filter((p) => reachesLimit(p, now)).map((p) => p.name);
   const needs = waiting + pending;
   const headline = needs ? `${needs} thing${needs > 1 ? "s" : ""} waiting on you` : running ? `${running} worker${running > 1 ? "s" : ""} running` : "All clear";
   const tokens5h = providers.reduce((sum, p) => sum + (p.tokens ? p.tokens["5h"].input + p.tokens["5h"].output : 0), 0);
+
+  let resetSide = null;
+  if (resets.length) {
+    const fig = ticking("div", { class: "hero-figure" }, resets[0].at, "countdown");
+    const note = h("div", { class: "hero-note" }, resets[0].label);
+    resetSide = h("div", { class: "hero-side" }, h("div", { class: "label" }, "Next limit reset"), fig, note);
+    if (resets.length > 1) {
+      let idx = 0;
+      const timer = setInterval(() => {
+        if (!resetSide.isConnected) {
+          clearInterval(timer);
+          return;
+        }
+        idx = (idx + 1) % resets.length;
+        const cur = resets[idx];
+        fig.dataset.epoch = cur.at;
+        note.textContent = cur.label;
+      }, 5000);
+    }
+  }
 
   const kpi = (name, label, value) => h("div", { class: "kpi" }, h("div", { class: "kpi-top" }, icon(name), label), h("div", { class: "kpi-value" }, value));
   return [
@@ -56,11 +161,11 @@ export function overview(d, link) {
       h("div", {}, h("div", { class: "hero-kicker" }, `${providers.length} LLM tool${providers.length === 1 ? "" : "s"} detected`),
         h("div", { class: "hero-head" }, headline),
         h("div", { class: "hero-note" }, low.length ? `Under 10% left: ${low.join(", ")}` : "No limit is under 10%.")),
-      reset ? h("div", { class: "hero-side" }, h("div", { class: "label" }, "Next limit reset"),
-        ticking("div", { class: "hero-figure" }, reset.at, "countdown"), h("div", { class: "hero-note" }, reset.label)) : null),
+      resetSide),
     h("div", { class: "kpis" },
       kpi("workers", "Running workers", running), kpi("bell", "Waiting on you", needs),
       kpi("leases", "File leases", Object.keys(d.locks || {}).length), kpi("bolt", "Tokens, last 5h", tokens(tokens5h))),
+    budgetsCard(d),
     h("div", { class: "grid overview-grid" },
       h("section", { class: "card" },
         h("div", {}, h("h2", { class: "card-title" }, "Token spend"), h("div", { class: "card-sub" }, "New input and output tokens per hour, last 24 hours")),
@@ -289,6 +394,9 @@ export function modelsPage(d) {
   const settings = d.settings || {};
   const allModels = settings.models || [];
   const bm = settings.benchmarks || {};
+  const opencodeProvider = (d.quotas && d.quotas.providers ? d.quotas.providers : []).find(
+    (p) => (p.id || "").toLowerCase() === "opencode" || (p.name || "").toLowerCase() === "opencode"
+  );
 
   let bmDate = "unknown";
   if (bm.fetched_at) {
@@ -315,7 +423,8 @@ export function modelsPage(d) {
       h("div", {},
         h("h2", { class: "card-title", id: "models-page-title" }, "Model rankings"),
         h("div", { class: "card-sub" }, `Benchmark source: ${bmSource} · Date: ${bmDate} · Refresh-free: models update dynamically`)),
-      h("div", { class: "seg", role: "group", "aria-label": "Filter by provider" }, segButtons)));
+      h("div", { class: "seg", role: "group", "aria-label": "Filter by provider" }, segButtons)),
+    h("div", { class: "card-sub" }, "Rankings tell the router how strong each model is for a kind of work. C is coding, R is reasoning, W is writing. Five dots is strongest."));
 
   const filtered = allModels.filter((m) => {
     const p = (m.provider || "").toLowerCase();
@@ -334,13 +443,16 @@ export function modelsPage(d) {
     groups[prov].push(m);
   }
 
-  const meter = (label, val) => {
+  const meter = (label, val, short) => {
     const dots = [];
     for (let i = 1; i <= 5; i++) {
       dots.push(h("span", { class: `dot-meter${i <= val ? " filled" : ""}` }));
     }
+    const shortLabel = short || label[0];
     return h("div", { class: "model-meter" },
-      h("span", { class: "meter-label" }, label),
+      h("span", { class: "meter-label", "data-short": shortLabel },
+        h("span", { class: "meter-full" }, label),
+        h("span", { class: "meter-short" }, shortLabel)),
       h("div", { class: "meter-dots" }, dots));
   };
 
@@ -377,7 +489,51 @@ export function modelsPage(d) {
 
       const tags = [h("span", { class: "tag" }, sourceTag)];
       if (m.scarce) tags.push(h("span", { class: "tag gold" }, "Scarce"));
-      if (m.free) tags.push(h("span", { class: "tag ok" }, "Free"));
+
+      const isOpenCode = (m.provider || "").toLowerCase() === "opencode";
+      if (m.free === true) {
+        tags.push(h("span", { class: "tag" }, "Free tier"));
+      }
+
+      if (isOpenCode && opencodeProvider) {
+        const limitedMap = (opencodeProvider && opencodeProvider.limited) || {};
+        let lim = limitedMap[m.model];
+        if (!lim && m.model) {
+          const mLow = m.model.toLowerCase();
+          for (const [k, v] of Object.entries(limitedMap)) {
+            const kLow = k.toLowerCase();
+            if (kLow === mLow || kLow.endsWith("/" + mLow) || mLow.endsWith("/" + kLow)) {
+              lim = v;
+              break;
+            }
+          }
+        }
+
+        if (lim && lim.recent) {
+          const ts = typeof lim.retry_at === "number" ? (lim.retry_at > 1e11 ? lim.retry_at : lim.retry_at * 1000) : Date.parse(lim.retry_at);
+          const retryTime = ts ? new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+          tags.push(h("span", { class: "tag bad" },
+            h("span", {}, "At limit"),
+            retryTime ? h("span", {}, ` · Retries around ${retryTime}`) : null));
+        } else {
+          tags.push(h("span", { class: "tag" }, "No limit reported"));
+        }
+
+        const perModelMap = (opencodeProvider && opencodeProvider.per_model) || {};
+        let usedTokens = perModelMap[m.model];
+        if (usedTokens === undefined && m.model) {
+          const mLow = m.model.toLowerCase();
+          for (const [k, v] of Object.entries(perModelMap)) {
+            const kLow = k.toLowerCase();
+            if (kLow === mLow || kLow.endsWith("/" + mLow) || mLow.endsWith("/" + kLow)) {
+              usedTokens = v;
+              break;
+            }
+          }
+        }
+        usedTokens = usedTokens || 0;
+        tags.push(h("span", { class: "tag num" }, `${tokens(usedTokens)} tokens used, 7 days`));
+      }
 
       const summaryBtn = h("button", {
         class: "model-row-btn",
@@ -393,9 +549,9 @@ export function modelsPage(d) {
           h("div", { class: "row-title" }, m.model || "Default"),
           h("div", { class: "tags" }, tags)),
         h("div", { class: "model-meters" },
-          meter("C", coding),
-          meter("R", reasoning),
-          meter("W", writing)));
+          meter("Coding", coding, "C"),
+          meter("Reasoning", reasoning, "R"),
+          meter("Writing", writing, "W")));
 
       if (!isExpanded) {
         return h("div", { class: "model-item" }, summaryBtn);
@@ -443,7 +599,14 @@ export function modelsPage(d) {
       h("div", { class: "rows" }, rows));
   });
 
-  return [headerCard, ...(groupCards.length ? groupCards : [h("div", { class: "card" }, h("div", { class: "empty" }, "No models match this filter."))])];
+  const howCard = h("section", { class: "card", "aria-labelledby": "how-title" },
+    h("div", { class: "card-head" },
+      h("h2", { class: "card-title", id: "how-title" }, "How this works")),
+    h("div", { class: "card-sub" },
+      "Routing picks a model using the task's difficulty, the role's skill, then remaining allowance; Benchmark means LMArena, Default means our starting estimate, Yours means you edited it; rankings measure strength, not allowance."));
+
+  const content = groupCards.length ? groupCards : [h("div", { class: "card" }, h("div", { class: "empty" }, "No models match this filter."))];
+  return [headerCard, ...content, howCard];
 }
 
 export function workersPage(d) {
@@ -477,10 +640,13 @@ export function workersPage(d) {
         budgetInput,
         budgetSaveBtn)));
 
+  const budgets = d.settings && d.settings.budgets;
+  const hasChatScope = Array.isArray(budgets) && budgets.some((b) => b.scope === "chat");
+
   return [
     permissionsCard(d.permissions || []),
     modeControl(d.settings),
-    chatBudgetCard,
+    hasChatScope ? null : chatBudgetCard,
     h("section", { class: "card" },
       h("div", { class: "card-head" },
         h("div", {},

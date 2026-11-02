@@ -99,19 +99,19 @@ export function providerCard(p, now) {
     (c.evidence || []).length ? h("details", {}, h("summary", {}, "Why this was detected"), h("ul", {}, c.evidence.map((e) => h("li", {}, e)))) : null);
 }
 
-/* Soonest upcoming reset across every provider, for the overview hero. */
-export function nextReset(providers, now) {
-  let best = null;
+/* Upcoming resets across every provider, soonest first, for the overview hero. */
+export function nextResets(providers, now) {
+  const resets = [];
   for (const p of providers) {
     for (const pool of p.pools || []) {
       for (const w of pool.windows) {
-        if (w.resets_at && w.resets_at > now && !w.disabled && (!best || w.resets_at < best.at)) {
-          best = { at: w.resets_at, label: `${p.name}${(p.pools.length > 1) ? ` ${pool.name}` : ""}, ${w.label.toLowerCase()}` };
+        if (w.resets_at && w.resets_at > now && !w.disabled) {
+          resets.push({ at: w.resets_at, label: `${p.name}${(p.pools.length > 1) ? ` ${pool.name}` : ""}, ${w.label.toLowerCase()}` });
         }
       }
     }
   }
-  return best;
+  return resets.sort((a, b) => a.at - b.at);
 }
 
 /* Tokens per hour for the last 24 hours, per provider. */

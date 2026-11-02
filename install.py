@@ -20,6 +20,7 @@ Usage:
 import json
 import os
 import select
+import shlex
 import shutil
 import stat
 import subprocess
@@ -221,29 +222,53 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
     # Hook in ~/.claude/settings.json
     hooks = settings_data.setdefault("hooks", {})
     if isinstance(hooks, dict):
+        if "/_npx/" in server_py.replace("\\", "/"):
+            npx = "npx.cmd" if sys.platform == "win32" else "npx"
+            hook_cmd = f"{shlex.quote(npx)} -y subway-context hook-guard"
+            hook_prompt_cmd = f"{shlex.quote(npx)} -y subway-context hook-prompt"
+        else:
+            hook_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-guard"
+            hook_prompt_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-prompt"
+
+        # Remove existing subway hooks and drop entries left empty
+        for event, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            cleaned = []
+            for entry in entries:
+                if isinstance(entry, dict) and "hooks" in entry and isinstance(entry["hooks"], list):
+                    remaining_hooks = [
+                        h for h in entry["hooks"]
+                        if isinstance(h, dict) and not (
+                            "hook-guard" in h.get("command", "") or "hook-prompt" in h.get("command", "")
+                        )
+                    ]
+                    if remaining_hooks:
+                        entry_copy = dict(entry)
+                        entry_copy["hooks"] = remaining_hooks
+                        cleaned.append(entry_copy)
+                elif isinstance(entry, dict):
+                    cmd = entry.get("command", "")
+                    if not ("hook-guard" in cmd or "hook-prompt" in cmd):
+                        cleaned.append(entry)
+                else:
+                    cleaned.append(entry)
+            hooks[event] = cleaned
+
         pre_tool = hooks.setdefault("PreToolUse", [])
         if isinstance(pre_tool, list):
-            if "/_npx/" in server_py.replace("\\", "/"):
-                npx = "npx.cmd" if sys.platform == "win32" else "npx"
-                hook_cmd = f"{npx} -y subway-context hook-guard"
-            else:
-                hook_cmd = f"{py_bin} {server_py} hook-guard"
-            hook_entry = {
-                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            pre_tool.append({
+                "matcher": "*",
                 "hooks": [{"type": "command", "command": hook_cmd}],
-            }
-            already_present = False
-            for entry in pre_tool:
-                if isinstance(entry, dict) and entry.get("matcher") == "Edit|Write|MultiEdit|NotebookEdit":
-                    for sub in entry.get("hooks", []):
-                        if isinstance(sub, dict) and sub.get("command") == hook_cmd:
-                            already_present = True
-                            break
-                if already_present:
-                    break
-            if not already_present:
-                pre_tool.append(hook_entry)
-                _atomic_write_json(settings_path, settings_data)
+            })
+
+        user_prompt = hooks.setdefault("UserPromptSubmit", [])
+        if isinstance(user_prompt, list):
+            user_prompt.append({
+                "hooks": [{"type": "command", "command": hook_prompt_cmd}],
+            })
+
+        _atomic_write_json(settings_path, settings_data)
 
     # Keyboard / slash command listeners (~/.claude/commands/)
     cmds_dir = os.path.expanduser("~/.claude/commands")
@@ -384,7 +409,7 @@ def remove_target(target: str) -> bool:
                     new_pre = []
                     hook_found = False
                     for entry in pre_tool:
-                        if isinstance(entry, dict) and entry.get("matcher") == "Edit|Write|MultiEdit|NotebookEdit":
+                        if isinstance(entry, dict) and entry.get("matcher") in ("Edit|Write|MultiEdit|NotebookEdit", "*"):
                             sub_hooks = entry.get("hooks", [])
                             filtered = [h for h in sub_hooks if isinstance(h, dict) and "hook-guard" not in h.get("command", "")]
                             if len(filtered) != len(sub_hooks):
@@ -400,6 +425,28 @@ def remove_target(target: str) -> bool:
                         hooks["PreToolUse"] = new_pre
                         _atomic_write_json(s_path, s_data)
                         print("  ✓ Claude Code: Removed Subway hook from ~/.claude/settings.json")
+                        removed = True
+
+                user_prompt = hooks.get("UserPromptSubmit", [])
+                if isinstance(user_prompt, list):
+                    new_up = []
+                    up_found = False
+                    for entry in user_prompt:
+                        if isinstance(entry, dict):
+                            sub_hooks = entry.get("hooks", [])
+                            filtered = [h for h in sub_hooks if isinstance(h, dict) and "hook-prompt" not in h.get("command", "")]
+                            if len(filtered) != len(sub_hooks):
+                                up_found = True
+                            if filtered:
+                                entry["hooks"] = filtered
+                                new_up.append(entry)
+                            else:
+                                up_found = True
+                        else:
+                            new_up.append(entry)
+                    if up_found:
+                        hooks["UserPromptSubmit"] = new_up
+                        _atomic_write_json(s_path, s_data)
                         removed = True
             except Exception as e:
                 print(f"  Error updating {s_path}: {e}")
