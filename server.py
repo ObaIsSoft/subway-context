@@ -5737,6 +5737,33 @@ def _review_trigger_step(review: str) -> Optional[Dict[str, Any]]:
     return _parse_trigger_steps(raw, label="review")[0]
 
 
+_PERMISSION_RANK = {"ask": 0, "auto_safe": 1, "auto_approve": 2}
+
+
+def _lineage_parent() -> Optional[Dict[str, Any]]:
+    """The running worker this call comes from, when a worker starts a sub-worker. None for chats."""
+    parent_id = os.environ.get("SUBWAY_WORKER_ID") or ""
+    if not WORKER_ID_RE.match(parent_id):
+        return None
+    parent = _load_worker(parent_id)
+    if not parent or parent.get("status") not in ("launching", "running"):
+        return None
+    return parent
+
+
+def _inherit_from_parent(parent: Optional[Dict[str, Any]], requested_mode: str, selected_mode: str) -> Tuple[str, str]:
+    """A sub-worker takes its parent's permission mode by default, and can never be broader than the parent."""
+    if not parent:
+        return requested_mode, selected_mode
+    parent_mode = str(parent.get("permission_mode") or "")
+    if parent_mode in _PERMISSION_RANK:
+        if not requested_mode or _PERMISSION_RANK.get(requested_mode, 0) > _PERMISSION_RANK[parent_mode]:
+            requested_mode = parent_mode
+    if selected_mode == "god" and parent.get("mode") != "god":
+        selected_mode = "standard"
+    return requested_mode, selected_mode
+
+
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
                   project_dir: str = "", timeout_seconds: int = DEFAULT_WORKER_TIMEOUT, effort: str = "auto",
                   mode: str = "standard", model: str = "", permission_mode: str = "",
@@ -5798,7 +5825,10 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         elif _WORKER_STANDING_RULES not in prompt:
             prompt = f"{prompt.rstrip()}\n\n{_WORKER_STANDING_RULES}"
 
-    permission_mode = _MODE_ALIASES.get(permission_mode, permission_mode) or get_permission_mode()
+    lineage_parent = _lineage_parent()
+    permission_mode, mode = _inherit_from_parent(lineage_parent, _MODE_ALIASES.get(permission_mode, permission_mode),
+                                                 (mode or "standard").lower())
+    permission_mode = permission_mode or get_permission_mode()
     if permission_mode not in PERMISSION_MODES:
         return f"Error: unknown permission_mode '{permission_mode}'. Must be one of {', '.join(PERMISSION_MODES)}."
     selected_mode = (mode or "standard").lower()
@@ -5984,7 +6014,18 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     }
     if selected_provider == "copilot":
         meta["input_excludes_cache"] = True
+    if lineage_parent:
+        # The user approved the parent, so its sub-workers start without a second approval.
+        meta["parent_id"] = lineage_parent["id"]
+        meta["approved_by"] = f"lineage:{lineage_parent['id']}"
     _save_worker(meta)
+    if lineage_parent:
+        launched = _launch_worker(worker_id)
+        _broadcast_track_internal(f"{lineage_parent['id']} started sub-worker `{worker_id}` ({role}, "
+                                  f"{selected_provider.upper()}, {PERMISSION_MODES[permission_mode]}).",
+                                  track=track, station_id="guard")
+        return (f"{launched}\n- Sub-worker of `{lineage_parent['id']}`: approved with its parent, "
+                f"permissions: {PERMISSION_MODES[permission_mode]} (never broader than the parent's).")
 
     god_warning = ("[WARNING: GOD MODE] This worker runs with permission prompts off and maximum effort.\n"
                    if is_god_mode else "")

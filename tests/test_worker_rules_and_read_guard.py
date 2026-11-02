@@ -4,6 +4,7 @@ _sandbox_sys.path.insert(0, _sandbox_os.path.dirname(_sandbox_os.path.abspath(__
 import _sandbox  # noqa: E402,F401
 import contextlib
 import json
+import re
 import os
 import shutil
 import tempfile
@@ -87,6 +88,48 @@ class TestWorkerRulesAndReadGuard(unittest.TestCase):
     def _permission_record(self, rid):
         with open(server._perm_file(rid), "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def _parent(self, status="running", permission_mode="auto_safe", mode="standard"):
+        parent = {"id": "worker_aaaaaa", "role": "Lead", "provider": "claude", "status": status,
+                  "permission_mode": permission_mode, "mode": mode, "launched_by": "test-launcher"}
+        server._save_worker(parent)
+        return parent
+
+    def _spin_as(self, parent_id, **kw):
+        launches = []
+        with mock.patch.dict(os.environ, {"SUBWAY_WORKER_ID": parent_id} if parent_id else {}), \
+                mock.patch.object(server, "_launch_worker", side_effect=lambda w: launches.append(w) or f"launched {w}"):
+            result = server.t_spin_worker(role="Sub", prompt="Read-only check", provider="claude",
+                                          project_dir=self.project, **kw)
+        wid = re.search(r"worker_[0-9a-f]{6}", result).group(0)
+        return server._load_worker(wid), launches, result
+
+    def test_sub_worker_inherits_parent_mode_and_approval(self):
+        self._parent(permission_mode="auto_safe")
+        child, launches, result = self._spin_as("worker_aaaaaa")
+        self.assertEqual(child["permission_mode"], "auto_safe")
+        self.assertEqual(child["parent_id"], "worker_aaaaaa")
+        self.assertEqual(child["approved_by"], "lineage:worker_aaaaaa")
+        self.assertEqual(launches, [child["id"]])
+        self.assertIn("approved with its parent", result)
+
+    def test_sub_worker_never_broader_than_parent(self):
+        self._parent(permission_mode="auto_safe")
+        child, _, _ = self._spin_as("worker_aaaaaa", permission_mode="auto_approve", mode="god")
+        self.assertEqual(child["permission_mode"], "auto_safe")
+        self.assertEqual(child["mode"], "standard")
+        narrower, _, _ = self._spin_as("worker_aaaaaa", permission_mode="ask")
+        self.assertEqual(narrower["permission_mode"], "ask")
+
+    def test_finished_parent_or_chat_caller_still_needs_user_approval(self):
+        self._parent(status="completed", permission_mode="auto_approve")
+        child, launches, _ = self._spin_as("worker_aaaaaa", permission_mode="ask")
+        self.assertEqual(launches, [])
+        self.assertEqual(child["status"], "pending_approval")
+        self.assertNotIn("parent_id", child)
+        from_chat, launches, _ = self._spin_as("", permission_mode="ask")
+        self.assertEqual(launches, [])
+        self.assertEqual(from_chat["status"], "pending_approval")
 
     def test_edit_prompt_gets_standing_rules_once_and_review_gets_only_reading_rule(self):
         source = os.path.join(self.project, "sample.py")
