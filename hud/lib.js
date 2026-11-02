@@ -39,6 +39,7 @@ const ICONS = {
   overview: "M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",
   usage: "M12 3a9 9 0 1 0 9 9h-9V3zM15 3.5A9 9 0 0 1 20.5 9H15V3.5z",
   workers: "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 7M18 14a7 7 0 0 1 4 7",
+  threads: "M3 4h18v13H8l-5 4zM7 9h10M7 13h7",
   leases: "M6 10V7a6 6 0 0 1 12 0v3M5 10h14v11H5zM12 14v3",
   ledger: "M6 3h12v18H6zM9 8h6M9 12h6M9 16h4",
   models: "M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5M3 17l9 5 9-5",
