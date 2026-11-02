@@ -63,6 +63,8 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
+import terminals
+
 try:
     import fcntl
 except ImportError:  # Windows: state stays atomic per write, but not serialized across processes.
@@ -198,6 +200,7 @@ def _ensure_subway_dir() -> None:
     os.makedirs(os.path.join(SUBWAY_DIR, "inbox"), exist_ok=True)
     os.makedirs(WORKERS_DIR, exist_ok=True)
     os.makedirs(TRACKS_DIR, exist_ok=True)
+    os.makedirs(_terminals_dir(), exist_ok=True)
     with contextlib.suppress(OSError):  # Holds prompts, worker logs and the HUD token.
         os.chmod(SUBWAY_DIR, 0o700)
 
@@ -7216,6 +7219,112 @@ def t_watch_workers(wait_seconds: int = 50) -> str:
     return "Nothing new. Workers are still running."
 
 
+# --------------------------------------------------------------------------
+# Terminals: thin wrappers over terminals.py (store, redaction, since-bookkeeping live there)
+# --------------------------------------------------------------------------
+
+def _terminals_dir() -> str:
+    return os.path.join(SUBWAY_DIR, "terminals")
+
+
+def t_list_terminals() -> str:
+    """List every terminal that has opted in: name, folder, last command, failures."""
+    with _state_lock("terminals"):
+        rows = terminals.list_terminals(_terminals_dir())
+    if not rows:
+        return "No terminals have been shared yet."
+    lines = [f"{len(rows)} terminal(s):"]
+    for r in rows:
+        flags = []
+        if r.get("closed"):
+            flags.append("closed")
+        if r.get("allow_commands"):
+            flags.append("commands allowed")
+        if r.get("shell_integration") is False:
+            flags.append("no shell integration")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(f"- `{r['id']}` {r['name']} — {r['folder'] or 'unknown folder'}{flag_str}: "
+                     f"last `{one_line(r.get('last_command') or '', 80)}` "
+                     f"({r['failures']} failing of {r['command_count']})")
+    return "\n".join(lines)
+
+
+def t_read_terminal(terminal_id: str, since: str = "last", mode: str = "commands") -> str:
+    """Read a terminal's history like a chat. mode='errors' shows only failed commands with output."""
+    caller = _self_id()
+    with _state_lock("terminals"):
+        result = terminals.read_terminal(_terminals_dir(), terminal_id, caller_id=caller, since=since, mode=mode)
+    if "error" in result:
+        return f"Error: {result['error']}"
+    cmds = result.get("commands") or []
+    if not cmds:
+        return f"Nothing new in `{terminal_id}`." if since == "last" else f"No commands in `{terminal_id}`."
+    lines = [f"`{terminal_id}` ({result.get('name') or terminal_id}), {len(cmds)} command(s):"]
+    for c in cmds:
+        lines.append(f"$ {c.get('command')}  (exit {c.get('exit_code')})")
+        if mode != "commands" and c.get("output"):
+            lines.append(one_line(c["output"], 2000))
+    return "\n".join(lines)
+
+
+def t_search_terminal(query: str, terminal: str = "") -> str:
+    """Find commands or output matching a substring, across one terminal or all of them."""
+    with _state_lock("terminals"):
+        hits = terminals.search_terminal(_terminals_dir(), query, terminal_id=terminal)
+    if not hits:
+        return f"No matches for '{query}'."
+    lines = [f"{len(hits)} match(es) for '{query}':"]
+    for h in hits:
+        lines.append(f"- `{h['terminal_id']}` {h.get('name')}: "
+                     f"$ {one_line(h.get('command') or '', 100)} (exit {h.get('exit_code')})")
+    return "\n".join(lines)
+
+
+def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -> str:
+    """Run a command in an opted-in editor terminal through the extension. Refuses terminals that
+    haven't opted in to running commands, have no shell integration, or are closed."""
+    caller = _self_id()
+    with _state_lock("terminals"):
+        term = terminals.get_terminal(_terminals_dir(), terminal_id)
+    if not term:
+        return f"Error: terminal `{terminal_id}` not found."
+    if term.get("closed"):
+        return f"[REFUSED] terminal `{terminal_id}` is closed."
+    if term.get("shell_integration") is False:
+        return f"[REFUSED] terminal `{terminal_id}` has no shell integration; run_terminal needs it."
+    if not term.get("allow_commands"):
+        return f"[REFUSED] terminal `{terminal_id}` hasn't opted in to running commands (needs 'Subway: Allow commands in this terminal')."
+
+    mode = get_permission_mode(caller)
+    if mode == "auto_safe" and not terminals.is_safe_command(command, AGY_SAFE_COMMANDS):
+        mode = "ask"
+    if mode == "ask":
+        meta = {"id": caller, "role": "chat", "provider": "terminal", "launched_by": caller, "permission_mode": "ask"}
+        rid = request_permission(meta, "run_terminal", f"{terminal_id}: {command}")
+        decision = await_permission(rid, wait=min(max(timeout_seconds, 0) + 60, PERMISSION_WAIT))
+        if decision not in ("allow", "allow_always"):
+            return f"[DENIED] run_terminal `{terminal_id}`: {command}"
+
+    run_id = f"run_{uuid.uuid4().hex[:8]}"
+    with _state_lock("terminals"):
+        terminals.create_run_request(_terminals_dir(), run_id, terminal_id, command,
+                                     timeout_seconds=timeout_seconds, caller_id=caller)
+    deadline = time.time() + max(1, min(timeout_seconds, 600)) + 5
+    while time.time() < deadline:
+        rec = terminals.get_run_request(_terminals_dir(), run_id)
+        if rec and rec.get("status") == "done":
+            with _state_lock("terminals"):
+                terminals.record_command(
+                    _terminals_dir(), terminal_id, command, exit_code=rec.get("exit_code"),
+                    start_ts=rec.get("created_at"), end_ts=rec.get("completed_at"),
+                    output=rec.get("output", ""), caller_id=caller)
+            if rec.get("error"):
+                return f"Error: {rec['error']}"
+            return f"[exit {rec.get('exit_code')}] {rec.get('output', '')}"
+        time.sleep(0.5)
+    return f"Error: `{terminal_id}` did not respond within {timeout_seconds}s."
+
+
 def stream_activity(emit: Callable[[str], None] = print, once: bool = False) -> None:
     """One line per new permission request or finished worker, the moment it happens."""
     seen = {r["id"] for r in _pending_permissions()}
@@ -12289,6 +12398,32 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"entries": history[offset:offset + limit], "total": len(history)})
             return
 
+        if path == "/api/terminals":
+            with _state_lock("terminals"):
+                rows = terminals.list_terminals(_terminals_dir())
+            self.send_json({"terminals": rows})
+            return
+
+        if path == "/api/terminal":
+            tid = query.get("id", [""])[0]
+            if not tid:
+                self._deny(400, "missing id")
+                return
+            with _state_lock("terminals"):
+                rec = terminals.get_terminal(_terminals_dir(), tid)
+            if not rec:
+                self._deny(404, "terminal not found")
+                return
+            self.send_json({"terminal": rec})
+            return
+
+        if path == "/api/pending_runs":
+            tid = query.get("terminal_id", [""])[0]
+            with _state_lock("terminals"):
+                runs = terminals.list_pending_runs(_terminals_dir(), terminal_id=tid)
+            self.send_json({"runs": runs})
+            return
+
         self._deny(404, "Not found")
 
     def _read_payload(self) -> Optional[Dict[str, Any]]:
@@ -12437,6 +12572,53 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 max_budget_usd=payload.get("max_budget_usd"))
         elif path == "/api/clear_history":
             res = archive_history()
+        elif path == "/api/terminal_opt_in":
+            tid = str(payload.get("terminal_id", ""))
+            if not tid:
+                self._deny(400, "missing terminal_id")
+                return
+            with _state_lock("terminals"):
+                rec = terminals.set_terminal_opt_in(
+                    _terminals_dir(), tid, name=str(payload.get("name", "")),
+                    window_id=str(payload.get("window_id", "")), folder=str(payload.get("folder", "")),
+                    share_enabled=payload.get("share_enabled"), allow_commands=payload.get("allow_commands"),
+                    shell_integration=payload.get("shell_integration"), closed=payload.get("closed"))
+            res = {"ok": True, "terminal": rec}
+        elif path == "/api/terminal_event":
+            tid = str(payload.get("terminal_id", ""))
+            if not tid:
+                self._deny(400, "missing terminal_id")
+                return
+            with _state_lock("terminals"):
+                term = terminals.get_terminal(_terminals_dir(), tid)
+                if not term or not term.get("share_enabled"):
+                    self._deny(403, "terminal has not opted in to sharing")
+                    return
+                terminals.record_command(
+                    _terminals_dir(), tid, str(payload.get("command", "")),
+                    exit_code=payload.get("exit_code"), start_ts=payload.get("start_ts"),
+                    end_ts=payload.get("end_ts"), output=str(payload.get("output", "")),
+                    caller_id=str(payload.get("caller_id") or "editor"),
+                    name=str(payload.get("name", "")), window_id=str(payload.get("window_id", "")),
+                    folder=str(payload.get("folder", "")))
+            res = {"ok": True}
+        elif path == "/api/run_result":
+            rid = str(payload.get("run_id", ""))
+            if not rid:
+                self._deny(400, "missing run_id")
+                return
+            try:
+                with _state_lock("terminals"):
+                    rec = terminals.complete_run_request(
+                        _terminals_dir(), rid, output=str(payload.get("output", "")),
+                        exit_code=payload.get("exit_code"), error=str(payload.get("error", "")))
+            except ValueError:
+                self._deny(400, "invalid run_id")
+                return
+            if not rec:
+                self._deny(404, "run request not found")
+                return
+            res = {"ok": True}
         else:
             self._deny(404, "Not found")
             return
@@ -12604,6 +12786,36 @@ TOOLS = {
     "list_locks": (t_list_locks, {
         "description": "List all active workspace file leases and sign-offs across all agents.",
         "inputSchema": {"type": "object", "properties": {}},
+    }),
+    "list_terminals": (t_list_terminals, {
+        "description": "List terminals your user has opted in to sharing: name, folder, last command, failures.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }),
+    "read_terminal": (t_read_terminal, {
+        "description": "Read a terminal's command history like a chat. since='last' returns only what you haven't seen.",
+        "inputSchema": {"type": "object", "required": ["terminal_id"], "properties": {
+            "terminal_id": {"type": "string"},
+            "since": {"type": "string", "default": "last", "description": "'last' or a unix timestamp."},
+            "mode": {"type": "string", "enum": ["commands", "errors", "full"], "default": "commands",
+                     "description": "'errors' shows only non-zero exits, with output."},
+        }},
+    }),
+    "search_terminal": (t_search_terminal, {
+        "description": "Find a command or output substring across shared terminals.",
+        "inputSchema": {"type": "object", "required": ["query"], "properties": {
+            "query": {"type": "string"},
+            "terminal": {"type": "string", "default": "", "description": "Limit to one terminal id."},
+        }},
+    }),
+    "run_terminal": (t_run_terminal, {
+        "description": "Run a command in an editor terminal your user opted in to running commands. Refuses "
+                       "terminals without that opt-in, without shell integration, or closed. Standalone terminals "
+                       "(Terminal, iTerm2, etc.) aren't supported here.",
+        "inputSchema": {"type": "object", "required": ["terminal_id", "command"], "properties": {
+            "terminal_id": {"type": "string"},
+            "command": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "default": 120},
+        }},
     }),
     "spin_worker": (t_spin_worker, {
         "description": "Queue an autonomous worker (Claude Code, OpenCode, or Antigravity) for your user's approval. "
@@ -13309,6 +13521,19 @@ def run_cli(argv: List[str]) -> int:
         return 0
     if arg == "mode":
         print(set_permission_mode(rest[0]) if rest else f"Permission mode: {PERMISSION_MODES[get_permission_mode()]}")
+        return 0
+    if arg == "terminal":
+        if not rest or rest[0] != "hook" or len(rest) < 2 or rest[1] not in ("install", "uninstall", "status"):
+            print("Usage: subway-context terminal hook install|uninstall|status")
+            return 2
+        action = rest[1]
+        shell = rest[2] if len(rest) > 2 else ""
+        if action == "install":
+            print(terminals.install_hook(shell=shell, server_url=_hud_url(_hud_port()), token=hud_token()))
+        elif action == "uninstall":
+            print(terminals.uninstall_hook(shell=shell))
+        else:
+            print(terminals.hook_status(shell=shell))
         return 0
     if arg == "watch":
         if "--stream" in rest:

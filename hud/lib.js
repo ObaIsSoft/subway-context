@@ -42,6 +42,7 @@ const ICONS = {
   threads: "M3 4h18v13H8l-5 4zM7 9h10M7 13h7",
   leases: "M6 10V7a6 6 0 0 1 12 0v3M5 10h14v11H5zM12 14v3",
   ledger: "M6 3h12v18H6zM9 8h6M9 12h6M9 16h4",
+  terminals: "M4 5h16v14H4zM7 10l3 3-3 3M13 16h4",
   models: "M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5M3 17l9 5 9-5",
   bell: "M6 16V11a6 6 0 0 1 12 0v5l2 2H4zM10 21h4",
   theme: "M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z",

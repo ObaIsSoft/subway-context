@@ -490,7 +490,7 @@ function workerRow(w, past) {
     logPre);
 }
 
-function openDelegate(d) {
+export function openDelegate(d, prefillPrompt = "") {
   const choices = d.quotas.providers.filter((p) => p.client && p.client.dispatchable);
   const provider = h("select", {}, h("option", { value: "auto" }, "Auto (first with budget)"), choices.map((p) => h("option", { value: p.id }, p.name)));
   const modes = d.settings.permission_modes;
@@ -507,7 +507,7 @@ function openDelegate(d) {
   const usd = input({ type: "number", min: 0, step: 0.5 });
   const maxTokens = input({ type: "number", min: 0 });
   const keepPrivate = h("input", { type: "checkbox" });
-  const prompt = h("textarea", { required: true });
+  const prompt = h("textarea", { required: true, value: prefillPrompt });
   const god = h("input", { type: "checkbox" });
   const verdict = h("div", { class: "verdict field full", role: "status" }, "Choose an agent to check its real limits.");
   const num = (el) => (el.value === "" ? null : parseFloat(el.value));
@@ -1046,6 +1046,78 @@ export function threadsPage(d, chats, onRefresh, error = "") {
       h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
     error ? h("div", { class: "err" }, `Could not refresh chat threads: ${error}`) : null,
     h("div", { class: "rows" }, rows.length ? rows : h("div", { class: "empty" }, "No chat threads found.")));
+}
+
+/* Terminals */
+export const terminalsState = { rows: [], loadedAt: 0, loading: false, error: "" };
+
+function terminalRowTags(t) {
+  const tags = [];
+  if (t.closed) tags.push(h("span", { class: "tag bad" }, "closed"));
+  if (t.shell_integration === false) tags.push(h("span", { class: "tag" }, "no shell integration"));
+  if (t.allow_commands) tags.push(h("span", { class: "tag" }, "commands allowed"));
+  if (t.failures) tags.push(h("span", { class: "tag bad" }, `${t.failures} failing`));
+  return tags;
+}
+
+async function openTerminalDetail(t) {
+  const body = h("div", { class: "rows" }, h("div", { class: "empty" }, "Loading…"));
+  const dlg = modal(t.name || t.id, body);
+  try {
+    const data = await api(`/api/terminal?id=${encodeURIComponent(t.id)}`);
+    const rec = data.terminal || {};
+    const commands = rec.commands || [];
+    const rows = commands.length ? commands.slice().reverse().map((c) => {
+      const failed = c.exit_code !== 0 && c.exit_code !== null && c.exit_code !== undefined;
+      const outputPre = h("pre", { hidden: true }, c.output || "(no output)");
+      const toggle = h("button", {
+        class: "link-btn", type: "button",
+        on: { click: () => { outputPre.hidden = !outputPre.hidden; } },
+      }, "Show output");
+      const handBtn = failed ? h("button", {
+        class: "btn", type: "button",
+        on: {
+          click: () => {
+            dlg.close();
+            openDelegate(get("status"),
+              `Terminal \`${rec.name || rec.id}\` ran \`${c.command}\` (exit ${c.exit_code}) in ${rec.folder || "an unknown folder"}:\n\n${(c.output || "").slice(0, 4000)}`);
+          },
+        },
+      }, "Hand to worker") : null;
+      return h("div", { class: `row${failed ? " alert" : ""}` },
+        h("div", {},
+          h("div", { class: "mono" }, `$ ${c.command}`),
+          h("div", { class: "row-sub" }, `exit ${c.exit_code ?? "?"}${c.ts ? ` · ${new Date(c.ts * 1000).toLocaleString()}` : ""}`)),
+        h("div", { class: "btns" }, toggle, handBtn),
+        outputPre);
+    }) : [h("div", { class: "empty" }, "No commands recorded yet.")];
+    body.replaceChildren(...rows);
+  } catch (e) {
+    body.replaceChildren(h("div", { class: "err" }, `Could not load terminal: ${e.message}`));
+  }
+}
+
+export function terminalsPage(d, rows, onRefresh, error = "") {
+  const list = rows || [];
+  const bodyRows = list.map((t) => h("div", {
+    class: "row", tabindex: "0", role: "button",
+    on: {
+      click: () => openTerminalDetail(t),
+      keydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openTerminalDetail(t); } },
+    },
+  },
+    h("div", {},
+      h("b", {}, t.name || t.id),
+      h("div", { class: "row-sub" }, `${t.folder || "Unknown folder"}${t.last_ts ? ` · ${new Date(t.last_ts * 1000).toLocaleString()}` : ""}`),
+      t.last_command ? h("div", { class: "row-sub mono" }, `$ ${t.last_command}`) : null),
+    h("div", { class: "tags" }, terminalRowTags(t))));
+  return h("section", { class: "card" },
+    h("div", { class: "card-head" },
+      h("div", {}, h("h2", { class: "card-title" }, "Terminals"),
+        h("div", { class: "card-sub" }, "Commands run in terminals your user has shared. Nothing is captured until they opt in.")),
+      h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
+    error ? h("div", { class: "err" }, `Could not refresh terminals: ${error}`) : null,
+    h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" }, "No terminals have been shared yet.")));
 }
 
 /* Ledger */
