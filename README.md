@@ -322,7 +322,9 @@ Subway Context tracks live rate limits, token usage, and session windows across 
   - **OpenCode**: Read from the local OpenCode SQLite database (`~/.local/share/opencode/opencode.db`).
 - **Unknown & Stale Indicators**: If an agent hasn't reported data or its server is temporarily unreachable, Subway retains the last-known reading and explicitly reports unknown values rather than guessing.
 - **OpenCode Limits**: OpenCode uses a background service, so no terminal needs to stay open. It publishes no remaining free allowance, so limits show only when a limit error occurs; Subway displays its active model and token counts without synthetic limit caps.
-- **GitHub Copilot**: Read through your `gh` sign-in (`gh api /copilot_internal/user`). Shows chat, completions and premium request allowances. Subway doesn't dispatch workers to Copilot.
+- **GitHub Copilot**: Read through your `gh` sign-in (`gh api /copilot_internal/user`).
+  Workers run through the Copilot CLI and spend the chat allowance (one request per run, credits shown in AIC).
+  Completions are inline editor suggestions, shown but never spent.
 - **Kimi**: Read from Kimi Code's own sign-in in `~/.kimi-code/credentials/`. Experimental: the usage endpoint is undocumented and may change when Kimi updates. Accounts without a Kimi Code plan show "no plan limits". Subway never refreshes or prints the token, and doesn't dispatch workers to Kimi.
 - **Manual Overrides (`set_quota`)**: Users can record manual limits if an agent cannot report them automatically. Live readings always supersede manual overrides.
 

@@ -344,7 +344,10 @@ function workerTags(w) {
   }
   if (w.triggered_by) tags.push(h("span", { class: "tag" }, `Started by ${w.triggered_by}`));
   if (Array.isArray(w.triggered) && w.triggered.length) tags.push(h("span", { class: "tag" }, `Then: ${w.triggered.join(", ")}`));
-  if (w.model && !["default", "inherit"].includes(w.model)) tags.push(h("span", { class: "tag" }, w.model));
+  const modelTag = (w.model_used && w.model && w.model !== w.model_used)
+    ? `${w.model} -> ${w.model_used}`
+    : (w.model_used || w.model);
+  if (modelTag && !["default", "inherit"].includes(modelTag)) tags.push(h("span", { class: "tag" }, modelTag));
   if (w.effort) tags.push(h("span", { class: "tag" }, `effort ${w.effort}`));
   if (w.skip_permissions) tags.push(h("span", { class: "tag bad" }, "Prompts off"));
   else if (w.permission_mode === "auto_safe") tags.push(h("span", { class: "tag" }, "Safe commands auto"));

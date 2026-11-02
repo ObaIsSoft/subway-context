@@ -5359,6 +5359,10 @@ def _add_usage(meta: Dict[str, Any], u: Dict[str, Any]) -> None:
     usage["input"] += int(u.get("input_tokens") or 0)
     usage["output"] += int(u.get("output_tokens") or 0) + int(u.get("thinking_tokens") or 0)
     usage["cache_read"] += int(u.get("cache_read_tokens") or 0)
+    if "credits" in u and u["credits"] is not None:
+        usage["credits"] = round(float(usage.get("credits", 0.0)) + float(u["credits"]), 5)
+    if "requests" in u and u["requests"] is not None:
+        usage["requests"] = int(usage.get("requests", 0)) + int(u["requests"])
 
 
 def _check_cap(run: Dict[str, Any]) -> None:
@@ -5484,11 +5488,18 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
     if sess_id and not run.get("conversation"):
         run["conversation"] = sess_id
 
-    if kind == "assistant.message":
+    if kind == "session.auto_mode_resolved":
+        chosen = ev.get("data", {}).get("chosenModel")
+        if chosen:
+            run["model_used"] = chosen
+    elif kind == "assistant.message":
         content = ev.get("data", {}).get("content") or ""
         if content:
             run["response"] = content
             write(content)
+        model = ev.get("data", {}).get("model")
+        if model and not run.get("model_used"):
+            run["model_used"] = model
     elif kind == "result":
         if ev.get("sessionId"):
             run["conversation"] = ev["sessionId"]
@@ -5496,42 +5507,56 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             run["response"] = ev["result"]
             write(str(ev["result"]))
         usage = ev.get("usage") or {}
-        credits_val = usage.get("premiumRequests") if usage.get("premiumRequests") is not None else usage.get("credits")
-        if credits_val is not None:
-            u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
-            u["credits"] = credits_val
+        reqs = usage.get("premiumRequests")
+        if reqs is not None:
+            u = run.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "credits": 0.0, "requests": 0})
+            u["requests"] = int(reqs)
     elif kind == "session.usage_checkpoint":
         data = ev.get("data") or {}
         snap = data.get("accountingSnapshot") or {}
-        credits_val = (
-            data.get("totalPremiumRequests")
-            if data.get("totalPremiumRequests") is not None
-            else snap.get("totalPremiumRequestCost")
-            if snap.get("totalPremiumRequestCost") is not None
-            else snap.get("credits")
-        )
-        if credits_val is None and data.get("totalNanoAiu"):
-            credits_val = round(data["totalNanoAiu"] / 1e9, 4)
+        credits_val = None
+        if data.get("totalNanoAiu") is not None:
+            credits_val = data["totalNanoAiu"] / 1e9
+        elif snap.get("totalNanoAiu") is not None:
+            credits_val = snap["totalNanoAiu"] / 1e9
+        elif snap.get("credits") is not None:
+            credits_val = float(snap["credits"])
+
+        reqs_val = data.get("totalPremiumRequests")
+        if reqs_val is None:
+            reqs_val = snap.get("totalPremiumRequests")
 
         td = data.get("tokenDetails") or snap.get("tokenDetails") or {}
         inp = int((td.get("input") or {}).get("tokenCount", 0))
         out_tok = int((td.get("output") or {}).get("tokenCount", 0))
         cache_read = int((td.get("cache_read") or {}).get("tokenCount", 0))
 
-        if not inp and not out_tok:
-            mm = data.get("modelMetrics") or snap.get("modelMetrics") or {}
-            for m_info in mm.values():
-                mu = m_info.get("usage") or {}
-                inp += int(mu.get("inputTokens") or 0)
-                out_tok += int(mu.get("outputTokens") or 0)
-                cache_read += int(mu.get("cacheReadTokens") or 0)
+        mm = data.get("modelMetrics") or snap.get("modelMetrics") or {}
+        mm_inp = mm_out = mm_cache = mm_reasoning = 0
+        for m_name, m_info in mm.items():
+            if m_name and not run.get("model_used"):
+                run["model_used"] = m_name
+            mu = m_info.get("usage") or {}
+            mm_inp += int(mu.get("inputTokens") or 0)
+            mm_out += int(mu.get("outputTokens") or 0)
+            mm_cache += int(mu.get("cacheReadTokens") or 0)
+            mm_reasoning += int(mu.get("reasoningTokens") or 0)
 
-        u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
+        if not inp and not out_tok:
+            inp = mm_inp
+            out_tok = mm_out + mm_reasoning
+            cache_read = mm_cache
+        elif mm_reasoning:
+            out_tok += mm_reasoning
+
+        u = run.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "credits": 0.0, "requests": 0})
         if credits_val is not None:
             u["credits"] = credits_val
-        u["input"] = inp
-        u["output"] = out_tok
-        u["cache_read"] = cache_read
+        if reqs_val is not None:
+            u["requests"] = int(reqs_val)
+        u["input_tokens"] = inp
+        u["output_tokens"] = out_tok
+        u["cache_read_tokens"] = cache_read
 
         step_cost = inp + out_tok
         new_cost = max(0, step_cost - run.get("seen_tokens", 0))
@@ -5549,19 +5574,24 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             run["response"] = ev["response"]
             write(str(ev["response"]))
         if "credits" in ev:
-            u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
-            u["credits"] = ev["credits"]
+            u = run.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "credits": 0.0, "requests": 0})
+            u["credits"] = float(ev["credits"])
+        if "requests" in ev:
+            u = run.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "credits": 0.0, "requests": 0})
+            u["requests"] = int(ev["requests"])
         if "usage" in ev and isinstance(ev["usage"], dict):
             u_dict = ev["usage"]
-            u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
+            u = run.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "credits": 0.0, "requests": 0})
             if "credits" in u_dict:
-                u["credits"] = u_dict["credits"]
-            for k_src, k_dst in [("input_tokens", "input"), ("input", "input"),
-                                 ("output_tokens", "output"), ("output", "output"),
-                                 ("cache_read_tokens", "cache_read"), ("cache_read", "cache_read")]:
+                u["credits"] = float(u_dict["credits"])
+            if "requests" in u_dict:
+                u["requests"] = int(u_dict["requests"])
+            for k_src, k_dst in [("input_tokens", "input_tokens"), ("input", "input_tokens"),
+                                 ("output_tokens", "output_tokens"), ("output", "output_tokens"),
+                                 ("cache_read_tokens", "cache_read_tokens"), ("cache_read", "cache_read_tokens")]:
                 if k_src in u_dict:
                     u[k_dst] = int(u_dict[k_src] or 0)
-            step_cost = u["input"] + u["output"]
+            step_cost = u.get("input_tokens", 0) + u.get("output_tokens", 0)
             if step_cost:
                 new_cost = max(0, step_cost - run.get("seen_tokens", 0))
                 run["seen_tokens"] = max(step_cost, run.get("seen_tokens", 0))
@@ -5911,6 +5941,10 @@ def supervise_worker(worker_id: str) -> int:
                     break
                 if pump:
                     pump.join(timeout=5)
+                    save_kwargs = {}
+                    if run.get("model_used"):
+                        meta["model_used"] = run["model_used"]
+                        save_kwargs["model_used"] = run["model_used"]
                     if run.get("usage"):
                         # A killed turn sends no total, so the next turn's total includes it. The live count shows which applies.
                         final = sum(int(run["usage"].get(k) or 0) for k in ("input_tokens", "output_tokens", "thinking_tokens"))
@@ -5918,7 +5952,10 @@ def supervise_worker(worker_id: str) -> int:
                         if saved and abs(final - run.get("spent", 0)) < abs(saved + final - run.get("spent", 0)):
                             meta["usage"] = {"input": 0, "output": 0, "cache_read": 0}
                         _add_usage(meta, run.pop("usage"))
-                        save_progress(usage=meta["usage"], conversation=run.get("conversation"))
+                        save_kwargs.update({"usage": meta["usage"], "conversation": run.get("conversation")})
+                        save_progress(**save_kwargs)
+                    elif save_kwargs:
+                        save_progress(**save_kwargs)
                     usage = meta.setdefault("usage", {"input": 0, "output": 0, "cache_read": 0})
                     if int(usage.get("input") or 0) + int(usage.get("output") or 0) < run.get("spent", 0):
                         diff = run["spent"] - (int(usage.get("input") or 0) + int(usage.get("output") or 0))
@@ -7622,7 +7659,7 @@ def detect_clients() -> Dict[str, Dict[str, Any]]:
            sorted(glob.glob(_home(".vscode", "extensions", "github.copilot*")))[-1:]]
     if os.path.isdir(_home(".config", "github-copilot")):
         ev.append("config: ~/.config/github-copilot")
-    add("copilot", ev)
+    add("copilot", ev, cli=copilot)
     if not ev and os.path.isdir(_home("Library", "Application Support", "Code", "User", "globalStorage", "github.copilot-chat")):
         out["copilot"].update({"installed": True, "evidence": ["VS Code data only, no extension or CLI found"]})
 
@@ -7814,6 +7851,7 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     if not raw or not isinstance(raw, dict):
         base_note = "Doesn't expose usage locally, and Subway can't dispatch workers to it yet."
         note = f"{base_note} {no_models_note}" if not models else base_note
+        client["dispatchable"] = False
         return {
             "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
             "pools": [], "tokens": None, "error": None, "models": models,
@@ -7823,6 +7861,12 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     plan = raw.get("copilot_plan") or ""
     quota_reset = _parse_ts(raw.get("quota_reset_date"))  # "2026-12-01" -> seconds, like every other gauge.
     snapshots = raw.get("quota_snapshots") or {}
+    chat = snapshots.get("chat") or {}
+    unlimited = bool(chat.get("unlimited"))
+    rem = chat.get("remaining")
+    pct = chat.get("percent_remaining")
+    chat_ok = unlimited or (rem is not None and rem > 0) or (pct is not None and pct > 0)
+    client["dispatchable"] = bool(client.get("dispatchable")) and chat_ok
     name_map = {
         "chat": "Chat",
         "completions": "Completions (inline editor suggestions Subway shows but never spends)",
@@ -8128,6 +8172,28 @@ def check_budget_preflight(model: str = "", provider: str = "auto",
     record = next((p for p in discover_connected_providers() if p["id"] == provider), None)
     if record is None:
         return True, f"Budget unknown: {provider} isn't detected on this machine."
+    if provider == "copilot":
+        raw = _copilot_raw()
+        if isinstance(raw, dict):
+            snaps = raw.get("quota_snapshots") or {}
+            chat = snaps.get("chat") or {}
+            unlimited = bool(chat.get("unlimited"))
+            rem = chat.get("remaining")
+            ent = chat.get("entitlement")
+            reset_date = raw.get("quota_reset_date") or ""
+            pct = chat.get("percent_remaining")
+            if not unlimited and rem is not None and rem <= 0:
+                return False, f"[BUDGET GUARD VIOLATION] Copilot chat pool exhausted: 0 of {ent} remaining (resets {reset_date})."
+            if budget_weekly_pct is not None and pct is not None and pct < budget_weekly_pct:
+                return False, f"[BUDGET GUARD ALERT] Requested task weekly budget cap ({budget_weekly_pct}%) exceeds available chat allowance ({pct}% left)."
+            if budget_session_pct is not None and pct is not None and pct < budget_session_pct:
+                return False, f"[BUDGET GUARD ALERT] Requested task 5h budget cap ({budget_session_pct}%) exceeds available chat allowance ({pct}% left)."
+            if unlimited:
+                reset_info = f" (resets {reset_date})" if reset_date else ""
+                return True, f"Budget approved: Copilot chat pool is unlimited{reset_info}."
+            if rem is not None and ent is not None:
+                reset_info = f" (resets {reset_date})" if reset_date else ""
+                return True, f"Budget approved: Copilot chat pool has {rem} of {ent} remaining{reset_info}."
     limited = (record.get("limited") or {}).get(model) if provider == "opencode" else None
     if limited and limited.get("recent"):
         return False, (f"[BUDGET GUARD VIOLATION] {model} is at its free limit, and OpenCode retries around "
