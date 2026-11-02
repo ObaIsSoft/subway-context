@@ -2000,6 +2000,25 @@ def find_agy_binary() -> Optional[str]:
     return None
 
 
+def find_copilot_binary() -> Optional[str]:
+    """Dynamically locate GitHub Copilot CLI binary."""
+    env_bin = os.environ.get("COPILOT_BIN")
+    if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
+        return env_bin
+    p = shutil.which("copilot") or (shutil.which("copilot.cmd") if sys.platform == "win32" else None)
+    if p:
+        return p
+    candidates = [
+        os.path.join(HOME, ".local", "bin", "copilot"),
+        "/usr/local/bin/copilot",
+        "/opt/homebrew/bin/copilot",
+    ]
+    for c in candidates:
+        if os.path.exists(c) or os.path.lexists(c):
+            return c
+    return None
+
+
 # --------------------------------------------------------------------------
 # Feature B: Live Workspace Guard (File Leases & Collision Shield)
 # --------------------------------------------------------------------------
@@ -2731,6 +2750,7 @@ DEFAULT_MODELS: List[Dict[str, Any]] = [
     {"provider": "antigravity", "model": "gemini-3.8-flash-medium", "coding": 3, "reasoning": 3, "writing": 3},
     {"provider": "claude", "model": "haiku", "coding": 2, "reasoning": 2, "writing": 3},
     {"provider": "antigravity", "model": "gemini-3.8-flash-low", "coding": 2, "reasoning": 2, "writing": 2},
+    {"provider": "copilot", "model": "auto", "coding": 3, "reasoning": 3, "writing": 3},
     {"provider": "opencode", "model": "", "coding": 2, "reasoning": 2, "writing": 2},
     {"provider": "local", "model": "", "coding": 1, "reasoning": 1, "writing": 2},
 ]
@@ -2974,10 +2994,59 @@ def _opencode_models() -> List[str]:
 
     return []
 
+
+@ttl_cached(300.0)
+def _copilot_models() -> List[Dict[str, Any]]:
+    patterns = [
+        os.path.expanduser("~/Library/Application Support/Code/User/workspaceStorage/*/GitHub.copilot-chat/debug-logs/*/models.json"),
+        os.path.expanduser("~/Library/Application Support/Code - Insiders/User/workspaceStorage/*/GitHub.copilot-chat/debug-logs/*/models.json"),
+    ]
+    candidates: List[str] = []
+    for pat in patterns:
+        candidates.extend(glob.glob(pat))
+    newest_file: Optional[str] = None
+    newest_mtime = -1.0
+    for path in candidates:
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                newest_file = path
+        except OSError:
+            continue
+    if not newest_file:
+        return []
+    try:
+        with open(newest_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    usable: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        policy = entry.get("policy")
+        policy_state = policy.get("state") if isinstance(policy, dict) else None
+        is_default = bool(entry.get("is_chat_default"))
+        if policy_state == "enabled" or is_default:
+            m_id = entry.get("id")
+            if not m_id:
+                continue
+            usable.append({
+                "model": m_id,
+                "name": entry.get("name"),
+                "vendor": entry.get("vendor"),
+                "price_band": entry.get("model_picker_price_category"),
+                "default": is_default,
+            })
+    return usable
+
 def _catalog_stamp() -> Tuple[float, ...]:
     """Changes when rankings do, so an edit shows up straight away despite the cache."""
     stamps = []
-    for name in ("models.json", "benchmarks.json", "providers.json", "opencode_models.json"):
+    for name in ("models.json", "benchmarks.json", "providers.json", "opencode_models.json", "copilot_models.json"):
         with contextlib.suppress(OSError):
             stamps.append(os.path.getmtime(os.path.join(SUBWAY_DIR, name)))
     return tuple(stamps)
@@ -2992,7 +3061,12 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
     b_data = _load_json("benchmarks.json")
     b_rows = b_data.get("rows") if isinstance(b_data, dict) else []
     oc_models = _opencode_models()
-    all_models_to_bench = list(DEFAULT_MODELS) + [{"provider": "opencode", "model": m} for m in oc_models]
+    cp_models = _copilot_models()
+    all_models_to_bench = (
+        list(DEFAULT_MODELS)
+        + [{"provider": "opencode", "model": m} for m in oc_models]
+        + [{"provider": "copilot", "model": m["model"]} for m in cp_models]
+    )
     b_strengths = benchmark_strengths(b_rows, all_models_to_bench) if isinstance(b_rows, list) else {}
 
     catalog_map: Dict[Tuple[str, str], Dict[str, Any]] = {}  # By provider too: several have no model name.
@@ -3025,6 +3099,33 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
                 entry["free"] = True
             if oc_model in b_strengths:
                 s = b_strengths[oc_model]
+                entry["coding"] = s
+                entry["reasoning"] = s
+                entry["writing"] = s
+                entry["source"] = "benchmark"
+            catalog_map[key] = entry
+
+    # Copilot models discovery
+    for cp_m in cp_models:
+        m_id = cp_m.get("model") or ""
+        key = ("copilot", m_id)
+        if key not in catalog_map:
+            entry = {
+                "provider": "copilot",
+                "model": m_id,
+                "coding": 2,
+                "reasoning": 2,
+                "writing": 2,
+                "source": "default",
+                "price_band": cp_m.get("price_band"),
+                "default": cp_m.get("default", False),
+            }
+            if cp_m.get("name"):
+                entry["name"] = cp_m["name"]
+            if cp_m.get("vendor"):
+                entry["vendor"] = cp_m["vendor"]
+            if m_id in b_strengths:
+                s = b_strengths[m_id]
                 entry["coding"] = s
                 entry["reasoning"] = s
                 entry["writing"] = s
@@ -3206,6 +3307,21 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     providers = providers if providers is not None else discover_connected_providers()
     usable = {p["id"] for p in providers if (p.get("client") or {}).get("dispatchable")}
     stats = _load_model_stats()
+    raw_copilot = _copilot_raw()
+    copilot_limited = False
+    if isinstance(raw_copilot, dict):
+        snaps = raw_copilot.get("quota_snapshots") or {}
+        chat = snaps.get("chat") or {}
+        prem = snaps.get("premium_interactions") or {}
+        shed_pct = _load_json("config.json").get("shed_at_pct", 20)
+        chat_ent = chat.get("entitlement", 0)
+        chat_finite = (not chat.get("unlimited", False)) and (chat_ent > 0)
+        prem_ent = prem.get("entitlement", 0)
+        prem_unl = prem.get("unlimited", False)
+        prem_pct = prem.get("percent_remaining")
+        prem_little_left = (not prem_unl) and (prem_pct is not None and prem_pct <= shed_pct)
+        if chat_finite and ((prem_ent == 0 and not prem_unl) or prem_little_left):
+            copilot_limited = True
     is_code_edit = (skill == "coding" and not _has_any(text, ["review", "audit"]))
     ranked = []
     for m in model_catalog():
@@ -3220,10 +3336,17 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             elif m["provider"] == "opencode":
                 oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om)]
                 model_name = oc_cand[0] if oc_cand else ""
+            elif m["provider"] == "copilot":
+                cp_cand = [cm["model"] for cm in _copilot_models() if cm.get("model") and not _model_is_bad(cm["model"])]
+                model_name = cp_cand[0] if cp_cand else "auto"
             else:
                 model_name = m["provider"]
         if not model_name or _model_is_bad(model_name):
             continue
+        if m["provider"] == "copilot" and copilot_limited:
+            usable_cp = {cm["model"] for cm in _copilot_models() if cm.get("model")}
+            if model_name not in usable_cp and model_name != "auto":
+                continue
         m_entry = dict(m, model=model_name)
         strength = float(m_entry.get(skill, 1))
         left = _pool_left(providers, m_entry["provider"], m_entry["model"])
@@ -3259,6 +3382,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
                 return 4
             if is_free or prov == "local":
                 return 3
+            if prov == "copilot":
+                return 0 if (copilot_limited and need <= 2) else 2
             if prov == "antigravity":
                 return 0
             if prov == "claude":
@@ -3267,6 +3392,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
         else:
             if is_free or prov == "local":
                 return 0
+            if prov == "copilot":
+                return 0 if (copilot_limited and need <= 2) else 2
             if prov == "antigravity":
                 return 1
             if prov == "claude":
@@ -3279,7 +3406,9 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     elif need >= 4:
         # Hard work: the strongest model, and a scarce one only if nothing else is as strong. Free models last on code edits.
         enough.sort(key=lambda r: (
-            2 if is_code_edit and r[2].get("high_no_change") else (1 if is_code_edit and (r[2].get("free") or r[2]["model"].endswith("-free") or r[2]["provider"] == "local") else 0),
+            2 if (r[2]["provider"] == "copilot" and copilot_limited) else (
+                2 if is_code_edit and r[2].get("high_no_change") else (1 if is_code_edit and (r[2].get("free") or r[2]["model"].endswith("-free") or r[2]["provider"] == "local") else 0)
+            ),
             -r[0],
             bool(r[2].get("scarce")),
             -r[1]
@@ -3321,13 +3450,22 @@ def _safe_prompt(prompt: str) -> str:
 
 def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: bool, caps: List[str],
                     permission_mode: str, prompt: str, max_budget_usd: Optional[float],
-                    thread_id: str, worker_id: str = "") -> List[str]:
+                    thread_id: str, worker_id: str = "", workdir: str = "",
+                    isolate: bool = False, isolated: bool = False) -> List[str]:
     """Translate a worker spec into the real flags of each agent CLI."""
     if provider == "antigravity" and effort == "max":
         effort = "high"  # Antigravity models stop at high, and refuse max outright.
     skip_permissions = god or permission_mode == "auto_approve" or "terminal:full" in caps
     safe = permission_mode == "auto_safe"
     text = _safe_prompt(prompt)
+
+    if provider == "copilot":
+        m = model if (model and model != "inherit") else "auto"
+        wd = workdir or os.getcwd()
+        cmd = [bin_path or "copilot", "-p", text, "--model", m, "--output-format", "json", "--add-dir", wd]
+        if isolate or isolated or skip_permissions:
+            cmd.append("--allow-all-tools")
+        return cmd
 
     if provider == "claude":
         cmd = [bin_path, "--model", model, "--effort", effort, "--output-format", "stream-json", "--verbose"]
@@ -4259,11 +4397,11 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     selected_provider = (provider or "auto").lower()
     if selected_provider == "god":
         selected_provider, selected_mode = "auto", "god"
-    selected_provider = {"claude-code": "claude", "opencode2": "opencode", "agy": "antigravity", "ollama": "local"}.get(selected_provider, selected_provider)
+    selected_provider = {"claude-code": "claude", "opencode2": "opencode", "agy": "antigravity", "ollama": "local", "github-copilot": "copilot"}.get(selected_provider, selected_provider)
     custom_map = {p["id"]: p for p in load_custom_providers()}
-    valid_providers = ("auto", "claude", "opencode", "antigravity", "local") + tuple(custom_map.keys())
+    valid_providers = ("auto", "claude", "opencode", "antigravity", "local", "copilot") + tuple(custom_map.keys())
     if selected_provider not in valid_providers:
-        return f"Error: unknown provider '{provider}'. Must be 'auto', 'claude', 'opencode', 'antigravity', 'local', or 'god'."
+        return f"Error: unknown provider '{provider}'. Must be 'auto', 'claude', 'opencode', 'antigravity', 'local', 'copilot', or 'god'."
     is_god_mode = selected_mode == "god"
 
     # Permissions come from an explicit request, never from words in a prompt.
@@ -4291,7 +4429,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         chosen_effort = "max"
 
     opencode_bin = find_opencode_binary()
-    binaries = {"claude": find_claude_binary(), "opencode": opencode_bin, "antigravity": find_agy_binary(), "local": opencode_bin}
+    copilot_bin = find_copilot_binary()
+    binaries = {"claude": find_claude_binary(), "opencode": opencode_bin, "antigravity": find_agy_binary(), "local": opencode_bin, "copilot": copilot_bin}
     for cid, cp in custom_map.items():
         binaries[cid] = shutil.which(cp.get("bin", ""))
     route = route_task(prompt, role, private=private, god=is_god_mode)
@@ -4350,6 +4489,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             return "[MEMORY GUARD] No installed local model that can use tools fits in the memory that's free right now."
     elif selected_provider == "opencode":
         target_model = target_model or "default"
+    elif selected_provider == "copilot":
+        target_model = target_model or "auto"
     elif selected_provider in custom_map:
         target_model = target_model or ""
     else:
@@ -4358,7 +4499,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     worker_id = f"worker_{uuid.uuid4().hex[:6]}"
     cmd = _worker_command("opencode" if selected_provider == "local" else selected_provider, binaries[selected_provider] or "",
                           f"ollama/{target_model}" if selected_provider == "local" else target_model, chosen_effort,
-                          is_god_mode, capabilities, permission_mode, prompt, max_budget_usd, thread_id, worker_id)
+                          is_god_mode, capabilities, permission_mode, prompt, max_budget_usd, thread_id, worker_id,
+                          workdir=cwd, isolate=bool(isolate))
     meta = {
         "id": worker_id,
         "role": role,
@@ -4368,7 +4510,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "mode": "god" if is_god_mode else "standard",
         "permission_mode": permission_mode,
         "capabilities": capabilities,
-        "skip_permissions": any(f in cmd for f in ("--dangerously-skip-permissions", "--auto")),
+        "skip_permissions": any(f in cmd for f in ("--dangerously-skip-permissions", "--auto", "--allow-all-tools")),
         "budget": {
             "session_pct": budget_session_pct,
             "weekly_pct": budget_weekly_pct,
@@ -5336,6 +5478,133 @@ def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
                 write(run["response"])
 
 
+def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Callable[[str], None]) -> None:
+    kind = ev.get("type")
+    sess_id = ev.get("sessionId") or ev.get("data", {}).get("interactionId") or ev.get("id")
+    if sess_id and not run.get("conversation"):
+        run["conversation"] = sess_id
+
+    if kind == "assistant.message":
+        content = ev.get("data", {}).get("content") or ""
+        if content:
+            run["response"] = content
+            write(content)
+    elif kind == "result":
+        if ev.get("sessionId"):
+            run["conversation"] = ev["sessionId"]
+        if ev.get("result") and not run.get("response"):
+            run["response"] = ev["result"]
+            write(str(ev["result"]))
+        usage = ev.get("usage") or {}
+        credits_val = usage.get("premiumRequests") if usage.get("premiumRequests") is not None else usage.get("credits")
+        if credits_val is not None:
+            u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
+            u["credits"] = credits_val
+    elif kind == "session.usage_checkpoint":
+        data = ev.get("data") or {}
+        snap = data.get("accountingSnapshot") or {}
+        credits_val = (
+            data.get("totalPremiumRequests")
+            if data.get("totalPremiumRequests") is not None
+            else snap.get("totalPremiumRequestCost")
+            if snap.get("totalPremiumRequestCost") is not None
+            else snap.get("credits")
+        )
+        if credits_val is None and data.get("totalNanoAiu"):
+            credits_val = round(data["totalNanoAiu"] / 1e9, 4)
+
+        td = data.get("tokenDetails") or snap.get("tokenDetails") or {}
+        inp = int((td.get("input") or {}).get("tokenCount", 0))
+        out_tok = int((td.get("output") or {}).get("tokenCount", 0))
+        cache_read = int((td.get("cache_read") or {}).get("tokenCount", 0))
+
+        if not inp and not out_tok:
+            mm = data.get("modelMetrics") or snap.get("modelMetrics") or {}
+            for m_info in mm.values():
+                mu = m_info.get("usage") or {}
+                inp += int(mu.get("inputTokens") or 0)
+                out_tok += int(mu.get("outputTokens") or 0)
+                cache_read += int(mu.get("cacheReadTokens") or 0)
+
+        u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
+        if credits_val is not None:
+            u["credits"] = credits_val
+        u["input"] = inp
+        u["output"] = out_tok
+        u["cache_read"] = cache_read
+
+        step_cost = inp + out_tok
+        new_cost = max(0, step_cost - run.get("seen_tokens", 0))
+        run["seen_tokens"] = max(step_cost, run.get("seen_tokens", 0))
+        run["spent"] = run.get("spent", 0) + new_cost
+        run["last_step"] = step_cost or run.get("last_step", 0)
+        if run.get("cap"):
+            spent = run.get("spent", 0)
+            if "cap_logged" not in run or run["cap_logged"] != spent:
+                run["cap_logged"] = spent
+                write(f"[cap] spent {spent} of {run['cap']}, soft {run.get('soft', 0)}")
+        _check_cap(run)
+    else:
+        if "response" in ev and not run.get("response"):
+            run["response"] = ev["response"]
+            write(str(ev["response"]))
+        if "credits" in ev:
+            u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
+            u["credits"] = ev["credits"]
+        if "usage" in ev and isinstance(ev["usage"], dict):
+            u_dict = ev["usage"]
+            u = run.setdefault("usage", {"credits": 0, "input": 0, "output": 0, "cache_read": 0})
+            if "credits" in u_dict:
+                u["credits"] = u_dict["credits"]
+            for k_src, k_dst in [("input_tokens", "input"), ("input", "input"),
+                                 ("output_tokens", "output"), ("output", "output"),
+                                 ("cache_read_tokens", "cache_read"), ("cache_read", "cache_read")]:
+                if k_src in u_dict:
+                    u[k_dst] = int(u_dict[k_src] or 0)
+            step_cost = u["input"] + u["output"]
+            if step_cost:
+                new_cost = max(0, step_cost - run.get("seen_tokens", 0))
+                run["seen_tokens"] = max(step_cost, run.get("seen_tokens", 0))
+                run["spent"] = run.get("spent", 0) + new_cost
+                run["last_step"] = step_cost or run.get("last_step", 0)
+                if run.get("cap"):
+                    _check_cap(run)
+
+
+def parse_copilot_jsonl(stream: Any) -> Dict[str, Any]:
+    """Parse JSONL output lines from Copilot CLI, returning run state."""
+    run: Dict[str, Any] = {}
+    lines = stream.splitlines() if isinstance(stream, str) else stream
+    for raw in lines:
+        line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        _process_copilot_event(ev, run, lambda text: None)
+    return run
+
+
+def _pump_copilot(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
+    """Read Copilot's JSONL output, track text, tokens, credits and caps."""
+    def write(text: str) -> None:
+        out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
+        out.flush()
+
+    for raw in proc.stdout:  # type: ignore[union-attr]
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            write(line)
+            continue
+        _process_copilot_event(ev, run, write)
+
+
 def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
     """Start a worker's follow-up steps from its own record, so no orchestrator has to be watching."""
     meta = _load_worker(worker_id)
@@ -5514,6 +5783,7 @@ def supervise_worker(worker_id: str) -> int:
     deadline = time.time() + limit if limit else None
     is_agy = meta.get("provider") == "antigravity"
     is_claude = meta.get("provider") == "claude"
+    is_copilot = meta.get("provider") == "copilot"
     is_local = meta.get("provider") == "local"
     is_acp = meta.get("provider") in ("opencode", "local")
     cmd = list(meta["cmd"])
@@ -5611,17 +5881,17 @@ def supervise_worker(worker_id: str) -> int:
                     env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
                 env["SUBWAY_WORKER"] = "1"
                 proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
-                                        stdout=subprocess.PIPE if (is_agy or is_claude or is_acp) else out, stderr=subprocess.STDOUT)
+                                        stdout=subprocess.PIPE if (is_agy or is_claude or is_acp or is_copilot) else out, stderr=subprocess.STDOUT)
                 current["proc"] = proc
                 pump = None
-                if is_agy or is_claude or is_acp:
+                if is_agy or is_claude or is_acp or is_copilot:
                     run["spent"] = max(run.get("spent", 0), sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output")))
                     run["cap"], run["on_cap"] = turn_cap or int(budget.get("max_tokens") or 0), budget_stop
                     run["soft"] = run["cap"] * 2 // 3 if not wrapped_up else 0
                     if is_acp:
                         pump = threading.Thread(target=_pump_opencode, args=(proc, out, run, meta, stopped), daemon=True)
                     else:
-                        target_pump = _pump_agy if is_agy else _pump_claude
+                        target_pump = _pump_agy if is_agy else (_pump_copilot if is_copilot else _pump_claude)
                         pump = threading.Thread(target=target_pump, args=(proc, out, run), daemon=True)
                     pump.start()
                 try:
@@ -5732,7 +6002,7 @@ def supervise_worker(worker_id: str) -> int:
                         result = {"status": "failed", "exit_code": code}
                 elif is_acp and run.get("user_denied") and not run.get("response"):
                     result = {"status": "stopped", "exit_code": 0, "reason": "You denied its request, so it stopped."}
-                elif (is_agy or is_acp) and not run.get("response"):
+                elif (is_agy or is_acp or is_copilot) and not run.get("response"):
                     result = {"status": "failed", "exit_code": 0, "reason": "The agent finished without producing a result."}
                 else:
                     result = {"status": "completed", "exit_code": 0}
@@ -7539,11 +7809,15 @@ def _copilot_raw() -> Optional[Dict[str, Any]]:
 
 def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     raw = _copilot_raw()
+    models = _copilot_models()
+    no_models_note = "Open Copilot Chat in VS Code once to list its models."
     if not raw or not isinstance(raw, dict):
+        base_note = "Doesn't expose usage locally, and Subway can't dispatch workers to it yet."
+        note = f"{base_note} {no_models_note}" if not models else base_note
         return {
             "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
-            "pools": [], "tokens": None, "error": None,
-            "note": "Doesn't expose usage locally, and Subway can't dispatch workers to it yet."
+            "pools": [], "tokens": None, "error": None, "models": models,
+            "note": note
         }
 
     plan = raw.get("copilot_plan") or ""
@@ -7551,7 +7825,7 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     snapshots = raw.get("quota_snapshots") or {}
     name_map = {
         "chat": "Chat",
-        "completions": "Completions",
+        "completions": "Completions (inline editor suggestions Subway shows but never spends)",
         "premium_interactions": "Premium requests"
     }
 
@@ -7582,7 +7856,7 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         "plan": plan, "state": "live", "source": "GitHub Copilot API via gh",
         "fetched_at": time.time(), "latency_ms": None,
         "pools": pools, "tokens": None, "other_sessions": _other_sessions("copilot"),
-        "error": None, "note": ""
+        "error": None, "models": models, "note": no_models_note if not models else ""
     }
 
 _KIMI_TOKEN_DIR = ".kimi-code/credentials"

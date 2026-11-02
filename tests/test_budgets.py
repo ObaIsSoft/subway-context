@@ -1332,6 +1332,8 @@ class TestCopilotBudgets(unittest.TestCase):
     def setUp(self):
         import server
         server._copilot_raw.clear()  # Each test needs its own gh reply, not a cached one.
+        server._copilot_models.clear()
+        server._model_catalog.clear()
 
     def test_copilot_view_mocked_gh(self):
         from unittest.mock import patch, MagicMock
@@ -1373,7 +1375,7 @@ class TestCopilotBudgets(unittest.TestCase):
             self.assertEqual(view["plan"], "individual")
             pool_map = {p["name"]: p for p in view["pools"]}
             self.assertIn("Chat", pool_map)
-            self.assertIn("Completions", pool_map)
+            self.assertIn("Completions (inline editor suggestions Subway shows but never spends)", pool_map)
             self.assertNotIn("Premium requests", pool_map)
 
             chat_win = pool_map["Chat"]["windows"][0]
@@ -1381,7 +1383,7 @@ class TestCopilotBudgets(unittest.TestCase):
             self.assertEqual(chat_win["left_pct"], 75.0)
             self.assertEqual(chat_win["resets_at"], server._parse_ts("2026-12-01"))
 
-            comp_win = pool_map["Completions"]["windows"][0]
+            comp_win = pool_map["Completions (inline editor suggestions Subway shows but never spends)"]["windows"][0]
             self.assertEqual(comp_win["label"], "Monthly")
             self.assertIn("not applied", comp_win.get("note", "").lower())
 
@@ -1394,6 +1396,213 @@ class TestCopilotBudgets(unittest.TestCase):
             self.assertEqual(view["state"], "detected")
             self.assertEqual(view["pools"], [])
             self.assertIn("Doesn't expose usage locally", view["note"])
+
+    def test_copilot_models_usable_filter(self):
+        from unittest.mock import patch
+        import server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_dir = os.path.join(tmp_dir, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws1", "GitHub.copilot-chat", "debug-logs", "run1")
+            os.makedirs(model_dir, exist_ok=True)
+            models_file = os.path.join(model_dir, "models.json")
+            data = [
+                {
+                    "id": "gpt-4o",
+                    "name": "GPT-4o",
+                    "vendor": "Azure OpenAI",
+                    "is_chat_default": False,
+                    "model_picker_price_category": "medium",
+                    "policy": {"state": "enabled"}
+                },
+                {
+                    "id": "claude-3.5-sonnet",
+                    "name": "Claude 3.5 Sonnet",
+                    "vendor": "Anthropic",
+                    "is_chat_default": True,
+                    "model_picker_price_category": "high",
+                    "policy": None
+                },
+                {
+                    "id": "disabled-model",
+                    "name": "Disabled",
+                    "vendor": "VendorX",
+                    "is_chat_default": False,
+                    "model_picker_price_category": "low",
+                    "policy": {"state": "disabled"}
+                },
+                {
+                    "id": "null-policy-not-default",
+                    "name": "Ignored",
+                    "vendor": "VendorY",
+                    "is_chat_default": False,
+                    "policy": None
+                }
+            ]
+            with open(models_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+            def fake_expand(p):
+                if p.startswith("~/"):
+                    return os.path.join(tmp_dir, p[2:])
+                return tmp_dir if p == "~" else p
+
+            with patch("os.path.expanduser", side_effect=fake_expand):
+                server._copilot_models.clear()
+                models = server._copilot_models()
+                self.assertEqual(len(models), 2)
+                m_ids = [m["model"] for m in models]
+                self.assertEqual(m_ids, ["gpt-4o", "claude-3.5-sonnet"])
+                self.assertEqual(models[0], {
+                    "model": "gpt-4o",
+                    "name": "GPT-4o",
+                    "vendor": "Azure OpenAI",
+                    "price_band": "medium",
+                    "default": False
+                })
+                self.assertEqual(models[1], {
+                    "model": "claude-3.5-sonnet",
+                    "name": "Claude 3.5 Sonnet",
+                    "vendor": "Anthropic",
+                    "price_band": "high",
+                    "default": True
+                })
+
+    def test_copilot_models_newest_file_wins(self):
+        from unittest.mock import patch
+        import server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dir_code = os.path.join(tmp_dir, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws1", "GitHub.copilot-chat", "debug-logs", "older")
+            dir_insiders = os.path.join(tmp_dir, "Library", "Application Support", "Code - Insiders", "User", "workspaceStorage", "ws2", "GitHub.copilot-chat", "debug-logs", "newer")
+            os.makedirs(dir_code, exist_ok=True)
+            os.makedirs(dir_insiders, exist_ok=True)
+
+            file_older = os.path.join(dir_code, "models.json")
+            file_newer = os.path.join(dir_insiders, "models.json")
+
+            with open(file_older, "w", encoding="utf-8") as f:
+                json.dump([{"id": "older-model", "name": "Old", "vendor": "V1", "is_chat_default": True}], f)
+            with open(file_newer, "w", encoding="utf-8") as f:
+                json.dump([{"id": "newer-model", "name": "New", "vendor": "V2", "is_chat_default": True}], f)
+
+            os.utime(file_older, (1000.0, 1000.0))
+            os.utime(file_newer, (2000.0, 2000.0))
+
+            def fake_expand(p):
+                if p.startswith("~/"):
+                    return os.path.join(tmp_dir, p[2:])
+                return tmp_dir if p == "~" else p
+
+            with patch("os.path.expanduser", side_effect=fake_expand):
+                server._copilot_models.clear()
+                models = server._copilot_models()
+                self.assertEqual(len(models), 1)
+                self.assertEqual(models[0]["model"], "newer-model")
+
+    def test_copilot_models_missing_file_returns_empty_and_view_has_note(self):
+        from unittest.mock import patch
+        import server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def fake_expand(p):
+                if p.startswith("~/"):
+                    return os.path.join(tmp_dir, p[2:])
+                return tmp_dir if p == "~" else p
+
+            with patch("os.path.expanduser", side_effect=fake_expand):
+                server._copilot_models.clear()
+                models = server._copilot_models()
+                self.assertEqual(models, [])
+
+                view = server._copilot_view({}, refresh=True)
+                self.assertEqual(view["models"], [])
+                self.assertIn("Open Copilot Chat in VS Code once to list its models.", view["note"])
+
+    def test_catalog_includes_copilot_entries(self):
+        from unittest.mock import patch
+        import server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_dir = os.path.join(tmp_dir, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws1", "GitHub.copilot-chat", "debug-logs", "run1")
+            os.makedirs(model_dir, exist_ok=True)
+            models_file = os.path.join(model_dir, "models.json")
+            with open(models_file, "w", encoding="utf-8") as f:
+                json.dump([{
+                    "id": "copilot-gpt-4o",
+                    "name": "GPT-4o",
+                    "vendor": "OpenAI",
+                    "model_picker_price_category": "medium",
+                    "is_chat_default": True,
+                    "policy": {"state": "enabled"}
+                }], f)
+
+            def fake_expand(p):
+                if p.startswith("~/"):
+                    return os.path.join(tmp_dir, p[2:])
+                return tmp_dir if p == "~" else p
+
+            with patch("os.path.expanduser", side_effect=fake_expand):
+                server._copilot_models.clear()
+                server._model_catalog.clear()
+                catalog = server.model_catalog()
+                copilot_entries = [m for m in catalog if m.get("provider") == "copilot"]
+                self.assertTrue(len(copilot_entries) >= 1)
+                entry = next((m for m in copilot_entries if m.get("model") == "copilot-gpt-4o"), None)
+                self.assertIsNotNone(entry)
+                self.assertEqual(entry["coding"], 2)
+                self.assertEqual(entry["reasoning"], 2)
+                self.assertEqual(entry["writing"], 2)
+                self.assertEqual(entry["price_band"], "medium")
+                self.assertTrue(entry["default"])
+
+    def test_copilot_view_carries_models(self):
+        from unittest.mock import patch, MagicMock
+        import server
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_dir = os.path.join(tmp_dir, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws1", "GitHub.copilot-chat", "debug-logs", "run1")
+            os.makedirs(model_dir, exist_ok=True)
+            models_file = os.path.join(model_dir, "models.json")
+            with open(models_file, "w", encoding="utf-8") as f:
+                json.dump([{
+                    "id": "copilot-claude-sonnet",
+                    "name": "Claude 3.5 Sonnet",
+                    "vendor": "Anthropic",
+                    "model_picker_price_category": "high",
+                    "is_chat_default": True,
+                    "policy": {"state": "enabled"}
+                }], f)
+
+            mock_payload = {
+                "copilot_plan": "individual",
+                "quota_reset_date": "2026-12-01",
+                "quota_snapshots": {
+                    "chat": {"percent_remaining": 80.0, "entitlement": 100, "remaining": 80, "unlimited": False}
+                }
+            }
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = json.dumps(mock_payload)
+
+            def fake_expand(p):
+                if p.startswith("~/"):
+                    return os.path.join(tmp_dir, p[2:])
+                return tmp_dir if p == "~" else p
+
+            with patch("os.path.expanduser", side_effect=fake_expand), \
+                 patch("subprocess.run", return_value=mock_proc):
+                server._copilot_models.clear()
+                server._copilot_raw.clear()
+                view = server._copilot_view({}, refresh=True)
+                self.assertEqual(view["state"], "live")
+                self.assertEqual(len(view["models"]), 1)
+                self.assertEqual(view["models"][0]["model"], "copilot-claude-sonnet")
+                self.assertEqual(view["note"], "")
 
 
 class TestKimiBudgets(unittest.TestCase):

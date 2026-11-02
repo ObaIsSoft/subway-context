@@ -614,18 +614,41 @@ export function modelsPage(d) {
   }
   const bmSource = bm.source || "unknown";
 
-  const filters = ["All", "Claude", "Antigravity", "OpenCode", "Local"];
+  const providerNames = {
+    claude: "Claude",
+    antigravity: "Antigravity",
+    opencode: "OpenCode",
+    local: "Local",
+    copilot: "Copilot",
+  };
+  const providerDisplayName = (id) => {
+    const lower = (id || "").toLowerCase();
+    if (providerNames[lower]) return providerNames[lower];
+    if (!id) return "";
+    return id.charAt(0).toUpperCase() + id.slice(1);
+  };
+
+  const seenProviders = new Set();
+  const filters = [{ id: "All", label: "All" }];
+  for (const m of allModels) {
+    const prov = (m.provider || "").toLowerCase();
+    if (prov && !seenProviders.has(prov)) {
+      seenProviders.add(prov);
+      filters.push({ id: prov, label: providerDisplayName(prov) });
+    }
+  }
+
   const segButtons = filters.map((f) => {
     return h("button", {
       type: "button",
-      "aria-pressed": String(modelFilter === f),
+      "aria-pressed": String((modelFilter || "").toLowerCase() === f.id.toLowerCase()),
       on: {
         click: () => {
-          modelFilter = f;
+          modelFilter = f.id;
           document.dispatchEvent(new Event("subway:rerender"));
         },
       },
-    }, f);
+    }, f.label);
   });
 
   const headerCard = h("section", { class: "card", "aria-labelledby": "models-page-title" },
@@ -637,13 +660,8 @@ export function modelsPage(d) {
     h("div", { class: "card-sub" }, "Rankings tell the router how strong each model is for a kind of work. C is coding, R is reasoning, W is writing. Five dots is strongest."));
 
   const filtered = allModels.filter((m) => {
-    const p = (m.provider || "").toLowerCase();
-    if (modelFilter === "All") return true;
-    if (modelFilter === "Claude") return p === "claude";
-    if (modelFilter === "Antigravity") return p === "antigravity";
-    if (modelFilter === "OpenCode") return p === "opencode";
-    if (modelFilter === "Local") return !["claude", "antigravity", "opencode"].includes(p);
-    return true;
+    if (!modelFilter || modelFilter.toLowerCase() === "all") return true;
+    return (m.provider || "").toLowerCase() === modelFilter.toLowerCase();
   });
 
   const groups = {};
