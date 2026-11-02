@@ -270,6 +270,7 @@ class TestLeases(SubwayTestCase):
         self.assertIn("[SIGNOFF: APPROVED]", sign_res)
 
         # Release initial claim
+        server._self_id = lambda: "author-1"
         server.t_release_file(filepath, holder="author-1")
 
         # Coordinator claims approved file
@@ -1556,3 +1557,143 @@ class TestHudCache(unittest.TestCase):
                 raise BrokenPipeError()
         handler.wfile = Broken()
         handler.send_json({"ok": True})  # Must not raise.
+
+
+class TestLedgerIdentity(SubwayTestCase):
+    def test_chat_a_posting_as_chat_b_is_refused(self):
+        server._self_id = lambda: "chat-A"
+        # broadcast_track refused
+        res_broadcast = server.t_broadcast_track("Hello", track="main", station_id="chat-B")
+        self.assertIn("Error", res_broadcast)
+        self.assertIn("cannot broadcast as 'chat-B'", res_broadcast)
+
+        # broadcast_track with session_id refused
+        res_broadcast_sess = server.t_broadcast_track("Hello", track="main", session_id="chat-B")
+        self.assertIn("Error", res_broadcast_sess)
+        self.assertIn("cannot broadcast as 'chat-B'", res_broadcast_sess)
+
+        # send_note refused
+        res_note = server.t_send_note(to="chat-C", text="Hi", from_chat="chat-B")
+        self.assertIn("Error", res_note)
+        self.assertIn("cannot send note as 'chat-B'", res_note)
+
+        # claim_file refused
+        res_claim = server.t_claim_file("test_claim.txt", holder="chat-B")
+        self.assertIn("Error", res_claim)
+        self.assertIn("cannot claim file as 'chat-B'", res_claim)
+
+        # signoff_file refused
+        res_signoff = server.t_signoff_file("test_claim.txt", reviewer="chat-B")
+        self.assertIn("Error", res_signoff)
+        self.assertIn("cannot sign off as 'chat-B'", res_signoff)
+
+        # tag_chat refused
+        res_tag = server.t_tag_chat("test-tag", chat_id="chat-B")
+        self.assertIn("Error", res_tag)
+        self.assertIn("cannot tag chat 'chat-B'", res_tag)
+
+        # join_track refused
+        res_join = server.t_join_track("main", station_id="chat-B")
+        self.assertIn("Error", res_join)
+        self.assertIn("cannot join track as 'chat-B'", res_join)
+
+    def test_chat_a_releasing_b_lock_is_refused(self):
+        filepath = os.path.join(self.test_dir, "locked_by_b.txt")
+        with open(filepath, "w") as f:
+            f.write("content\n")
+
+        # Chat B acquires lock
+        server._self_id = lambda: "chat-B"
+        res_claim = server.t_claim_file(filepath, holder="chat-B")
+        self.assertIn("[LEASE ACQUIRED]", res_claim)
+
+        # Chat A attempts to release it
+        server._self_id = lambda: "chat-A"
+        res_rel = server.t_release_file(filepath)
+        self.assertIn("cannot release another chat's lock", res_rel)
+
+        # Chat A attempting with holder="chat-B"
+        res_rel2 = server.t_release_file(filepath, holder="chat-B")
+        self.assertIn("Error", res_rel2)
+
+        # Chat A attempting with force=True
+        res_rel3 = server.t_release_file(filepath, force=True)
+        self.assertIn("cannot release another chat's lock", res_rel3)
+
+        # Verify lock is still present
+        canon = server._canon_path(filepath)
+        locks = server.load_locks()
+        self.assertIn(canon, locks["locks"])
+        self.assertEqual(locks["locks"][canon]["holder"], "chat-B")
+
+        # Chat B can release its own lock
+        server._self_id = lambda: "chat-B"
+        res_rel_b = server.t_release_file(filepath)
+        self.assertIn("[RELEASED]", res_rel_b)
+        self.assertNotIn(canon, server.load_locks()["locks"])
+
+    def test_undetected_caller_record_marked_unverified(self):
+        # Caller cannot be detected at all
+        with unittest.mock.patch.object(server, "detect_self", return_value=None), \
+             unittest.mock.patch.object(server, "_self_id", return_value=f"host-{os.getpid()}"):
+            res = server.t_broadcast_track("Undetected update", track="unv_track", station_id="mystery-chat")
+            self.assertIn("[unverified]", res)
+
+            # Check read_track
+            read_res = server.t_read_track("unv_track")
+            self.assertIn("[unverified]", read_res)
+            self.assertIn("mystery-chat", read_res)
+
+            # Check HUD text
+            hud_res = server.t_hud_status()
+            self.assertIn("[unverified]", hud_res)
+
+            # Check raw record in tracks/
+            entries = server.read_track_entries("unv_track")
+            self.assertTrue(entries[-1].get("unverified"))
+            self.assertEqual(entries[-1].get("station_id"), "mystery-chat")
+
+            # Check claim file as undetected
+            claim_file = os.path.join(self.test_dir, "unv_file.txt")
+            with open(claim_file, "w") as f:
+                f.write("test\n")
+            c_res = server.t_claim_file(claim_file, holder="ghost")
+            self.assertIn("[unverified]", c_res)
+            canon = server._canon_path(claim_file)
+            self.assertTrue(server.load_locks()["locks"][canon].get("unverified"))
+
+    def test_worker_posting_as_itself_works(self):
+        worker_id = "worker_123456"
+        meta = {
+            "id": worker_id,
+            "role": "tester",
+            "launched_by": "launcher-chat",
+            "track": "main",
+            "status": "running",
+        }
+        server._save_worker(meta)
+
+        # Worker posts as itself
+        server._self_id = lambda: worker_id
+        res = server.t_broadcast_track("I finished testing", track="main", station_id=worker_id)
+        self.assertIn("[BROADCAST]", res)
+        self.assertIn(worker_id, res)
+
+        entries = server.read_track_entries("main")
+        last = entries[-1]
+        self.assertEqual(last["station_id"], worker_id)
+        self.assertEqual(last.get("parent"), "launcher-chat")
+        self.assertFalse(last.get("unverified", False))
+
+        # Launcher posting on behalf of worker also works
+        server._self_id = lambda: "launcher-chat"
+        res2 = server.t_broadcast_track("Report from launcher", track="main", station_id=worker_id)
+        self.assertIn("[BROADCAST]", res2)
+        entries = server.read_track_entries("main")
+        self.assertEqual(entries[-1]["parent"], "launcher-chat")
+
+        # Intruder trying to post as worker fails
+        server._self_id = lambda: "intruder-chat"
+        res_intruder = server.t_broadcast_track("Fake report", track="main", station_id=worker_id)
+        self.assertIn("Error", res_intruder)
+        self.assertIn("cannot broadcast as 'worker_123456'", res_intruder)
