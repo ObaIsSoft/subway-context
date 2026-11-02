@@ -2509,16 +2509,62 @@ def _is_read_only_prompt(prompt: str) -> bool:
     return "read-only" in text or "do not edit any file" in text
 
 
-def _settle_isolated_result(result: Dict[str, Any], prompt: str, wt_note: str, reply: str) -> None:
-    """A read-only run that changes nothing is done, not a failure. Editing runs still need a diff."""
-    if result.get("status") != "completed" or wt_note != "No files changed.":
-        return
+def _worker_expected_to_edit(meta: Dict[str, Any]) -> bool:
+    role = str(meta.get("role") or "").lower()
+    if re.search(r"\b(?:review|reviewer|research|researcher|read[- ]?only)\b", role):
+        return False
+    prompt = str(meta.get("prompt") or "")
     if _is_read_only_prompt(prompt):
-        result["reason"] = (reply or "").strip()
+        return False
+    capabilities = meta.get("capabilities") or []
+    # files:write is the clearest edit signal; god mode also enables unrestricted tools.
+    if ("files:write" not in capabilities and "terminal:full" not in capabilities
+            and meta.get("mode") != "god" and meta.get("permission_mode") != "auto_approve"):
+        return False
+    return bool(re.search(
+        r"\b(?:add|change|create|implement|update|modify|edit|fix|refactor|remove|delete|rename|write|replace|introduce|extend|migrate|convert|build)\b",
+        prompt,
+        re.IGNORECASE,
+    ))
+
+
+def _git_change_fingerprint(project_dir: str) -> Optional[str]:
+    """Fingerprint tracked and untracked git changes relative to the worker's start state."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        cwd=project_dir, capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+
+    digest = hashlib.sha256(status.stdout)
+    for args in (["git", "diff", "--binary", "--"], ["git", "diff", "--cached", "--binary", "--"]):
+        diff = subprocess.run(args, cwd=project_dir, capture_output=True, check=True)
+        digest.update(diff.stdout)
+    for entry in status.stdout.split(b"\0"):
+        if not entry.startswith(b"?? "):
+            continue
+        path = os.path.join(project_dir, os.fsdecode(entry[3:]))
+        if os.path.islink(path):
+            digest.update(os.fsencode(os.readlink(path)))
+        elif os.path.isfile(path):
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _settle_worker_result(result: Dict[str, Any], meta: Dict[str, Any], no_changes: bool, reply: str) -> None:
+    if result.get("status") != "completed" or not no_changes:
         return
-    if "Edit " in prompt or "edit" in prompt:
-        result["status"] = "failed"
-        result["reason"] = "Reported work, but no files changed."
+    summary = (reply or "").strip() or str(result.get("reason") or "").strip()
+    if not _worker_expected_to_edit(meta):
+        result["reason"] = summary
+        return
+    result["status"] = "failed"
+    result["reason"] = f"No changes made. {summary}".strip()
 
 
 def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
@@ -2530,7 +2576,7 @@ def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
     reason = str(result.get("reason") or meta.get("report") or "")
     if status == "budget_stopped" or "budget" in reason.lower():
         return "budget_stopped"
-    if "no files changed" in reason.lower() or reason == "Reported work, but no files changed.":
+    if "no files changed" in reason.lower() or "no changes made" in reason.lower():
         return "no_change"
     if status == "completed" or "patch applied" in reason.lower():
         return "landed"
@@ -5208,6 +5254,15 @@ def _launch_worker(worker_id: str) -> str:
                     _save_worker(meta)
                     return f"Error: couldn't create a worktree: {exc}"
                 meta["isolate"] = False  # Not a git folder, so there's nothing to copy: it works in place.
+        if not meta.get("isolate") and _worker_expected_to_edit(meta):
+            try:
+                git_state = _git_change_fingerprint(meta.get("project_dir") or HOME)
+            except (OSError, subprocess.SubprocessError) as exc:
+                meta["status"] = "pending_approval"
+                _save_worker(meta)
+                return f"Error: couldn't record starting git state: {exc}"
+            if git_state is not None:
+                meta["git_state_before"] = git_state
         _save_worker(meta)
 
     try:
@@ -6332,12 +6387,18 @@ def supervise_worker(worker_id: str) -> int:
                 _save_worker(fresh)
         except (OSError, subprocess.SubprocessError) as exc:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
-    if result.get("status") == "completed" and fresh.get("isolate"):
-        prompt = fresh.get("prompt") or ""
-        _settle_isolated_result(result, prompt, wt_note, str(run.get("response") or ""))
+    no_changes = bool(fresh.get("isolate") and wt_note == "No files changed.")
+    if result.get("status") == "completed" and fresh.get("git_state_before"):
+        try:
+            no_changes = _git_change_fingerprint(fresh.get("project_dir") or HOME) == fresh["git_state_before"]
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["status"] = "failed"
+            result["reason"] = f"Could not verify worker changes: {exc}"
+    if result.get("status") == "completed" and (fresh.get("isolate") or fresh.get("git_state_before")):
+        _settle_worker_result(result, fresh, no_changes, str(run.get("response") or ""))
         if result.get("status") == "completed":
             patch_file = fresh.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
-            if os.path.exists(patch_file):
+            if fresh.get("isolate") and os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
                     verify_worker(worker_id)
     with contextlib.suppress(Exception):
