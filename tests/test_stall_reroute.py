@@ -1,3 +1,6 @@
+import os as _sandbox_os, sys as _sandbox_sys  # Isolate HOME, SUBWAY_DIR and agent folders before server loads.
+_sandbox_sys.path.insert(0, _sandbox_os.path.dirname(_sandbox_os.path.abspath(__file__)))
+import _sandbox  # noqa: E402,F401
 import json
 import os
 import shutil
