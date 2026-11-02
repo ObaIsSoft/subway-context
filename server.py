@@ -23,6 +23,7 @@ Data sources (read-only):
   * Antigravity:  ~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl
                   & conversation_summaries.db
   * OpenCode:     ~/.local/share/opencode/opencode.db
+  * GitHub Copilot: ~/.copilot/session-state/*/events.jsonl and VS Code User chatSessions/*.jsonl
 Writes:
   * ~/.subway-context/ (aliases, checkpoints, note inboxes, leases, tracks, workers, HUD token)
   * ~/.config/opencode/agents/ (generated @alias stubs, marked <!-- subway-auto-stub -->)
@@ -75,6 +76,7 @@ AGY_DIR = os.environ.get("SUBWAY_AGY_DIR", os.path.join(HOME, ".gemini", "antigr
 OPENCODE_DIR = os.environ.get("SUBWAY_OPENCODE_DIR", os.path.join(HOME, ".local", "share", "opencode"))
 OPENCODE_AGENTS_DIR = os.environ.get("SUBWAY_OPENCODE_AGENTS_DIR",
                                      os.path.join(HOME, ".config", "opencode", "agents"))
+COPILOT_DIR = os.environ.get("SUBWAY_COPILOT_DIR", os.path.join(HOME, ".copilot"))
 SUBWAY_DIR = os.environ.get("SUBWAY_DIR", os.path.join(HOME, ".subway-context"))
 LOCKS_FILE = os.path.join(SUBWAY_DIR, "locks.json")
 WORKERS_DIR = os.path.join(SUBWAY_DIR, "workers")
@@ -541,6 +543,8 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
         header.append(f"Transit: {anchor_info}")
     if meta.get("subagent"):
         header.append(f"Subagent Line: Spun by Parent `{meta.get('parent')}`")
+    if meta.get("worker"):
+        header.append("Subway Worker Line: Created by a Subway worker dispatch.")
 
     # Discover any child subagents spun by this session
     cid = meta.get("id")
@@ -573,6 +577,13 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
                 con.close()
         except Exception:
             pass
+    elif meta.get("source") == "copilot":
+        children_lines = [
+            f"- `{w.get('conversation', '')[:8]}`: [Copilot worker] {w.get('role') or 'Worker'} "
+            f"-> `read_chat(chat_id=\"{str(w.get('conversation') or '')[:8]}\", mode=\"decisions\")`"
+            for w in _copilot_worker_index().values()
+            if w.get("launched_by") == cid and w.get("conversation")
+        ][:6]
     elif meta.get("source") == "opencode":
         try:
             con = _opencode_db()
@@ -608,7 +619,7 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
     ])
     if children_lines:
         header.extend([
-            "### Spun Child Subagents (Worker Sessions):",
+            "### Spun Child Subagents / Worker Sessions:",
             *children_lines,
             "",
         ])
@@ -1065,6 +1076,11 @@ def chat_segments_info(chat: Dict[str, Any], segment: Union[str, int] = "all") -
             if not has_markers:
                 segs = [segs[0]] if segs else [[]]
                 note = "compaction not marked in this transcript"
+        elif source == "copilot":
+            segs, has_markers = copilot_read_segments(chat)
+            if not has_markers:
+                segs = [segs[0]] if segs else [[]]
+                note = "compaction not marked in this transcript"
         else:
             segs = [[]]
             note = "compaction history not supported for this provider"
@@ -1359,6 +1375,565 @@ def opencode_read(sid: str) -> List[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
+# Provider 4: GitHub Copilot (CLI and VS Code)
+# --------------------------------------------------------------------------
+
+def _copilot_session_store() -> Dict[str, Dict[str, Any]]:
+    """Read the Copilot CLI session index without opening it for writes."""
+    path = os.path.join(COPILOT_DIR, "session-store.db")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            cols = {row[1] for row in con.execute("pragma table_info(sessions)")}
+            if "id" not in cols:
+                return {}
+            wanted = [c for c in ("id", "cwd", "repository", "branch", "updated_at", "host_type") if c in cols]
+            rows = con.execute(f"select {', '.join(wanted)} from sessions").fetchall()
+            return {str(row[wanted.index("id")]): dict(zip(wanted, row)) for row in rows if row[0]}
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return {}
+
+
+def _copilot_worker_index() -> Dict[str, Dict[str, Any]]:
+    """Map Copilot session ids back to Subway worker records without updating worker state."""
+    result: Dict[str, Dict[str, Any]] = {}
+    paths = glob.glob(os.path.join(WORKERS_DIR, "worker_*.json"))
+    paths.extend(glob.glob(os.path.join(_archive_dir(), "worker_*.json")))
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                worker = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(worker, dict) or worker.get("provider") != "copilot":
+            continue
+        sid = worker.get("conversation") or worker.get("thread")
+        if sid:
+            result[str(sid)] = worker
+    return result
+
+
+def _copilot_open_sessions() -> Set[str]:
+    path = os.path.join(COPILOT_DIR, "open-sessions-state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return {str(sid) for sid, value in state.items()
+                if isinstance(value, dict) and value.get("working")} if isinstance(state, dict) else set()
+    except (OSError, ValueError):
+        return set()
+
+
+def _copilot_current_session() -> str:
+    path = os.path.join(COPILOT_DIR, "open-sessions-state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    active = [(str(value.get("refreshedAt") or value.get("openedAt") or ""), str(sid))
+              for sid, value in state.items() if isinstance(value, dict) and value.get("working")]
+    return max(active)[1] if active else ""
+
+
+def _copilot_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _copilot_usage_checkpoint(data: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = data.get("accountingSnapshot") or {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    details = snapshot.get("tokenDetails") or {}
+    if not isinstance(details, dict):
+        details = {}
+    model_metrics = snapshot.get("modelMetrics") or {}
+    if not isinstance(model_metrics, dict):
+        model_metrics = {}
+    model = snapshot.get("currentModel") or data.get("lastActiveModel") or ""
+    if not model and model_metrics:
+        model = next(reversed(model_metrics), "")
+    input_details = details.get("input") if isinstance(details.get("input"), dict) else {}
+    output_details = details.get("output") if isinstance(details.get("output"), dict) else {}
+    cache_details = details.get("cache_read") if isinstance(details.get("cache_read"), dict) else {}
+    input_tokens = _copilot_int(input_details.get("tokenCount"))
+    output_tokens = _copilot_int(output_details.get("tokenCount"))
+    cache_read = _copilot_int(cache_details.get("tokenCount"))
+    if not input_tokens and not output_tokens and model_metrics:
+        model_info = next(iter(model_metrics.values()), {})
+        metrics = model_info.get("usage") if isinstance(model_info, dict) else {}
+        metrics = metrics if isinstance(metrics, dict) else {}
+        input_tokens = _copilot_int(metrics.get("inputTokens"))
+        output_tokens = _copilot_int(metrics.get("outputTokens"))
+        cache_read = _copilot_int(metrics.get("cacheReadTokens"))
+    return {
+        "input": input_tokens, "output": output_tokens,
+        "cache_read": cache_read, "total": input_tokens + output_tokens,
+        "requests": _copilot_int(data.get("totalPremiumRequests")),
+        "model": model,
+    }
+
+
+def _copilot_session_usage(path: str) -> Optional[Dict[str, Any]]:
+    latest: Optional[Dict[str, Any]] = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "session.usage_checkpoint" not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if event.get("type") != "session.usage_checkpoint":
+                    continue
+                data = event.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
+                latest = _copilot_usage_checkpoint(data)
+    except OSError:
+        return None
+    return latest
+
+
+def _copilot_cli_meta(path: str, index: Dict[str, Dict[str, Any]],
+                      worker_index: Dict[str, Dict[str, Any]],
+                      open_sessions: Set[str]) -> Dict[str, Any]:
+    folder_id = os.path.basename(os.path.dirname(path))
+    sid = folder_id
+    first_prompt = last_prompt = title = model = ""
+    updated: Any = os.path.getmtime(path)
+    project = ""
+    usage: Optional[Dict[str, Any]] = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                typ = event.get("type")
+                data = event.get("data") or {}
+                if not isinstance(data, dict):
+                    data = {}
+                if typ == "session.start":
+                    sid = str(data.get("sessionId") or sid)
+                    model = data.get("selectedModel") or model
+                    context = data.get("context") or {}
+                    if isinstance(context, dict):
+                        project = (context.get("cwd") or context.get("workingDirectory")
+                                   or context.get("workspaceRoot") or project)
+                elif typ == "result":
+                    sid = str(event.get("sessionId") or sid)
+                if typ == "user.message":
+                    prompt = str(data.get("content") or data.get("transformedContent") or "").strip()
+                    if prompt:
+                        first_prompt = first_prompt or prompt
+                        last_prompt = prompt
+                elif typ == "assistant.message":
+                    model = data.get("model") or model
+                elif typ == "session.usage_checkpoint":
+                    usage = _copilot_usage_checkpoint(data)
+                ts = event.get("timestamp")
+                if ts:
+                    updated = ts
+    except OSError:
+        pass
+
+    indexed = index.get(sid) or index.get(folder_id) or {}
+    project = indexed.get("cwd") or project or indexed.get("repository") or ""
+    updated = indexed.get("updated_at") or updated
+    worker = worker_index.get(sid) or worker_index.get(folder_id)
+    if usage and usage.get("model"):
+        model = usage["model"]
+    return {
+        "source": "copilot", "id": sid, "path": path, "format": "copilot-cli",
+        "title": one_line(first_prompt, 80) if first_prompt else "(Copilot CLI session)",
+        "first_prompt": first_prompt, "last_prompt": last_prompt,
+        "project": project or "", "updated": updated, "model": model,
+        "usage": usage, "tokens": usage.get("total") if usage else None,
+        "open": sid in open_sessions or folder_id in open_sessions,
+        "worker": bool(worker), "subagent": bool(worker),
+        "parent": str((worker or {}).get("launched_by") or ""),
+    }
+
+
+def _vscode_user_dirs() -> List[str]:
+    """Return only the VS Code user-data folders used by the supported operating systems."""
+    candidates = [
+        os.path.join(HOME, "Library", "Application Support", "Code", "User"),
+        os.path.join(HOME, ".config", "Code", "User"),
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.insert(1, os.path.join(appdata, "Code", "User"))
+    return list(dict.fromkeys(path for path in candidates if path and os.path.isdir(path)))
+
+
+def _vscode_workspace_project(workspace_dir: str) -> str:
+    path = os.path.join(workspace_dir, "workspace.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    candidates = [data.get("folder"), data.get("workspace")]
+    folders = data.get("folders")
+    if isinstance(folders, list):
+        candidates.extend(x.get("uri") or x.get("path") for x in folders if isinstance(x, dict))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            parsed = urllib.parse.urlparse(candidate)
+            return urllib.parse.unquote(parsed.path) if parsed.scheme == "file" else candidate
+    return ""
+
+
+def _vscode_chat_files() -> List[Tuple[str, str, str]]:
+    """Return (transcript path, project path, surface) for old VS Code chat storage."""
+    found: List[Tuple[str, str, str]] = []
+    for user_dir in _vscode_user_dirs():
+        storage = os.path.join(user_dir, "workspaceStorage")
+        for path in glob.glob(os.path.join(storage, "*", "chatSessions", "*.jsonl")):
+            workspace_dir = os.path.dirname(os.path.dirname(path))
+            found.append((path, _vscode_workspace_project(workspace_dir), "VS Code Chat"))
+        empty_root = os.path.join(user_dir, "globalStorage", "emptyWindowChatSessions")
+        for path in glob.glob(os.path.join(empty_root, "*.jsonl")):
+            found.append((path, "", "VS Code Chat (empty window)"))
+    return found
+
+
+def _vscode_patch_path(path: Any) -> List[Any]:
+    if isinstance(path, list):
+        return path
+    if isinstance(path, str):
+        return [part for part in path.split(".") if part]
+    return []
+
+
+def _vscode_set_path(root: Dict[str, Any], path: List[Any], value: Any) -> None:
+    current: Any = root
+    for index, part in enumerate(path[:-1]):
+        next_part = path[index + 1]
+        if isinstance(current, dict):
+            key = str(part)
+            if key not in current or not isinstance(current[key], (dict, list)):
+                current[key] = [] if str(next_part).isdigit() else {}
+            current = current[key]
+        elif isinstance(current, list):
+            try:
+                position = int(part)
+            except (TypeError, ValueError):
+                return
+            while len(current) <= position:
+                current.append({})
+            current = current[position]
+        else:
+            return
+    if not path:
+        return
+    final = path[-1]
+    if isinstance(current, dict):
+        current[str(final)] = value
+    elif isinstance(current, list):
+        try:
+            position = int(final)
+        except (TypeError, ValueError):
+            return
+        while len(current) <= position:
+            current.append(None)
+        current[position] = value
+
+
+def _vscode_chat_state(path: str) -> Dict[str, Any]:
+    """Replay the VS Code kind-0 snapshot, kind-1 replacement, and kind-2 append records."""
+    state: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                value = record.get("v")
+                if record.get("kind") == 0 and isinstance(value, dict):
+                    state = value
+                elif record.get("kind") == 1:
+                    _vscode_set_path(state, _vscode_patch_path(record.get("k")), value)
+                elif record.get("kind") == 2:
+                    patch_path = _vscode_patch_path(record.get("k"))
+                    if not patch_path:
+                        continue
+                    target: Any = state
+                    for part in patch_path:
+                        if isinstance(target, dict):
+                            target = target.get(str(part))
+                        elif isinstance(target, list):
+                            try:
+                                target = target[int(part)]
+                            except (TypeError, ValueError, IndexError):
+                                target = None
+                        else:
+                            target = None
+                    if isinstance(target, list) and isinstance(value, list):
+                        target.extend(value)
+    except OSError:
+        return {}
+    return state
+
+
+def _vscode_response_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response.strip()
+    parts: List[str] = []
+    for item in response if isinstance(response, list) else []:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            for key in ("value", "text", "markdown", "content"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+                    break
+    return "\n".join(parts).strip()
+
+
+def _vscode_request_model(request: Dict[str, Any]) -> str:
+    model = request.get("modelId") or request.get("model")
+    metadata = request.get("metadata") or {}
+    rounds = metadata.get("toolCallRounds") if isinstance(metadata, dict) else None
+    if not model and isinstance(rounds, list):
+        model = next((r.get("modelId") for r in reversed(rounds)
+                      if isinstance(r, dict) and r.get("modelId")), "")
+    if not model:
+        state = request.get("modelState") or {}
+        model = state.get("value") if isinstance(state, dict) else ""
+    return str(model or "")
+
+
+def _vscode_chat_data(path: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    state = _vscode_chat_state(path)
+    turns: List[Dict[str, Any]] = []
+    requests = state.get("requests") or []
+    if not isinstance(requests, list):
+        return state, turns
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        message = request.get("message") or request.get("prompt") or ""
+        if isinstance(message, dict):
+            message = message.get("text") or message.get("message") or ""
+        ts = request.get("timestamp") or request.get("creationDate") or state.get("creationDate")
+        if isinstance(message, str) and message.strip():
+            turns.append({"role": "user", "text": message.strip(), "ts": ts})
+        response = _vscode_response_text(request.get("response"))
+        if not response:
+            result = request.get("result")
+            response = _vscode_response_text(result.get("response")) if isinstance(result, dict) else ""
+        if response:
+            turns.append({"role": "assistant", "text": response, "ts": ts})
+    return state, turns
+
+
+def _vscode_chat_meta(path: str, project: str, surface: str,
+                      worker_index: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    state, turns = _vscode_chat_data(path)
+    if state.get("responderUsername") not in (None, "", "GitHub Copilot"):
+        return None
+    sid = str(state.get("sessionId") or os.path.basename(path)[:-6])
+    user_turns = [turn["text"] for turn in turns if turn["role"] == "user"]
+    requests = state.get("requests") or []
+    input_tokens = output_tokens = 0
+    models: List[str] = []
+    for request in requests if isinstance(requests, list) else []:
+        if not isinstance(request, dict):
+            continue
+        input_tokens += _copilot_int(request.get("promptTokens"))
+        output_tokens += _copilot_int(request.get("completionTokens"))
+        model = _vscode_request_model(request)
+        if model:
+            models.append(model)
+    usage = {
+        "input": input_tokens, "output": output_tokens, "total": input_tokens + output_tokens,
+        "requests": len(requests) if isinstance(requests, list) else 0,
+        "model": models[-1] if models else "",
+    }
+    worker = worker_index.get(sid)
+    updated = state.get("completedAt") or state.get("creationDate") or os.path.getmtime(path)
+    return {
+        "source": "copilot", "id": sid, "path": path, "format": "vscode-chat",
+        "title": state.get("customTitle") or (one_line(user_turns[0], 80) if user_turns else "(Copilot Chat session)"),
+        "first_prompt": user_turns[0] if user_turns else "",
+        "last_prompt": user_turns[-1] if user_turns else "",
+        "project": project, "updated": updated, "model": usage["model"],
+        "usage": usage, "tokens": usage["total"], "open": False,
+        "worker": bool(worker), "subagent": bool(worker),
+        "parent": str((worker or {}).get("launched_by") or ""), "surface": surface,
+    }
+
+
+def _copilot_agent_host_ids(user_dir: str) -> Set[str]:
+    """Agent Host stores copilotcli session references, not chat transcript bodies."""
+    path = os.path.join(user_dir, "globalStorage", "agent-host.db")
+    if not os.path.isfile(path):
+        return set()
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            ids: Set[str] = set()
+            for row in con.execute("select session_uri from sessions where provider='copilotcli'"):
+                uri = urllib.parse.urlparse(str(row[0] or ""))
+                sid = uri.path.rstrip("/").rsplit("/", 1)[-1] or uri.netloc
+                if sid:
+                    ids.add(sid)
+            return ids
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return set()
+
+
+def copilot_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
+    session_root = os.path.join(COPILOT_DIR, "session-state")
+    index = _copilot_session_store()
+    worker_index = _copilot_worker_index()
+    open_sessions = _copilot_open_sessions()
+    out: List[Dict[str, Any]] = []
+    if os.path.isdir(session_root):
+        for path in glob.glob(os.path.join(session_root, "*", "events.jsonl")):
+            if not os.path.isfile(path):
+                continue
+            try:
+                meta = _copilot_cli_meta(path, index, worker_index, open_sessions)
+            except OSError as e:
+                log("copilot session metadata failed", path, e)
+                continue
+            if meta["subagent"] and not include_subagents:
+                continue
+            out.append(meta)
+
+    agent_host_ids: Set[str] = set()
+    vscode_seen: Set[str] = set()
+    for user_dir in _vscode_user_dirs():
+        agent_host_ids.update(_copilot_agent_host_ids(user_dir))
+    for path, project, surface in _vscode_chat_files():
+        try:
+            meta = _vscode_chat_meta(path, project, surface, worker_index)
+        except OSError as e:
+            log("VS Code Copilot metadata failed", path, e)
+            continue
+        if not meta or meta["id"] in vscode_seen:
+            continue
+        vscode_seen.add(meta["id"])
+        if meta["subagent"] and not include_subagents:
+            continue
+        out.append(meta)
+
+    for meta in out:
+        if meta.get("format") == "copilot-cli" and meta["id"] in agent_host_ids:
+            meta["surface"] = "VS Code Agent Host"
+    return out
+
+
+def copilot_read_segments(chat: Dict[str, Any]) -> Tuple[List[List[Dict[str, Any]]], bool]:
+    if chat.get("format") == "vscode-chat":
+        _state, turns = _vscode_chat_data(chat.get("path", ""))
+        return [turns], False
+
+    path = str(chat.get("path") or "")
+    segs: List[List[Dict[str, Any]]] = [[]]
+    has_markers = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                typ = str(event.get("type") or "").lower()
+                data = event.get("data") or {}
+                if not isinstance(data, dict):
+                    data = {}
+                if re.search(r"(?:compact|compaction|summari[sz]|truncat)", typ):
+                    has_markers = True
+                    summary = data.get("summary") or data.get("content")
+                    if isinstance(summary, str) and summary.strip():
+                        segs[-1].append({"role": "summary", "text": summary.strip(),
+                                         "ts": event.get("timestamp")})
+                    segs.append([])
+                    continue
+                ts = event.get("timestamp")
+                if typ == "user.message":
+                    text = str(data.get("content") or data.get("transformedContent") or "").strip()
+                    if text:
+                        segs[-1].append({"role": "user", "text": text, "ts": ts})
+                elif typ == "assistant.message":
+                    thought = str(data.get("reasoningText") or "").strip()
+                    if thought:
+                        segs[-1].append({"role": "assistant", "text": "", "thought": thought, "ts": ts})
+                    text = str(data.get("content") or "").strip()
+                    if text:
+                        segs[-1].append({"role": "assistant", "text": text, "ts": ts})
+                    for request in data.get("toolRequests") or []:
+                        if isinstance(request, dict):
+                            name = request.get("name") or request.get("toolName") or "tool"
+                            segs[-1].append({"role": "assistant", "text": "", "tool": f"[tool {name}]", "ts": ts})
+                elif typ == "tool.execution_start":
+                    name = data.get("toolTitle") or data.get("toolName") or "tool"
+                    segs[-1].append({"role": "assistant", "text": "", "tool": f"[tool {name}]", "ts": ts})
+                elif typ == "result" and isinstance(event.get("result"), str):
+                    text = event["result"].strip()
+                    if text and not any(turn.get("role") == "assistant" and turn.get("text") == text
+                                        for turn in segs[-1][-3:]):
+                        segs[-1].append({"role": "assistant", "text": text, "ts": ts})
+    except OSError:
+        return [[]], False
+    # Inspected Copilot CLI logs contain no compaction/summarization event; do not infer boundaries.
+    return (segs if segs else [[]]), has_markers
+
+
+def _copilot_tokens_for_session(session_id: str) -> Optional[int]:
+    if not session_id or os.path.basename(session_id) != session_id or "/" in session_id or "\\" in session_id:
+        return None
+    direct = os.path.join(COPILOT_DIR, "session-state", session_id, "events.jsonl")
+    paths = [direct] if os.path.isfile(direct) else []
+    if not paths:
+        paths = glob.glob(os.path.join(COPILOT_DIR, "session-state", "*", "events.jsonl"))
+    for path in paths:
+        if os.path.basename(os.path.dirname(path)) != session_id and path != direct:
+            continue
+        usage = _copilot_session_usage(path)
+        if usage:
+            return int(usage.get("total") or 0)
+    for path, _project, _surface in _vscode_chat_files():
+        try:
+            meta = _vscode_chat_meta(path, _vscode_workspace_project(os.path.dirname(os.path.dirname(path))), _surface, {})
+        except OSError:
+            continue
+        if meta and meta["id"] == session_id:
+            return int(meta.get("tokens") or 0)
+    return None
+
+
+# --------------------------------------------------------------------------
 # Multi-Window Registry & Resolution
 # --------------------------------------------------------------------------
 
@@ -1375,6 +1950,8 @@ def all_chats(source: str = "all", include_subagents: bool = False) -> List[Dict
         chats.extend(agy_list(include_subagents))
     if source in ("all", "opencode"):
         chats.extend(opencode_list(include_subagents))
+    if source in ("all", "copilot"):
+        chats.extend(copilot_list(include_subagents))
     return chats
 
 
@@ -1424,14 +2001,15 @@ def resolve(ident: str, source: str = "all", project: str = "", strict: bool = F
             return hit
     latest_for = {"agy-latest": "antigravity", "gemini-latest": "antigravity", "agy": "antigravity",
                   "gemini": "antigravity", "claude-latest": "claude", "claude": "claude",
-                  "opencode-latest": "opencode", "opencode": "opencode"}
+                  "opencode-latest": "opencode", "opencode": "opencode",
+                  "copilot-latest": "copilot", "copilot": "copilot"}
     if clean_alias in latest_for:
         hit = _newest([c for c in boardable if c.get("source") == latest_for[clean_alias]])
         if hit:
             return hit
 
     # 3. Dynamic Workspace Heads & Topic Slugs (<agent>-<target>)
-    m = re.match(r"^(agy|gemini|claude|opencode)-([a-z0-9_.-]+)$", clean_alias)
+    m = re.match(r"^(agy|gemini|claude|opencode|copilot)-([a-z0-9_.-]+)$", clean_alias)
     if m:
         agent_prefix, rest = m.group(1), m.group(2)
         src = "antigravity" if agent_prefix in ("agy", "gemini") else agent_prefix
@@ -1499,9 +2077,14 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
     forced = os.environ.get("SUBWAY_STATION_ID")
     if forced:
         return {"source": "manual", "id": forced, "tab_name": None, "synthetic": True}
+    worker_id = os.environ.get("SUBWAY_WORKER_ID")
+    if worker_id:
+        return {"source": "worker", "id": worker_id, "tab_name": None, "synthetic": True}
     agy_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
     if agy_conv:
         return {"source": "antigravity", "id": agy_conv, "tab_name": None}
+    if os.environ.get("SUBWAY_NO_NOTIFY"):
+        return None
 
     opens: Dict[int, Dict[str, Any]] = {}
     for p in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
@@ -1537,6 +2120,10 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
                 return {"source": "opencode", "id": f"opencode-{pid}", "tab_name": None, "synthetic": True}
             if name == "agy" or name.startswith("antigravity"):
                 return {"source": "antigravity", "id": f"agy-{pid}", "tab_name": None, "synthetic": True}
+            if name.startswith("copilot"):
+                session_id = _copilot_current_session()
+                return {"source": "copilot", "id": session_id or f"copilot-{pid}",
+                        "tab_name": None, "synthetic": not bool(session_id)}
             pid = ppid
         return None
 
@@ -1558,6 +2145,10 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
             return {"source": "opencode", "id": f"opencode-{pid}", "tab_name": None, "synthetic": True}
         if name == "agy" or name.startswith("antigravity"):
             return {"source": "antigravity", "id": f"agy-{pid}", "tab_name": None, "synthetic": True}
+        if name.startswith("copilot"):
+            session_id = _copilot_current_session()
+            return {"source": "copilot", "id": session_id or f"copilot-{pid}",
+                    "tab_name": None, "synthetic": not bool(session_id)}
         try:
             pid = int(ppid)
         except ValueError:
@@ -1569,7 +2160,17 @@ def detect_self() -> Optional[Dict[str, Any]]:
     """Identify the agent window this server belongs to, across every supported client."""
     global _self_cache
     now = time.time()
-    if now - _self_cache[0] > _SELF_TTL:
+    forced = os.environ.get("SUBWAY_STATION_ID")
+    worker = os.environ.get("SUBWAY_WORKER_ID")
+    if forced and (_self_cache[1] is None or _self_cache[1].get("id") != forced):
+        _self_cache = (now, _detect_self_uncached())
+    elif not forced and _self_cache[1] and _self_cache[1].get("source") == "manual":
+        _self_cache = (now, _detect_self_uncached())
+    elif worker and (_self_cache[1] is None or _self_cache[1].get("id") != worker):
+        _self_cache = (now, _detect_self_uncached())
+    elif not worker and _self_cache[1] and _self_cache[1].get("source") == "worker":
+        _self_cache = (now, _detect_self_uncached())
+    elif now - _self_cache[0] > _SELF_TTL:
         _self_cache = (now, _detect_self_uncached())
     return _self_cache[1]
 
@@ -1580,8 +2181,73 @@ def _self_id() -> str:
     return me["id"] if me else f"host-{os.getpid()}"
 
 
+_orig_self_id = _self_id
+
+
 def _short_id(station: str) -> str:
     return station[:8] if re.match(r"^[0-9a-f]{8}-", station) else station
+
+
+def _detected_chat() -> Optional[Dict[str, Any]]:
+    """Return the detected calling chat, or None if Subway cannot detect the caller at all."""
+    if _self_id is not _orig_self_id:
+        try:
+            sid = _self_id()
+            if sid and not sid.startswith(f"host-{os.getpid()}"):
+                return {"source": "test", "id": sid, "tab_name": None}
+        except Exception:
+            pass
+    me = detect_self()
+    if me:
+        return me
+    try:
+        sid = _self_id()
+        if sid and not sid.startswith(f"host-{os.getpid()}"):
+            return {"source": "test", "id": sid, "tab_name": None}
+    except Exception:
+        pass
+    return None
+
+
+def _id_matches(supplied: Optional[str], target: Optional[str]) -> bool:
+    """Check if a supplied caller/station ID matches the target detected ID."""
+    if not supplied or not target:
+        return False
+    s = str(supplied).strip().lower()
+    t = str(target).strip().lower()
+    if s == t:
+        return True
+    if _short_id(s) == _short_id(t):
+        return True
+    if len(s) >= 8 and len(t) >= 8:
+        if s.startswith(t) or t.startswith(s):
+            return True
+    try:
+        aliases = load_aliases()
+        clean = s.lstrip("@")
+        if clean in aliases:
+            resolved = aliases[clean].lower()
+            if resolved == t or _short_id(resolved) == _short_id(t):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_authorized_worker(worker_id: str, caller_id: str) -> Tuple[bool, Optional[str]]:
+    """Returns (is_authorized, launcher_id) if worker_id is allowed for caller_id."""
+    if not worker_id:
+        return False, None
+    w = _load_worker(worker_id)
+    launcher = w.get("launched_by") if w else None
+    if _id_matches(worker_id, caller_id):
+        return True, launcher
+    if launcher and _id_matches(caller_id, launcher):
+        return True, launcher
+    if re.match(r"^worker_[0-9a-f]{6}$", worker_id):
+        if os.environ.get("SUBWAY_WORKER_ID") == worker_id:
+            return True, launcher
+    return False, None
 
 
 # --------------------------------------------------------------------------
@@ -1600,6 +2266,8 @@ def _get_last_entry_preview(chat: Dict[str, Any]) -> str:
             data = claude_read(chat["path"], "tail", 1)
         elif src == "opencode":
             data = opencode_read(cid)
+        elif src == "copilot":
+            data = copilot_read_segments(chat)[0][0]
         else:
             data = agy_read(cid)
 
@@ -1637,17 +2305,17 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
     chats.sort(key=lambda c: (bool(c.get("open")), sort_key_ts(c.get("updated"))), reverse=True)
     chats = chats[: max(1, int(limit))]
     if not chats:
-        return "No chats found across Antigravity, Claude Code, or OpenCode."
+        return "No chats found across Antigravity, Claude Code, OpenCode, or GitHub Copilot."
     me = detect_self()
-    lines = ["| line (agent) | station id | alias / open tab | project | last active | last exchange / highlight |",
-             "|---|---|---|---|---|---|"]
+    lines = ["| line (agent) | station id | alias / open tab | project | last active | tokens | last exchange / highlight |",
+             "|---|---|---|---|---|---:|---|"]
     for c in chats:
         labels = []
         if c.get("open"):
             labels.append(c.get("tab_name") or "open")
         if c.get("subagent"):
             parent_short = c.get('parent')[:8] if c.get('parent') else '?'
-            labels.append(f"↳ child of `{parent_short}`")
+            labels.append(f"↳ {'worker' if c.get('worker') else 'child'} of `{parent_short}`")
         if c["id"] in id_to_aliases:
             labels.extend(f"@{a}" for a in id_to_aliases[c["id"]])
         else:
@@ -1660,8 +2328,10 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
             labels.append("(current line)")
         label_str = ", ".join(labels)
         highlight = _get_last_entry_preview(c)
+        token_count = c.get("tokens")
+        token_label = f"{int(token_count):,}" if isinstance(token_count, (int, float)) else ""
         lines.append(f"| {c['source']} | `{c['id'][:8]}` | {label_str} | {os.path.basename(c.get('project') or '')} | "
-                     f"{fmt_ts(c.get('updated'))} | {one_line(highlight, 160).replace('|', '/')} |")
+                     f"{fmt_ts(c.get('updated'))} | {token_label} | {one_line(highlight, 160).replace('|', '/')} |")
     lines.append("\nTip: Board any chat by ID, prefix, @pinned-alias, dynamic workspace head (e.g. @agy-dziner), or topic slug (e.g. @agy-subway).")
     try:
         _sync_opencode_agent_stubs()
@@ -1745,10 +2415,17 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
 
 def t_tag_chat(alias: str, chat_id: str = "") -> str:
     """Assign a memorable sticky alias to a chat. If chat_id is omitted, tags the current active session."""
-    target_id = chat_id
-    if not target_id:
-        me = detect_self()
-        target_id = me["id"] if me and not me.get("synthetic") else "latest"
+    det = _detected_chat()
+    if det is not None:
+        det_id = det["id"]
+        if chat_id and not _id_matches(chat_id, det_id):
+            return f"Error: caller is '{det_id}', cannot tag chat '{chat_id}'."
+        target_id = chat_id or (det_id if not det.get("synthetic") else "latest")
+    else:
+        target_id = chat_id
+        if not target_id:
+            me = detect_self()
+            target_id = me["id"] if me and not me.get("synthetic") else "latest"
     c = resolve(target_id)
     save_alias(alias, c["id"])
     return f"Station alias '@{alias.lower().lstrip('@')}' now points to {c['source'].upper()} `{c['id'][:8]}` ({c.get('title')})."
@@ -1834,17 +2511,40 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
 
 
 def t_send_note(to: str, text: str, from_chat: str = "", share_chat: str = "") -> str:
+    det = _detected_chat()
+    parent = None
+    is_unverified = False
+    if det is not None:
+        det_id = det["id"]
+        if from_chat:
+            if not _id_matches(from_chat, det_id):
+                return f"Error: caller is '{det_id}', cannot send note as '{from_chat}'."
+            sender = from_chat
+        else:
+            sender = _short_id(det_id)
+        if not parent:
+            w = _load_worker(det_id)
+            if w and w.get("launched_by"):
+                parent = w.get("launched_by")
+    else:
+        sender = from_chat or _self_id()
+        is_unverified = True
+
     target = resolve(to, strict=True)
     shared = None
     if share_chat:
         shared = resolve(share_chat, strict=True)
-    sender = from_chat or _self_id()
+
     rec = {
         "ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "from": sender, "text": text,
         "shared_chat": ({"id": shared["id"], "source": shared["source"], "title": shared.get("title")}
                         if shared else None),
     }
+    if parent:
+        rec["parent"] = parent
+    if is_unverified:
+        rec["unverified"] = True
     _ensure_subway_dir()
     inbox_path = os.path.join(SUBWAY_DIR, "inbox", f"{target['id']}.jsonl")
     with _state_lock("inbox"):
@@ -1890,7 +2590,8 @@ def t_check_notes(my_chat_id: str = "", keep: bool = False) -> str:
     if corrupt:
         out.append(f"> {corrupt} unreadable line(s) were skipped.")
     for r in recs:
-        out.append(f"\n## From {_short_id(str(r.get('from', '?')))} at {r.get('ts')}\n{r.get('text', '')}")
+        unv_note = " [unverified]" if r.get("unverified") else ""
+        out.append(f"\n## From {_short_id(str(r.get('from', '?')))} at {r.get('ts')}{unv_note}\n{r.get('text', '')}")
         sc = r.get("shared_chat")
         if sc:
             out.append(f"Transit link: {sc['source'].upper()} `{sc['id']}` ({sc.get('title')}). "
@@ -2087,8 +2788,24 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
     if not filepath:
         return "Error: filepath is required."
     path = _canon_path(filepath, project_dir)
-    me_id = _self_id()
-    holder = holder or _short_id(me_id)
+
+    det = _detected_chat()
+    is_unverified = False
+    if det is not None:
+        det_id = det["id"]
+        if holder:
+            if not _id_matches(holder, det_id):
+                return f"Error: caller is '{det_id}', cannot claim file as '{holder}'."
+            else:
+                me_id = det_id
+        else:
+            holder = _short_id(det_id)
+            me_id = det_id
+    else:
+        me_id = _self_id()
+        holder = holder or _short_id(me_id)
+        is_unverified = True
+
     role = (role or "implementer").lower()
 
     try:
@@ -2098,6 +2815,8 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
 
     head = _git_head(path)
     override = ""
+    worker = _load_worker(me_id)
+    parent = worker.get("launched_by") if worker else None
     with _state_lock("locks"):
         now = time.time()
         data = load_locks()
@@ -2138,14 +2857,24 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
             "role": role,
             "status": "LEASED",
         }
+        if parent:
+            locks[path]["parent"] = parent
+        if is_unverified:
+            locks[path]["unverified"] = True
         data["authors"][path] = {"holder": holder, "holder_id": me_id}
+        if parent:
+            data["authors"][path]["parent"] = parent
+        if is_unverified:
+            data["authors"][path]["unverified"] = True
         save_locks(data)
 
     if override:
-        t_broadcast_track(override, track="main", files=[path], station_id=holder)
+        _broadcast_track_internal(override, track="main", files=[path], station_id=holder,
+                                  parent=parent, is_unverified=is_unverified)
     exp_iso = _dt.datetime.fromtimestamp(expires_at).astimezone().strftime("%H:%M:%S")
     base_note = f" (baseline: {baseline})" if baseline else ""
-    return (f"[LEASE ACQUIRED] '{path}' claimed by {holder} (role: {role}){base_note} until {exp_iso} ({duration}s). "
+    unv_note = " [unverified]" if is_unverified else ""
+    return (f"[LEASE ACQUIRED] '{path}' claimed by {holder}{unv_note} (role: {role}){base_note} until {exp_iso} ({duration}s). "
             f"Purpose: {purpose or 'Active modification'}.")
 
 
@@ -2155,16 +2884,34 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
     if not filepath:
         return "Error: filepath is required."
     path = _canon_path(filepath, project_dir)
-    me_id = _self_id()
-    reviewer = reviewer or _short_id(me_id)
+
+    det = _detected_chat()
+    is_unverified = False
+    if det is not None:
+        det_id = det["id"]
+        if reviewer:
+            if not _id_matches(reviewer, det_id):
+                return f"Error: caller is '{det_id}', cannot sign off as '{reviewer}'."
+            else:
+                me_id = det_id
+        else:
+            reviewer = _short_id(det_id)
+            me_id = det_id
+    else:
+        me_id = _self_id()
+        reviewer = reviewer or _short_id(me_id)
+        is_unverified = True
+
     is_approved = verdict.strip().lower() in ("approved", "accept", "pass", "good")
     status_str = "APPROVED" if is_approved else "NEEDS_WORK"
     commit_sha = _git_head(path) or "uncommitted"
+    worker = _load_worker(me_id)
+    parent = worker.get("launched_by") if worker else None
 
     with _state_lock("locks"):
         data = load_locks()
         author = data["authors"].get(path) or data["locks"].get(path) or {}
-        if is_approved and (me_id == author.get("holder_id") or reviewer == author.get("holder")):
+        if is_approved and (_id_matches(me_id, author.get("holder_id")) or _id_matches(reviewer, author.get("holder"))):
             return (f"[SIGNOFF REFUSED] '{path}' was last claimed by {author.get('holder')}. "
                     f"Approval has to come from a different agent than the one that changed the file.")
         data["signoffs"][path] = {
@@ -2176,14 +2923,20 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
             "timestamp": time.time(),
             "time_iso": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if parent:
+            data["signoffs"][path]["parent"] = parent
+        if is_unverified:
+            data["signoffs"][path]["unverified"] = True
         save_locks(data)
 
     final_notes = data["signoffs"][path]["notes"]
-    t_broadcast_track(f"[SIGNOFF: {status_str}] '{path}' evaluated by {reviewer} at commit {commit_sha}. Notes: {final_notes}",
-                      track="main", files=[path], decisions=[f"Sign-off {status_str} by {reviewer}"])
+    _broadcast_track_internal(f"[SIGNOFF: {status_str}] '{path}' evaluated by {reviewer} at commit {commit_sha}. Notes: {final_notes}",
+                              track="main", files=[path], decisions=[f"Sign-off {status_str} by {reviewer}"],
+                              station_id=reviewer, parent=parent, is_unverified=is_unverified)
+    unv_note = " [unverified]" if is_unverified else ""
     if is_approved:
-        return f"[SIGNOFF: APPROVED] '{path}' marked approved by {reviewer} (commit: {commit_sha}). Regression Shield active."
-    return f"[SIGNOFF: NEEDS_WORK] '{path}' flagged for rework by {reviewer}. Notes: {final_notes}"
+        return f"[SIGNOFF: APPROVED] '{path}' marked approved by {reviewer}{unv_note} (commit: {commit_sha}). Regression Shield active."
+    return f"[SIGNOFF: NEEDS_WORK] '{path}' flagged for rework by {reviewer}{unv_note}. Notes: {final_notes}"
 
 
 def t_release_file(filepath: str, holder: str = "", project_dir: str = "", force: bool = False) -> str:
@@ -2191,18 +2944,49 @@ def t_release_file(filepath: str, holder: str = "", project_dir: str = "", force
     if not filepath:
         return "Error: filepath is required."
     path = _canon_path(filepath, project_dir)
-    me_id = _self_id()
-    holder = holder or _short_id(me_id)
     with _state_lock("locks"):
         data = load_locks()
         current = data["locks"].get(path)
         if not current:
             return f"File '{path}' was not currently leased."
-        if not force and current.get("holder") != holder and current.get("holder_id") != me_id:
-            return f"Warning: '{path}' is held by {current.get('holder')}, not {holder}. Lease not released."
+
+        lock_holder = current.get("holder", "")
+        lock_holder_id = current.get("holder_id", "")
+
+        det = _detected_chat()
+        if det is not None:
+            det_id = det["id"]
+            owns_lock = _id_matches(det_id, lock_holder_id) or _id_matches(det_id, lock_holder)
+            worker_id = lock_holder_id if WORKER_ID_RE.match(lock_holder_id or "") else lock_holder
+            worker = _load_worker(worker_id) if WORKER_ID_RE.match(worker_id or "") else None
+            if worker:
+                worker = _update_worker_status(worker)
+            worker_ended = bool(worker and worker.get("status") and
+                                worker.get("status") not in ACTIVE_WORKER_STATES)
+            launcher_cleanup = bool(worker_ended and _id_matches(worker.get("launched_by"), det_id))
+
+            if holder and not _id_matches(holder, det_id):
+                requested_worker = bool(launcher_cleanup and _id_matches(holder, worker_id))
+                if not requested_worker:
+                    return f"Error: caller is '{det_id}', cannot release as '{holder}'."
+            if not owns_lock and launcher_cleanup:
+                owns_lock = True
+
+            if not owns_lock:
+                return f"Error: file '{path}' is held by '{lock_holder}', caller '{det_id}' cannot release another chat's lock."
+            released_for = worker_id if launcher_cleanup and not _id_matches(det_id, worker_id) else ""
+        else:
+            me_id = _self_id()
+            caller_holder = holder or _short_id(me_id)
+            if current.get("holder_id") and not _id_matches(caller_holder, current.get("holder_id")):
+                return f"Error: file '{path}' is held by '{lock_holder}'. Lease not released."
+            if not force and current.get("holder") != caller_holder and current.get("holder_id") != me_id:
+                return f"Warning: '{path}' is held by {current.get('holder')}, not {caller_holder}. Lease not released."
+
         del data["locks"][path]
         save_locks(data)
-    return f"[RELEASED] '{path}' is now free for modification by any agent."
+    release_note = f" released by {det_id} for ended worker {released_for}" if det is not None and released_for else ""
+    return f"[RELEASED] '{path}' is now free for modification by any agent.{release_note}"
 
 
 def t_list_locks() -> str:
@@ -2215,11 +2999,14 @@ def t_list_locks() -> str:
     lines = ["# Active Workspace File Leases (Workspace Guard)", ""]
     for path, info in sorted(locks.items(), key=lambda x: x[1].get("expires_at", 0)):
         rem = max(0, int(info.get("expires_at", 0) - now))
-        lines.append(f"- `[LOCKED] {path}` — held by **{info.get('holder')}** "
+        unv = " [unverified]" if info.get("unverified") else ""
+        lines.append(f"- `[LOCKED] {path}` — held by **{info.get('holder')}**{unv} "
                      f"(role: {info.get('role')}, {rem}s remaining) :: {info.get('purpose')}")
     for path, s in sorted(signoffs.items()):
         drift = " :: file changed since sign-off" if s.get("content_sha") and _file_sha(path) != s["content_sha"] else ""
-        lines.append(f"- `[{s.get('verdict')}] {path}` — by **{s.get('reviewer')}** (commit: {s.get('commit_sha')}){drift}")
+        unv = " [unverified]" if s.get("unverified") else ""
+        lines.append(f"- `[{s.get('verdict')}] {path}` — by **{s.get('reviewer')}**{unv} (commit: {s.get('commit_sha')}){drift}")
+    return "\n".join(lines)
     return "\n".join(lines)
 
 
@@ -2327,7 +3114,17 @@ def _track_file(track: str) -> str:
 def t_join_track(track: str = "main", station_id: str = "") -> str:
     """Subscribe a station to a shared context track and retrieve current track state."""
     clean_track = _clean_track(track)
-    station_id = station_id or _short_id(_self_id())
+    det = _detected_chat()
+    if det is not None:
+        det_id = det["id"]
+        if station_id and not _id_matches(station_id, det_id):
+            is_w, _ = _is_authorized_worker(station_id, det_id)
+            if not is_w:
+                return f"Error: caller is '{det_id}', cannot join track as '{station_id}'."
+        station_id = station_id or _short_id(det_id)
+    else:
+        station_id = station_id or _short_id(_self_id())
+
     sub_file = os.path.join(TRACKS_DIR, f"{clean_track}.subscribers.json")
     _ensure_subway_dir()
     with _state_lock("tracks"):
@@ -2344,16 +3141,16 @@ def t_join_track(track: str = "main", station_id: str = "") -> str:
             f"Active subscribers: {len(subs)}.\n\n{history}")
 
 
-def t_broadcast_track(message: str, track: str = "main", files: Optional[List[str]] = None,
-                      decisions: Optional[List[str]] = None, station_id: str = "",
-                      session_id: str = "") -> str:
-    """Broadcast a decision, commitment, or status update to a shared multi-agent track."""
+def _broadcast_track_internal(message: str, track: str = "main", files: Optional[List[str]] = None,
+                              decisions: Optional[List[str]] = None, station_id: str = "",
+                              session_id: str = "", parent: Optional[str] = None,
+                              is_unverified: bool = False) -> str:
+    """Internal helper to write an entry to a track."""
     if not message:
         return "Error: message is required."
     clean_track = _clean_track(track)
     if clean_track == _ALERTS_TRACK:
         return f"Error: '{_ALERTS_TRACK}' is reserved for the destructive-action audit log."
-    station_id = station_id or _short_id(_self_id())
 
     # A heuristic over what agents report, for the audit log. It can't see commands nobody mentions.
     is_destructive = bool(DESTRUCTIVE_RE.search(message))
@@ -2363,13 +3160,18 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
         "id": uuid.uuid4().hex[:8],
         "timestamp": time.time(),
         "iso": _dt.datetime.now().astimezone().strftime("%H:%M:%S"),
-        "station_id": station_id,
-        "session_id": session_id or station_id,
+        "station_id": station_id or _short_id(_self_id()),
+        "session_id": session_id or station_id or _short_id(_self_id()),
         "message": full_message,
         "is_destructive": is_destructive,
         "files": files or [],
         "decisions": decisions or [],
     }
+    if parent:
+        rec["parent"] = parent
+    if is_unverified:
+        rec["unverified"] = True
+
     with open(_track_file(clean_track), "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
     if is_destructive:
@@ -2378,8 +3180,53 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
                 af.write(json.dumps(rec) + "\n")
 
     file_note = f" (files: {', '.join(files)})" if files else ""
-    sess_note = f" [session:{session_id}]" if session_id and session_id != station_id else ""
-    return f"[BROADCAST] Posted to track '{clean_track}' by `{station_id}`{sess_note}: {full_message}{file_note}"
+    sess_id = rec["session_id"]
+    stat_id = rec["station_id"]
+    sess_note = f" [session:{sess_id}]" if sess_id and sess_id != stat_id else ""
+    parent_note = f" (parent: {parent})" if parent else ""
+    unv_note = " [unverified]" if is_unverified else ""
+    return f"[BROADCAST] Posted to track '{clean_track}' by `{stat_id}`{sess_note}{parent_note}{unv_note}: {full_message}{file_note}"
+
+
+def t_broadcast_track(message: str, track: str = "main", files: Optional[List[str]] = None,
+                      decisions: Optional[List[str]] = None, station_id: str = "",
+                      session_id: str = "") -> str:
+    """Broadcast a decision, commitment, or status update to a shared multi-agent track."""
+    if not message:
+        return "Error: message is required."
+    clean_track = _clean_track(track)
+    if clean_track == _ALERTS_TRACK:
+        return f"Error: '{_ALERTS_TRACK}' is reserved for the destructive-action audit log."
+
+    parent = None
+    is_unverified = False
+
+    det = _detected_chat()
+    if det is not None:
+        det_id = det["id"]
+        if station_id and not _id_matches(station_id, det_id):
+            return f"Error: caller is '{det_id}', cannot broadcast as '{station_id}'."
+        if session_id and not _id_matches(session_id, det_id):
+            return f"Error: caller is '{det_id}', cannot broadcast as '{session_id}'."
+
+        if not station_id:
+            station_id = _short_id(det_id)
+        if not session_id:
+            session_id = det_id
+        if not parent:
+            w = _load_worker(det_id)
+            if w and w.get("launched_by"):
+                parent = w.get("launched_by")
+    else:
+        station_id = station_id or session_id or _short_id(_self_id())
+        session_id = session_id or station_id
+        is_unverified = True
+
+    return _broadcast_track_internal(
+        message=message, track=track, files=files, decisions=decisions,
+        station_id=station_id, session_id=session_id, parent=parent,
+        is_unverified=is_unverified
+    )
 
 
 def read_track_entries(track: str = "main", limit: int = 50, since_timestamp: float = 0.0) -> List[Dict[str, Any]]:
@@ -2414,7 +3261,9 @@ def t_read_track(track: str = "main", limit: int = 15, since_timestamp: float = 
         st = e.get("station_id", "unknown")
         sess = e.get("session_id")
         sess_str = f" [session:{sess}]" if sess and sess != st else ""
-        lines.append(f"- **[{iso}] `{st}`**{sess_str}: {e.get('message', '')}")
+        parent_str = f" (parent: {e.get('parent')})" if e.get("parent") else ""
+        unv_str = " [unverified]" if e.get("unverified") else ""
+        lines.append(f"- **[{iso}] `{st}`**{sess_str}{parent_str}{unv_str}: {e.get('message', '')}")
         fl = e.get("files")
         if fl:
             lines.append(f"  - *Files touched/claimed*: {', '.join(f'`{f}`' for f in fl)}")
@@ -3484,6 +4333,33 @@ def _mark_model_bad(model: str, reason: str = "", reset_time: Optional[float] = 
         _save_json("bad_models.json", bad)
 
 
+def _mark_model_stall_cooldown(model: str, seconds: float = 15 * 60) -> None:
+    if not model:
+        return
+    with _state_lock("stall_cooldowns"):
+        cooldowns = _load_json("stall_cooldowns.json")
+        cooldowns[model] = {"until": time.time() + seconds}
+        _save_json("stall_cooldowns.json", cooldowns)
+
+
+def _clear_model_stall_cooldown(model: str) -> None:
+    if not model:
+        return
+    clean = model.split("/", 1)[1] if "/" in model else model
+    with _state_lock("stall_cooldowns"):
+        cooldowns = _load_json("stall_cooldowns.json")
+        changed = False
+        for key in list(cooldowns):
+            key_clean = key.split("/", 1)[1] if "/" in key else key
+            base_key = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', key_clean)
+            base_model = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', clean)
+            if key == model or key_clean == clean or (base_key and base_key == base_model):
+                cooldowns.pop(key, None)
+                changed = True
+        if changed:
+            _save_json("stall_cooldowns.json", cooldowns)
+
+
 def _match_bad_entry(bad: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
     if not model:
         return None
@@ -3522,6 +4398,14 @@ def _model_is_bad(model: str) -> bool:
                     return True
             except (TypeError, ValueError):
                 pass
+    cooldowns = _load_json("stall_cooldowns.json")
+    cooldown = _match_bad_entry(cooldowns, model)
+    if cooldown:
+        try:
+            if time.time() < float(cooldown.get("until", 0)):
+                return True
+        except (AttributeError, TypeError, ValueError):
+            pass
     with contextlib.suppress(Exception):
         if _is_opencode_model_exhausted(model):
             return True
@@ -3733,7 +4617,7 @@ def _safe_prompt(prompt: str) -> str:
 def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: bool, caps: List[str],
                     permission_mode: str, prompt: str, max_budget_usd: Optional[float],
                     thread_id: str, worker_id: str = "", workdir: str = "",
-                    isolate: bool = False, isolated: bool = False) -> List[str]:
+                    isolate: bool = False, isolated: bool = False, session_id: str = "") -> List[str]:
     """Translate a worker spec into the real flags of each agent CLI."""
     if provider == "antigravity" and effort == "max":
         effort = "high"  # Antigravity models stop at high, and refuse max outright.
@@ -3746,13 +4630,16 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
         wd = workdir or os.getcwd()
         cmd = [bin_path or "copilot", "--model", m, "--add-dir", wd, "--sync-session=off", "--no-ask-user"]
         if max_budget_usd is not None:
-            # Copilot AI credits are cent-denominated; round up so a fractional USD cap is not weakened.
+            # Copilot AI credits are cent-denominated (1 credit = $0.01); round up so a fractional USD cap is not weakened.
             cmd.extend(["--max-ai-credits", str(math.ceil(max_budget_usd * 100))])
         if permission_mode == "ask":
             cmd.append("--acp")
         else:
-            cmd.extend(["-p", text, "--output-format", "json"])
-        if permission_mode == "auto_approve":
+            # --stream on keeps -p output flowing; the session id lets the stall watchdog follow the events file.
+            cmd.extend(["-p", text, "--output-format", "json", "--stream", "on"])
+            if session_id:
+                cmd.extend(["--session-id", session_id])
+        if skip_permissions:
             cmd.append("--allow-all-tools")
         elif safe:
             if "files:write" in caps:
@@ -3842,6 +4729,9 @@ def chat_tokens_used(session_id: Optional[str] = None) -> Optional[int]:
             for ts, inp, out, cache_read in _parse_claude_usage(matches[0]):
                 total += inp + out
             return total
+        copilot_tokens = _copilot_tokens_for_session(session_id)
+        if copilot_tokens is not None:
+            return copilot_tokens
         return None
     ident = detect_self()
     if not ident:
@@ -3858,6 +4748,10 @@ def chat_tokens_used(session_id: Optional[str] = None) -> Optional[int]:
         for ts, inp, out, cache_read in _parse_claude_usage(matches[0]):
             total += inp + out
         return total
+    if source == "copilot":
+        if not cid or ident.get("synthetic"):
+            return None
+        return _copilot_tokens_for_session(str(cid))
     if source in ("antigravity", "gemini", "agy"):
         if not cid or ident.get("synthetic") or cid.startswith("agy-"):
             return None
@@ -4954,8 +5848,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             break
         first_failure = first_failure or budget_msg
     if not ok:
-        t_broadcast_track(f"[BUDGET GUARD HALT] Worker '{role}' ({model or provider}) blocked: {first_failure}",
-                          track=track, station_id="budget-guard")
+        _broadcast_track_internal(f"[BUDGET GUARD HALT] Worker '{role}' ({model or provider}) blocked: {first_failure}",
+                                  track=track, station_id="budget-guard")
         return first_failure
 
     thread_id = ""
@@ -4990,14 +5884,16 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         target_model = target_model or "inherit"
 
     worker_id = f"worker_{uuid.uuid4().hex[:6]}"
+    copilot_session_id = str(uuid.uuid4()) if selected_provider == "copilot" else ""
     cmd = _worker_command("opencode" if selected_provider == "local" else selected_provider, binaries[selected_provider] or "",
                           f"ollama/{target_model}" if selected_provider == "local" else target_model, chosen_effort,
                           is_god_mode, capabilities, permission_mode, prompt, max_budget_usd, thread_id, worker_id,
-                          workdir=cwd, isolate=bool(isolate))
+                          workdir=cwd, isolate=bool(isolate), session_id=copilot_session_id)
     meta = {
         "id": worker_id,
         "role": role,
         "provider": selected_provider,
+        **({"copilot_session_id": copilot_session_id} if copilot_session_id else {}),
         "model": target_model,
         "effort": chosen_effort,
         "mode": "god" if is_god_mode else "standard",
@@ -5067,7 +5963,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
 
     god_warning = ("[WARNING: GOD MODE] This worker runs with permission prompts off and maximum effort.\n"
                    if is_god_mode else "")
-    t_broadcast_track(
+    _broadcast_track_internal(
         f"[PENDING APPROVAL] Worker `{worker_id}` queued ({role}, {selected_provider.upper()} "
         f"model:{target_model} effort:{chosen_effort}). User authorization required.",
         track=track, station_id="guard")
@@ -5150,7 +6046,7 @@ def _fallback_copilot_acp(meta: Dict[str, Any], workdir: str) -> bool:
         str(meta.get("effort") or "auto"), meta.get("mode") == "god",
         list(meta.get("capabilities") or []), "auto_safe", str(meta.get("prompt") or ""),
         budget.get("max_usd"), str(meta.get("thread") or ""), str(meta.get("id") or ""),
-        workdir=workdir, isolate=bool(meta.get("isolate")),
+        workdir=workdir, isolate=bool(meta.get("isolate")), session_id=str(meta.get("copilot_session_id") or ""),
     )
     note = "Copilot ACP unavailable; running with safe-command auto-approval"
     with _state_lock("workers"):
@@ -5569,7 +6465,7 @@ def _launch_worker(worker_id: str) -> str:
     meta.update({"status": "running", "pid": proc.pid, "report": "",
                  "started_at": _dt.datetime.now().astimezone().isoformat()})
     _save_worker(meta)
-    t_broadcast_track(
+    _broadcast_track_internal(
         f"[WORKER APPROVED & LAUNCHED] Worker `{worker_id}` [{meta.get('provider', '').upper()}] "
         f"(PID {proc.pid}) started for role: '{meta.get('role')}'",
         track=meta.get("track", "main"), station_id=worker_id)
@@ -5623,7 +6519,7 @@ _notification_log_lock = threading.Lock()
 
 def _log_notification_failure(mechanism: str, error: Any) -> None:
     """Keep the notification failure log bounded without making alerts fatal."""
-    path = os.path.expanduser("~/.subway-context/notify.log")
+    path = os.path.join(SUBWAY_DIR, "notify.log")  # follows SUBWAY_DIR so tests and sandboxes never touch the real log
     entry = f"{_dt.datetime.now().astimezone().isoformat(timespec='seconds')} [{mechanism}] {error}\n"
     try:
         with _notification_log_lock:
@@ -5798,8 +6694,8 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
                     f.write(json.dumps({"ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                                         "from": meta["id"], "shared_chat": None,
                                         "text": f"Permission needed ({rid}): {tool}: {detail}"}) + "\n")
-    t_broadcast_track(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
-                      track=meta.get("track", "main"), station_id=meta["id"])
+    _broadcast_track_internal(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
+                              track=meta.get("track", "main"), station_id=meta["id"])
     notify_if_still_waiting(f"permission_request|{meta['id']}|{rid}", f"Permission needed ({meta['id']}): {tool}",
                             lambda: rid in {r["id"] for r in _pending_permissions()}, route="workers")
     return rid
@@ -5835,8 +6731,8 @@ def _answer_permission(rid: str, decision: str, answered_by: str) -> str:
             return f"Permission request `{rid}` was already answered ({rec.get('decision')})."
         rec.update({"status": "answered", "decision": decision, "answered_by": answered_by, "answered_at": time.time()})
         _write_json_atomic(_perm_file(rid), rec)
-    t_broadcast_track(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {one_line(rec['detail'], 160)} "
-                      f"(by {answered_by})", track="main", station_id="guard")
+    _broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {one_line(rec['detail'], 160)} "
+                              f"(by {answered_by})", track="main", station_id="guard")
     return f"[{decision.upper()}] `{rid}`: {rec['tool']}: {one_line(rec['detail'], 160)}"
 
 
@@ -6366,8 +7262,8 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
                 _save_worker(parent)
     if is_reviewer and verdict != "none":
         word = "APPROVE" if verdict == "approve" else "REJECT"
-        t_broadcast_track(f"Review of {worker_id} by {reviewer_model}: {word}: {verdict_reason}".rstrip(),
-                          track=meta.get("track", "main"), station_id=worker_id)
+        _broadcast_track_internal(f"Review of {worker_id} by {reviewer_model}: {word}: {verdict_reason}".rstrip(),
+                                  track=meta.get("track", "main"), station_id=worker_id)
     for step in steps:
         when = step.get("when") or "completed"
         if when == "always":
@@ -6453,8 +7349,8 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
             parent = _load_worker(worker_id) or meta
             parent.setdefault("triggered", []).append(child_id)
             _save_worker(parent)
-        t_broadcast_track(f"{worker_id} finished; started {child_id} ({step.get('role')})",
-                          track=meta.get("track", "main"), station_id=worker_id)
+        _broadcast_track_internal(f"{worker_id} finished; started {child_id} ({step.get('role')})",
+                                  track=meta.get("track", "main"), station_id=worker_id)
         with contextlib.suppress(Exception):
             _launch_worker(child_id)
 
@@ -6557,24 +7453,202 @@ def check_quota_error(provider: str, text: str, source: str = "stdout") -> Optio
 
 
 def get_stall_timeout(meta: Dict[str, Any]) -> float:
-    """Configurable stall timeout (default 120s; long thinking models get more)."""
+    """Configurable provider stall timeout (default 300s for Copilot/Antigravity, 120s otherwise)."""
     cfg = _load_json("config.json")
+    default_timeout = 300.0 if meta.get("provider") in ("copilot", "antigravity") else DEFAULT_STALL_TIMEOUT
     val = (
         meta.get("stall_timeout")
         or os.environ.get("SUBWAY_STALL_TIMEOUT")
         or (cfg.get("stall_timeout") if isinstance(cfg, dict) else None)
         or (cfg.get("worker_stall_timeout") if isinstance(cfg, dict) else None)
-        or DEFAULT_STALL_TIMEOUT
+        or default_timeout
     )
     try:
         timeout = float(val)
     except (TypeError, ValueError):
-        timeout = DEFAULT_STALL_TIMEOUT
+        timeout = default_timeout
     model = str(meta.get("model") or "").lower()
     effort = str(meta.get("effort") or "").lower()
     if "thinking" in model or effort in ("high", "max"):
         timeout = max(timeout * 2, timeout + 120.0)
     return timeout
+
+
+def _process_cpu_time(proc: Any) -> Optional[float]:
+    """Return user plus system CPU seconds for a live child process when the OS exposes them."""
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class FileTime(ctypes.Structure):
+                _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(FileTime), ctypes.POINTER(FileTime),
+                ctypes.POINTER(FileTime), ctypes.POINTER(FileTime),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel, user = FileTime(), FileTime()
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            try:
+                ok = kernel32.GetProcessTimes(
+                    handle, ctypes.byref(FileTime()), ctypes.byref(FileTime()),
+                    ctypes.byref(kernel), ctypes.byref(user),
+                )
+                if not ok:
+                    return None
+                ticks = ((kernel.high << 32) | kernel.low) + ((user.high << 32) | user.low)
+                return ticks / 10_000_000
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii") as stat_file:
+            fields = stat_file.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, AttributeError, TypeError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "cputime=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode:
+            return None
+        value = result.stdout.strip()
+        match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", value)
+        if not match:
+            return None
+        days, hours, minutes = (int(part or 0) for part in match.groups()[:3])
+        return days * 86400 + hours * 3600 + minutes * 60 + float(match.group(4))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _file_activity_signature(path: str) -> Tuple[bool, int, int]:
+    try:
+        stat = os.stat(path)
+        return True, stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return False, 0, 0
+
+
+def _worker_folder_activity(meta: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+    """A cheap change fingerprint of the worker's folder: git status plus each changed path's size and mtime."""
+    folder = meta.get("worktree") or meta.get("project_dir")
+    if not folder or not os.path.isdir(folder):
+        return None
+    real = os.path.realpath(folder)
+    if real in (os.path.realpath(HOME), os.path.realpath(os.sep)):
+        return None  # Too big to watch; the other signals decide.
+    try:
+        status = subprocess.run(["git", "status", "--porcelain=1", "-z", "--untracked-files=all"],
+                                cwd=real, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        status = None
+    if status is not None and status.returncode == 0:
+        digest = hashlib.sha256(status.stdout)
+        for entry in status.stdout.split(b"\0"):
+            path = entry[3:].decode("utf-8", "replace") if len(entry) > 3 else ""
+            if path:
+                digest.update(repr(_file_activity_signature(os.path.join(real, path))).encode())
+        return "git", digest.hexdigest()
+    newest_mtime, seen = 0, 0
+    for root, dirs, files in os.walk(real):
+        dirs[:] = [name for name in dirs if name not in (".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__")]
+        for name in files:
+            seen += 1
+            if seen > 5000:
+                return "mtime", newest_mtime
+            try:
+                newest_mtime = max(newest_mtime, os.stat(os.path.join(root, name)).st_mtime_ns)
+            except OSError:
+                continue
+    return "mtime", newest_mtime
+
+
+def _opencode_worker_session_activity(meta: Dict[str, Any], started_at: float) -> Optional[Tuple[str, Any]]:
+    """Return the matching OpenCode session's last update timestamp."""
+    db_path = os.path.join(OPENCODE_DIR, "opencode.db")
+    if not os.path.exists(db_path):
+        return None
+    worker_dir = meta.get("worktree") or meta.get("project_dir") or HOME
+    directory = os.path.abspath(worker_dir)
+    real_directory = os.path.realpath(directory)
+    uri_path = urllib.parse.quote(db_path, safe="/")
+    try:
+        con = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=0.1)
+        try:
+            con.execute("PRAGMA busy_timeout=100")
+            session = con.execute(
+                "select id from session_v2 where directory in (?, ?) and time_created>=? "
+                "order by time_created desc limit 1",
+                (directory, real_directory, int(started_at * 1000)),
+            ).fetchone()
+            updated = con.execute(
+                "select max(time_updated) from session_message where session_id=?",
+                (session[0],),
+            ).fetchone() if session else None
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return None
+    latest = updated[0] if updated else None
+    return (str(session[0]), latest) if session and latest is not None else None
+
+
+def _worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at: float) -> Dict[str, Any]:
+    """Activity readings are advisory: one that fails is skipped, never fatal to the supervisor."""
+    try:
+        return _collect_worker_activity_signals(meta, proc, started_at)
+    except Exception:
+        return {}
+
+
+def _collect_worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at: float) -> Dict[str, Any]:
+    signals: Dict[str, Any] = {}
+    log_path = meta.get("log_file")
+    if log_path:
+        signals["output"] = _file_activity_signature(log_path)
+    if meta.get("provider") == "copilot" and meta.get("copilot_session_id"):
+        events_path = os.path.join(COPILOT_DIR, "session-state", str(meta["copilot_session_id"]), "events.jsonl")
+        signals["copilot_events"] = _file_activity_signature(events_path)
+    if meta.get("provider") == "opencode":
+        activity = _opencode_worker_session_activity(meta, started_at)
+        if activity is not None:
+            signals["opencode"] = activity
+    folder_activity = _worker_folder_activity(meta)
+    if folder_activity is not None:
+        signals["worker_folder"] = folder_activity
+    cpu_time = _process_cpu_time(proc)
+    if cpu_time is not None:
+        signals["cpu"] = cpu_time
+    return signals
+
+
+def _update_worker_activity(
+    previous: Dict[str, Any], last_active: Dict[str, float], current: Dict[str, Any], now: float,
+) -> None:
+    for signal, value in current.items():
+        if signal not in previous or previous[signal] != value:
+            last_active[signal] = now
+    previous.update(current)
+
+
+def _worker_is_stalled(last_active: Dict[str, float], now: float, timeout: float) -> bool:
+    return not last_active or all(now - seen >= timeout for seen in last_active.values())
 
 
 def _poll_opencode_worker_retry(
@@ -6696,7 +7770,7 @@ def _handle_worker_exhaustion_or_stall(
     is_stall: bool = False,
     reset_time: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """On quota/stall: stop worker, mark model exhausted, reroute once or mark failed."""
+    """Stop a quota-limited or stalled worker, then reroute once or mark failed."""
     model = (meta.get("model") or "").strip()
     if not model or model in ("auto", "inherit", "default"):
         model = (meta.get("model_used") or "").strip()
@@ -6709,26 +7783,29 @@ def _handle_worker_exhaustion_or_stall(
     if not model:
         model = meta.get("provider", "")
 
-    # Reset time when known, else a few hours
-    if reset_time is None and reason:
-        m_retry = re.search(r"retry\s+(?:after|in)\s+(\d+)", reason, re.IGNORECASE)
-        if m_retry:
-            reset_time = time.time() + float(m_retry.group(1))
-    if reset_time is None:
-        reset_time = time.time() + 4 * 3600
+    if is_stall:
+        _mark_model_stall_cooldown(model)
+    else:
+        if reset_time is None and reason:
+            m_retry = re.search(r"retry\s+(?:after|in)\s+(\d+)", reason, re.IGNORECASE)
+            if m_retry:
+                reset_time = time.time() + float(m_retry.group(1))
+        if reset_time is None:
+            reset_time = time.time() + 4 * 3600
+        _mark_model_bad(model, reason=reason, reset_time=reset_time)
+        if "/" in model:
+            _mark_model_bad(model.split("/", 1)[1], reason=reason, reset_time=reset_time)
+        if (meta.get("provider") == "opencode"
+                and model.lower().split("/", 1)[-1].endswith("-free")
+                and re.search(r"free\s+usage\s+limit\s+reached", reason, re.IGNORECASE)):
+            for free_model in _opencode_models():
+                clean_model = str(free_model).lower().split("/", 1)[-1]
+                if clean_model.endswith("-free"):
+                    _mark_model_bad(str(free_model), reason=reason, reset_time=reset_time)
+                    if "/" in str(free_model):
+                        _mark_model_bad(str(free_model).split("/", 1)[1], reason=reason, reset_time=reset_time)
 
-    _mark_model_bad(model, reason=reason, reset_time=reset_time)
-    if "/" in model:
-        _mark_model_bad(model.split("/", 1)[1], reason=reason, reset_time=reset_time)
-    if (meta.get("provider") == "opencode"
-            and model.lower().split("/", 1)[-1].endswith("-free")
-            and re.search(r"free\s+usage\s+limit\s+reached", reason, re.IGNORECASE)):
-        for free_model in _opencode_models():
-            clean_model = str(free_model).lower().split("/", 1)[-1]
-            if clean_model.endswith("-free"):
-                _mark_model_bad(str(free_model), reason=reason, reset_time=reset_time)
-                if "/" in str(free_model):
-                    _mark_model_bad(str(free_model).split("/", 1)[1], reason=reason, reset_time=reset_time)
+    condition = "stalled" if is_stall else "exhausted"
 
     launcher = str(meta.get("launched_by") or "")
 
@@ -6742,7 +7819,7 @@ def _handle_worker_exhaustion_or_stall(
 
     # Loop prevention: once per original task (no loops; keep a chain 'rerouted_from')
     if meta.get("rerouted_from"):
-        fail_msg = f"Model '{model}' exhausted/stalled; worker `{worker_id}` was already rerouted from `{meta['rerouted_from']}`, not rerouting again."
+        fail_msg = f"Model '{model}' {condition}; worker `{worker_id}` was already rerouted from `{meta['rerouted_from']}`, not rerouting again."
         return fail_worker(fail_msg)
 
     # Route next model
@@ -6784,7 +7861,7 @@ def _handle_worker_exhaustion_or_stall(
         no_candidate_reason = route.get("reason", "no candidates")
         if private:
             no_candidate_reason = f"Private worker cannot leave the local provider; no alternative local model is available. {no_candidate_reason}"
-        fail_msg = f"Model '{model}' exhausted/stalled and no alternative model available to reroute: {no_candidate_reason}"
+        fail_msg = f"Model '{model}' {condition} and no alternative model available to reroute: {no_candidate_reason}"
         return fail_worker(fail_msg)
 
     # Keep the original request intact and only replace the provider/model choice.
@@ -6840,14 +7917,14 @@ def _handle_worker_exhaustion_or_stall(
                 new_meta["then"] = meta.get("then")
             _save_worker(new_meta)
 
-    ping_text = f"Worker `{worker_id}` model `{model}` exhausted/stalled. Task rerouted to `{next_cand['model']}` (`{new_worker_id}`)."
+    ping_text = f"Worker `{worker_id}` model `{model}` {condition}. Task rerouted to `{next_cand['model']}` (`{new_worker_id}`)."
     _ping_launcher(launcher, ping_text, from_id=worker_id)
     t_broadcast_track(ping_text, track=meta.get("track", "main"), station_id=worker_id)
 
     return {
         "status": "stopped",
         "exit_code": 0,
-        "reason": f"Model '{model}' exhausted/stalled; stopped and rerouted to `{new_worker_id}` ({next_cand['model']}).",
+        "reason": f"Model '{model}' {condition}; stopped and rerouted to `{new_worker_id}` ({next_cand['model']}).",
         "rerouted_to": new_worker_id,
     }
 
@@ -6988,6 +8065,8 @@ def supervise_worker(worker_id: str) -> int:
                 if meta.get("provider") in ("opencode", "local") and is_acp and not meta.get("skip_permissions"):
                     env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
                 env["SUBWAY_WORKER"] = "1"
+                env["SUBWAY_WORKER_ID"] = meta["id"]
+                env["SUBWAY_STATION_ID"] = meta["id"]
                 try:
                     proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -7005,8 +8084,11 @@ def supervise_worker(worker_id: str) -> int:
                 start_time = time.time()
                 next_opencode_check = start_time
                 opencode_retries_seen: Set[Tuple[str, str]] = set()
-                has_output = {"seen": False}
-                run["has_output"] = has_output
+                previous_activity = _worker_activity_signals(meta, proc, worker_started_at)
+                last_activity = {signal: start_time for signal in previous_activity}
+                last_activity["start"] = start_time  # Never refreshes: with no other signal, quiet since start is a stall.
+                signal_interval = min(5.0, max(0.05, stall_timeout / 20))
+                next_signal_check = start_time + signal_interval
 
                 def quota_handler(text: str, source: str) -> None:
                     q_err = check_quota_error(str(meta.get("provider") or ""), text, source=source)
@@ -7030,10 +8112,11 @@ def supervise_worker(worker_id: str) -> int:
                             quota_handler(line, "stderr")
 
                 def stall_watchdog() -> None:
-                    nonlocal next_opencode_check
+                    nonlocal next_opencode_check, previous_activity, next_signal_check
                     while not stall_event.is_set() and not stopped["flag"]:
-                        if is_acp and meta.get("provider") == "opencode" and time.time() >= next_opencode_check:
-                            next_opencode_check = time.time() + 3
+                        now = time.time()
+                        if is_acp and meta.get("provider") == "opencode" and now >= next_opencode_check:
+                            next_opencode_check = now + 3
                             retry = _poll_opencode_worker_retry(meta, worker_started_at, opencode_retries_seen)
                             if retry and retry.get("quota"):
                                 stopped["quota_error"] = f"Quota/usage limit error: {retry['reason']}"
@@ -7047,14 +8130,14 @@ def supervise_worker(worker_id: str) -> int:
                                 if proc.poll() is None:
                                     proc.terminate()
                                 return
-                        if not has_output["seen"]:
-                            log_p = meta.get("log_file")
-                            if log_p and os.path.exists(log_p) and os.path.getsize(log_p) > 0:
-                                has_output["seen"] = True
-                            elif run.get("spent", 0) > 0:
-                                has_output["seen"] = True
-                        if not has_output["seen"] and (time.time() - start_time) >= stall_timeout:
-                            stopped["stall"] = f"No output at all for {int(stall_timeout)}s after start."
+                        if now >= next_signal_check:
+                            # git, ps and the OpenCode DB are too costly to read every half second.
+                            next_signal_check = now + signal_interval
+                            signals = _worker_activity_signals(meta, proc, worker_started_at)
+                            _update_worker_activity(previous_activity, last_activity, signals, now)
+                        if _worker_is_stalled(last_activity, now, stall_timeout):
+                            quiet = ", ".join(sorted(last_activity)) or "no signals"
+                            stopped["stall"] = f"No activity for {int(stall_timeout)}s from any signal ({quiet})."
                             stopped["flag"] = True
                             if is_acp and run.get("conversation") and proc.poll() is None:
                                 with contextlib.suppress(Exception):
@@ -7063,7 +8146,7 @@ def supervise_worker(worker_id: str) -> int:
                             if proc.poll() is None:
                                 proc.terminate()
                             return
-                        stall_event.wait(0.2)
+                        stall_event.wait(min(0.5, max(0.05, stall_timeout / 20)))
 
                 stall_thread = threading.Thread(
                     target=stall_watchdog, name=f"worker-stall-{worker_id}", daemon=True,
@@ -7331,6 +8414,8 @@ def supervise_worker(worker_id: str) -> int:
         _save_worker(fresh)
     with contextlib.suppress(Exception):
         result["response"] = str(run.get("response") or "")
+    if result.get("status") == "completed":
+        _clear_model_stall_cooldown(str(fresh.get("model_used") or fresh.get("model") or ""))
     _write_json_atomic(_exit_file(worker_id), result)
     _update_worker_status(_load_worker(worker_id) or meta)
     with contextlib.suppress(Exception):
@@ -7374,7 +8459,7 @@ def t_spin_batch(role: str, prompt: str, input_glob: str, output_file: str, mode
         "merge_prompt": merge_prompt,
     }
     _save_worker(meta)
-    t_broadcast_track(f"[PENDING APPROVAL] Batch `{worker_id}` queued ({role}, {len(files)} files, model {chosen}).", track=track, station_id="guard")
+    _broadcast_track_internal(f"[PENDING APPROVAL] Batch `{worker_id}` queued ({role}, {len(files)} files, model {chosen}).", track=track, station_id="guard")
     return (f"[APPROVAL REQUIRED] Batch `{worker_id}` is queued in PENDING APPROVAL state.\n"
             f"- Files: {len(files)}\n- Model: **{chosen}** ({msg})\n- Results: `{out_path}`\n\n"
             f"Only your user can launch this. It resumes where it stopped if it's interrupted. They can approve it in the Live HUD, "
@@ -7967,8 +9052,8 @@ def t_stop_worker(worker_id: str, reason: str = "") -> str:
                            capture_output=True, timeout=5)
         else:
             os.kill(int(meta["pid"]), signal.SIGTERM)  # The supervisor forwards it and records the result.
-    t_broadcast_track(f"[WORKER STOPPED] Worker `{worker_id}` stop requested. Reason: {meta['stop_reason']}",
-                      track=meta.get("track", "main"), station_id="guard")
+    _broadcast_track_internal(f"[WORKER STOPPED] Worker `{worker_id}` stop requested. Reason: {meta['stop_reason']}",
+                              track=meta.get("track", "main"), station_id="guard")
     return f"[STOPPING] Worker `{worker_id}` was told to stop."
 
 
@@ -7987,8 +9072,8 @@ def t_reject_worker(worker_id: str, reason: str = "") -> str:
         meta["status"] = "rejected"
         meta["rejection_reason"] = reason or "Cancelled by user"
         _save_worker(meta)
-    t_broadcast_track(f"[WORKER REJECTED] Worker `{worker_id}` rejected. Reason: {meta['rejection_reason']}",
-                      track=meta.get("track", "main"), station_id="guard")
+    _broadcast_track_internal(f"[WORKER REJECTED] Worker `{worker_id}` rejected. Reason: {meta['rejection_reason']}",
+                              track=meta.get("track", "main"), station_id="guard")
     return f"[REJECTED] Worker `{worker_id}` was rejected and cancelled."
 
 
@@ -8212,7 +9297,7 @@ def t_escalate_worker(worker_id: str, new_effort: str = "max", new_mode: str = "
     esc_msg = f"[ESCALATE_COMPLEXITY] Worker `{worker_id}` ({role}) escalated from {prev_effort}/{prev_mode} to {new_effort}/{new_mode}."
     if reason:
         esc_msg += f" Reason: {reason}"
-    t_broadcast_track(esc_msg, track=track, station_id="coordinator")
+    _broadcast_track_internal(esc_msg, track=track, station_id="coordinator")
 
     successor_prompt = (
         f"ESCALATION SUCCESSOR for task '{role}'.\n"
@@ -9312,7 +10397,7 @@ def _agy_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
 
 @ttl_cached(120.0)
 def _copilot_cli_usage(base_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    session_dir = base_dir if base_dir is not None else os.path.expanduser("~/.copilot/session-state")
+    session_dir = base_dir if base_dir is not None else os.path.join(COPILOT_DIR, "session-state")
     if not os.path.isdir(session_dir):
         return None
     now = time.time()
@@ -10182,7 +11267,8 @@ def t_hud_status(project: str = "") -> str:
         lines.append("  (No files locked.)")
     for p, info in locks.items():
         rem = max(0, int(info.get("expires_at", 0) - now))
-        lines.append(f"  [LOCKED] {p} <- {info.get('holder')} ({info.get('role')}, {rem}s left) :: {info.get('purpose', '')}")
+        unv = " [unverified]" if info.get("unverified") else ""
+        lines.append(f"  [LOCKED] {p} <- {info.get('holder')}{unv} ({info.get('role')}, {rem}s left) :: {info.get('purpose', '')}")
 
     lines.extend([subsep, "[AUTONOMOUS WORKER SWARM - ACTIVE]"])
     if not workers:
@@ -10198,8 +11284,11 @@ def t_hud_status(project: str = "") -> str:
         lines.append("  (No active tracks. Join or broadcast with join_track() / broadcast_track().)")
     for tname, tinfo in tracks.items():
         last = tinfo.get("last_entry") or {}
+        st = last.get('station_id', 'none')
+        unv = " [unverified]" if last.get("unverified") else ""
+        parent = f" (parent: {last.get('parent')})" if last.get("parent") else ""
         lines.append(f"  [TRACK] '{tname}': {tinfo.get('count', 0)} events. "
-                     f"Latest from `{last.get('station_id', 'none')}`: {last.get('message', 'No dispatches yet')}")
+                     f"Latest from `{st}`{parent}{unv}: {last.get('message', 'No dispatches yet')}")
 
     probe = _hud_probe(HUD_PORT)
     if probe and probe.get("version") == VERSION:
@@ -10574,6 +11663,29 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(get_hud_data(project=query.get("project", [""])[0]))
             return
 
+        if path in ("/api/chats", "/api/threads"):
+            source = query.get("source", ["all"])[0]
+            include_subagents = query.get("include_subagents", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            try:
+                limit = min(500, max(1, int(query.get("limit", ["200"])[0])))
+            except (TypeError, ValueError):
+                limit = 200
+            aliases: Dict[str, List[str]] = {}
+            for alias, chat_id in load_aliases().items():
+                aliases.setdefault(str(chat_id), []).append(alias)
+            chats = all_chats(source, include_subagents=include_subagents)
+            chats.sort(key=lambda c: (bool(c.get("open")), sort_key_ts(c.get("updated"))), reverse=True)
+            self.send_json({"chats": [{
+                "source": c.get("source"), "id": c.get("id"), "title": c.get("title"),
+                "project": c.get("project"), "updated": c.get("updated"), "open": bool(c.get("open")),
+                "tab_name": c.get("tab_name"), "worker": bool(c.get("worker")),
+                "subagent": bool(c.get("subagent")), "parent": c.get("parent") or "",
+                "surface": c.get("surface") or "", "model": c.get("model") or "",
+                "tokens": c.get("tokens"), "usage": c.get("usage"),
+                "aliases": aliases.get(str(c.get("id")), []),
+            } for c in chats[:limit]], "total": len(chats)})
+            return
+
         if path == "/api/models":
             self.send_json({"models": model_catalog()})
             return
@@ -10667,11 +11779,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/release":
             res = t_release_file(filepath=str(payload.get("filepath", "")), holder="hud-user", force=True)
         elif path == "/api/broadcast":
-            res = t_broadcast_track(
+            res = _broadcast_track_internal(
                 message=str(payload.get("message", "")), track=str(payload.get("track", "main")),
                 files=[str(f) for f in payload.get("files") or []],
                 decisions=[str(d) for d in payload.get("decisions") or []],
-                station_id=str(payload.get("station_id") or "web-hud"), session_id=str(payload.get("session_id", "")))
+                station_id="user (HUD)")
         elif path == "/api/approve_worker":
             res = _launch_worker(str(payload.get("id", "")))  # The HUD token proves this is the user.
         elif path == "/api/reject_worker":
@@ -10821,11 +11933,11 @@ def start_hud_server(port: int = HUD_PORT, daemon: bool = True) -> Optional[http
     return httpd
 
 
-READ_SOURCE = {"type": "string", "enum": ["all", "antigravity", "claude", "opencode"], "default": "all"}
+READ_SOURCE = {"type": "string", "enum": ["all", "antigravity", "claude", "opencode", "copilot"], "default": "all"}
 
 TOOLS = {
     "list_chats": (t_list_chats, {
-        "description": "List all active lines and stations (chats) across Antigravity, Claude Code, and OpenCode. "
+        "description": "List all active lines and stations (chats) across Antigravity, Claude Code, OpenCode, and GitHub Copilot. "
                        "Highlights open tabs and sticky @aliases.",
         "inputSchema": {"type": "object", "properties": {
             "source": READ_SOURCE,
@@ -10858,7 +11970,7 @@ TOOLS = {
         }},
     }),
     "read_chat": (t_read_chat, {
-        "description": "Board and read a chat context from another agent. "
+        "description": "Board and read a chat context from another agent, including GitHub Copilot CLI and VS Code chats. "
                        "chat_id can be UUID, prefix, open tab name, or @alias. "
                        "Modes: 'recent' (last N stops), 'decisions' (comprehensive rulings/files only), 'outline', 'full'. "
                        "since='last' returns what you haven't seen, and continues where a truncated read stopped. "

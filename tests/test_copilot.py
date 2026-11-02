@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import sqlite3
 import shutil
 import tempfile
 import time
@@ -207,6 +208,7 @@ class TestCopilotPermissionFallback(unittest.TestCase):
             run["response"] = "safe-mode result"
 
         with patch.object(server.subprocess, "Popen", side_effect=processes), \
+             patch.object(server, "_worker_activity_signals", return_value={}), \
              patch.object(server, "_pump_copilot", side_effect=safe_result), \
              patch.object(server, "_record_worker_stat"), \
              patch.object(server, "_settle_worker_result"), \
@@ -708,6 +710,166 @@ class TestCopilotIntegration(unittest.TestCase):
             ])
             self.assertEqual(then_steps[0]["provider"], "copilot")
             self.assertEqual(then_steps[0]["model"], "auto")
+
+
+class TestCopilotChatTransit(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.copilot_dir = os.path.join(self.temp_dir, "copilot")
+        self.workers_dir = os.path.join(self.temp_dir, "workers")
+        self.vscode_user = os.path.join(self.temp_dir, "Code", "User")
+        cli_dir = os.path.join(self.copilot_dir, "session-state", "copilot-cli-sample")
+        workspace = os.path.join(self.vscode_user, "workspaceStorage", "workspace-hash")
+        chat_dir = os.path.join(workspace, "chatSessions")
+        os.makedirs(cli_dir)
+        os.makedirs(chat_dir)
+        with open(os.path.join(workspace, "workspace.json"), "w", encoding="utf-8") as f:
+            json.dump({"folder": "file:///workspace/copilot-vscode-project"}, f)
+        fixture_dir = os.path.join(os.path.dirname(__file__), "fixtures")
+        self.events_fixture = os.path.join(fixture_dir, "copilot_chat_events.jsonl")
+        self.vscode_fixture = os.path.join(fixture_dir, "copilot_vscode_chat.jsonl")
+        shutil.copyfile(self.events_fixture, os.path.join(cli_dir, "events.jsonl"))
+        shutil.copyfile(self.vscode_fixture, os.path.join(chat_dir, "copilot-vscode-sample.jsonl"))
+        empty_dir = os.path.join(self.vscode_user, "globalStorage", "emptyWindowChatSessions")
+        os.makedirs(empty_dir)
+        with open(self.vscode_fixture, "r", encoding="utf-8") as f:
+            empty_fixture = f.read().replace("copilot-vscode-sample", "copilot-empty-sample")
+        with open(os.path.join(empty_dir, "copilot-empty-sample.jsonl"), "w", encoding="utf-8") as f:
+            f.write(empty_fixture)
+        self.patches = [
+            patch.object(server, "COPILOT_DIR", self.copilot_dir),
+            patch.object(server, "WORKERS_DIR", self.workers_dir),
+            patch.object(server, "SUBWAY_DIR", os.path.join(self.temp_dir, "subway")),
+            patch.object(server, "_vscode_user_dirs", return_value=[self.vscode_user]),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _chat(self, chat_id="copilot-cli-sample"):
+        return next(c for c in server.copilot_list(include_subagents=True) if c["id"] == chat_id)
+
+    def test_list_read_search_segments_and_token_usage(self):
+        chats = server.copilot_list()
+        by_id = {chat["id"]: chat for chat in chats}
+        self.assertIn("copilot-cli-sample", by_id)
+        self.assertIn("copilot-vscode-sample", by_id)
+        self.assertIn("copilot-empty-sample", by_id)
+        self.assertEqual(by_id["copilot-cli-sample"]["project"], "/workspace/copilot-demo")
+        self.assertEqual(by_id["copilot-vscode-sample"]["project"], "/workspace/copilot-vscode-project")
+        self.assertEqual(by_id["copilot-empty-sample"]["surface"], "VS Code Chat (empty window)")
+        self.assertEqual(by_id["copilot-empty-sample"]["project"], "")
+        self.assertEqual(by_id["copilot-cli-sample"]["tokens"], 54)
+        self.assertEqual(by_id["copilot-vscode-sample"]["tokens"], 37)
+
+        decisions = server.t_read_chat("copilot-cli-sample", source="copilot", mode="decisions")
+        self.assertIn("Keep the transcript adapter read-only", decisions)
+        recent = server.t_read_chat("copilot-vscode-sample", source="copilot", mode="recent")
+        self.assertIn("This is a synthetic Copilot response", recent)
+        self.assertIn("compaction not marked", recent)
+        outline = server.t_read_chat("copilot-cli-sample", source="copilot", mode="outline")
+        full = server.t_read_chat("copilot-cli-sample", source="copilot", mode="full", segment=1)
+        latest_read = server.t_read_chat("copilot-cli-sample", source="copilot", mode="recent", segment="latest")
+        self.assertIn("context compacted", outline.lower())
+        self.assertIn("Review the synthetic parser fixture", full)
+        self.assertIn("second synthetic segment", latest_read.lower())
+        self.assertIn("CLI result event remains readable", latest_read)
+        self.assertEqual(server.chat_tokens_used("copilot-cli-sample"), 54)
+        self.assertEqual(server.chat_tokens_used("copilot-vscode-sample"), 37)
+
+        all_segments = server.chat_segments_info(self._chat())
+        latest = server.chat_segments_info(self._chat(), "latest")
+        self.assertEqual(all_segments[2], 2)
+        self.assertEqual(latest[1:3], ("2", 2))
+        self.assertTrue(any("compaction boundary" in turn["text"] for turn in all_segments[0]
+                            if turn["role"] == "summary"))
+        self.assertIn("Review the synthetic parser fixture.", server.t_search_chat(quote="read-only", source="copilot"))
+
+    def test_subway_worker_sessions_are_hidden_unless_requested(self):
+        worker_id = "copilot-worker-sample"
+        worker_dir = os.path.join(self.copilot_dir, "session-state", worker_id)
+        os.makedirs(worker_dir)
+        with open(self.events_fixture, "r", encoding="utf-8") as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        for event in events:
+            if event.get("type") == "session.start":
+                event["data"]["sessionId"] = worker_id
+            if event.get("type") == "result":
+                event["sessionId"] = worker_id
+        with open(os.path.join(worker_dir, "events.jsonl"), "w", encoding="utf-8") as f:
+            for event in events:
+                f.write(json.dumps(event) + "\n")
+        os.makedirs(self.workers_dir, exist_ok=True)
+        with open(os.path.join(self.workers_dir, "worker_abcdef.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "worker_abcdef", "provider": "copilot", "conversation": worker_id,
+                       "launched_by": "parent-station", "role": "Tester"}, f)
+
+        visible = {chat["id"]: chat for chat in server.copilot_list()}
+        self.assertNotIn(worker_id, visible)
+        workers = {chat["id"]: chat for chat in server.copilot_list(include_subagents=True)}
+        self.assertTrue(workers[worker_id]["worker"])
+        self.assertEqual(workers[worker_id]["parent"], "parent-station")
+
+    def test_agent_host_metadata_marks_cli_session_surface(self):
+        global_storage = os.path.join(self.vscode_user, "globalStorage")
+        os.makedirs(global_storage, exist_ok=True)
+        con = sqlite3.connect(os.path.join(global_storage, "agent-host.db"))
+        con.execute("create table sessions (session_uri text, provider text)")
+        con.execute("insert into sessions values (?, ?)", ("copilotcli://copilot-cli-sample", "copilotcli"))
+        con.commit()
+        con.close()
+
+        chat = next(c for c in server.copilot_list() if c["id"] == "copilot-cli-sample")
+        self.assertEqual(chat["surface"], "VS Code Agent Host")
+
+    def test_session_store_index_enriches_cli_project(self):
+        con = sqlite3.connect(os.path.join(self.copilot_dir, "session-store.db"))
+        con.execute("create table sessions (id text, cwd text, repository text, branch text, updated_at text, host_type text)")
+        con.execute("insert into sessions values (?, ?, ?, ?, ?, ?)",
+                    ("copilot-cli-sample", "/indexed/copilot-project", "", "", "2026-10-03T10:00:00Z", "cli"))
+        con.commit()
+        con.close()
+
+        chat = next(c for c in server.copilot_list() if c["id"] == "copilot-cli-sample")
+        self.assertEqual(chat["project"], "/indexed/copilot-project")
+        self.assertEqual(chat["updated"], "2026-10-03T10:00:00Z")
+
+    def test_alias_resolution_and_threads_api(self):
+        with patch.object(server, "all_chats", return_value=server.copilot_list(include_subagents=True)):
+            tagged = server.t_tag_chat(alias="copilot-main", chat_id="copilot-cli-sample")
+            self.assertIn("@copilot-main", tagged)
+            self.assertEqual(server.resolve("@copilot-main", source="copilot")["id"], "copilot-cli-sample")
+            note = server.t_send_note(to="@copilot-main", text="Synthetic handoff target.")
+            self.assertIn("COPILOT", note)
+        inbox = os.path.join(self.temp_dir, "subway", "inbox", "copilot-cli-sample.jsonl")
+        with open(inbox, "r", encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["text"], "Synthetic handoff target.")
+
+        class Handler(server.SubwayHUDHandler):
+            def __init__(self):
+                self.path = "/api/threads?source=copilot&limit=1"
+
+            def _gate(self, api=True):
+                return True
+
+            def send_json(self, data, status=200):
+                self.sent_data = data
+
+        handler = Handler()
+        handler.do_GET()
+        self.assertEqual(handler.sent_data["total"], 3)
+        self.assertEqual(len(handler.sent_data["chats"]), 1)
+        self.assertEqual(handler.sent_data["chats"][0]["source"], "copilot")
+
+    def test_missing_copilot_and_vscode_folders_are_ignored(self):
+        missing = os.path.join(self.temp_dir, "does-not-exist")
+        with patch.object(server, "COPILOT_DIR", missing), patch.object(server, "_vscode_user_dirs", return_value=[missing]):
+            self.assertEqual(server.copilot_list(), [])
+            self.assertIsNone(server.chat_tokens_used("missing-session"))
 
 
 if __name__ == "__main__":
