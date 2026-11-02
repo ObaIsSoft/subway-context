@@ -44,7 +44,7 @@
     <text x="60" y="10" fill="#f8fafc" font-family="sans-serif" font-size="16" font-weight="700">Dynamic Workspace Heads</text>
     <text x="60" y="26" fill="#94a3b8" font-family="sans-serif" font-size="12">Resolves to the most active session within a specific repository workspace directory.</text>
     <rect x="530" y="-18" width="230" height="36" rx="6" fill="#0f172a" stroke="#475569"/>
-    <text x="645" y="5" fill="#38bdf8" font-family="monospace" font-size="13" font-weight="700" text-anchor="middle">@agy-dziner · @claude-web</text>
+    <text x="645" y="5" fill="#38bdf8" font-family="monospace" font-size="13" font-weight="700" text-anchor="middle">@agy-my-project · @claude-web</text>
   </g>
 
   <!-- Tier 4 -->
