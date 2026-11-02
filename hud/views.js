@@ -364,7 +364,9 @@ function workerTags(w) {
     }
   }
   const u = w.usage;
-  if (u && (u.input || u.output)) tags.push(h("span", { class: "tag num" }, `${tokens(u.input)} in, ${tokens(u.output)} out`));
+  const isEstimate = Boolean(w.estimate || (u && u.estimate));
+  if (u && (u.input || u.output)) tags.push(h("span", { class: "tag num" }, `${tokens(u.input)} in, ${tokens(u.output)} out${isEstimate ? " (estimate)" : ""}`));
+  else if (isEstimate) tags.push(h("span", { class: "tag" }, "estimate"));
   return tags;
 }
 
@@ -1035,7 +1037,7 @@ export function threadsPage(d, chats, onRefresh, error = "") {
         h("b", {}, chat.title || "(untitled)"),
         h("div", { class: "row-sub" }, `${chat.source || ""} · ${chat.project || "No workspace"}${updated ? ` · ${updated}` : ""}`)),
       labels.length ? h("div", { class: "tags" }, labels.map((label) => h("span", { class: "tag" }, label))) : null,
-      permSelect ? h("div", { style: "display: flex; gap: 6px; align-items: center;" }, permSelect, resetBtn) : null);
+      permSelect ? h("div", { class: "thread-perm-actions" }, permSelect, resetBtn) : null);
   });
   return h("section", { class: "card" },
     h("div", { class: "card-head" },

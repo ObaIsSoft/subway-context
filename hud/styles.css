@@ -136,6 +136,7 @@ svg { display: block; }
 .tag.bad { color: var(--red); border-color: var(--red); background: var(--red-soft); }
 .tag.gold { color: var(--gold); border-color: var(--gold-line); background: var(--gold-soft); }
 .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.thread-perm-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
 /* Buttons and forms */
 .btn { min-height: 44px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--raised); color: var(--strong); font-size: 13px; font-weight: 600; cursor: pointer; }

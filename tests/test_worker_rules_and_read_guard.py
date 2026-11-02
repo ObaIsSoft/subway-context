@@ -3,6 +3,7 @@ import os as _sandbox_os, sys as _sandbox_sys  # Isolate HOME, SUBWAY_DIR and ag
 _sandbox_sys.path.insert(0, _sandbox_os.path.dirname(_sandbox_os.path.abspath(__file__)))
 import _sandbox  # noqa: E402,F401
 import contextlib
+import io
 import json
 import re
 import os
@@ -210,6 +211,162 @@ class TestWorkerRulesAndReadGuard(unittest.TestCase):
         self.assertIsNone(server._large_file_read_denial(meta, "read_file", external))
         with mock.patch.object(server, "log"), mock.patch("builtins.open", side_effect=PermissionError("unreadable")):
             self.assertIsNone(server._large_file_read_denial(meta, "read_file", path))
+
+    def test_antigravity_read_guard_ranged_read_allowed(self):
+        path = self._large_file()
+        meta = self._worker_meta(provider="antigravity", mode="auto_approve")
+        step_event = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": "read_file",
+                "tool_info": {
+                    "parameters": {
+                        "Path": path,
+                        "StartLine": 1,
+                        "EndLine": 50,
+                    }
+                }
+            }
+        }
+        proc = mock.MagicMock()
+        proc.stdout = [json.dumps(step_event).encode("utf-8") + b"\n"]
+        out = io.BytesIO()
+        run = {"meta": meta}
+        server._pump_agy(proc, out, run, meta=meta)
+        self.assertNotIn("read_guard_denial", run)
+        proc.terminate.assert_not_called()
+        self.assertNotIn("read_guard_hits", meta)
+        logged = out.getvalue().decode("utf-8")
+        self.assertIn("lines 1-50", logged)
+
+    def test_antigravity_read_guard_small_file_allowed(self):
+        small = os.path.join(self.project, "small.txt")
+        with open(small, "w", encoding="utf-8") as f:
+            f.write("one\ntwo\n")
+        meta = self._worker_meta(provider="antigravity", mode="auto_approve")
+        step_event = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": "read_file",
+                "tool_info": {"parameters": {"Path": small}}
+            }
+        }
+        proc = mock.MagicMock()
+        proc.stdout = [json.dumps(step_event).encode("utf-8") + b"\n"]
+        out = io.BytesIO()
+        run = {"meta": meta}
+        server._pump_agy(proc, out, run, meta=meta)
+        self.assertNotIn("read_guard_denial", run)
+        proc.terminate.assert_not_called()
+        self.assertNotIn("read_guard_hits", meta)
+
+    def test_antigravity_read_guard_file_outside_folder_allowed(self):
+        external = os.path.join(self.tmp, "outside.txt")
+        with open(external, "w", encoding="utf-8") as f:
+            f.write("line\n" * 1501)
+        meta = self._worker_meta(provider="antigravity", mode="auto_approve")
+        step_event = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": "read_file",
+                "tool_info": {"parameters": {"Path": external}}
+            }
+        }
+        proc = mock.MagicMock()
+        proc.stdout = [json.dumps(step_event).encode("utf-8") + b"\n"]
+        out = io.BytesIO()
+        run = {"meta": meta}
+        server._pump_agy(proc, out, run, meta=meta)
+        self.assertNotIn("read_guard_denial", run)
+        proc.terminate.assert_not_called()
+        self.assertNotIn("read_guard_hits", meta)
+
+    def test_antigravity_read_guard_config_allow_allows(self):
+        path = self._large_file()
+        server._save_json("config.json", {"large_file_reads": "allow"})
+        meta = self._worker_meta(provider="antigravity", mode="auto_approve")
+        step_event = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": "read_file",
+                "tool_info": {"parameters": {"Path": path}}
+            }
+        }
+        proc = mock.MagicMock()
+        proc.stdout = [json.dumps(step_event).encode("utf-8") + b"\n"]
+        out = io.BytesIO()
+        run = {"meta": meta}
+        server._pump_agy(proc, out, run, meta=meta)
+        self.assertNotIn("read_guard_denial", run)
+        proc.terminate.assert_not_called()
+        self.assertNotIn("read_guard_hits", meta)
+
+    def test_antigravity_read_guard_whole_read_stopped_resumed_and_counter_increments(self):
+        path = self._large_file()
+        meta = self._worker_meta(provider="antigravity", mode="auto_approve")
+        meta["model"] = "gemini-test"
+        server._save_worker(meta)
+        init_event = {"event": "init", "conversation_id": "conv-test-123"}
+        step_event = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "ACTIVE",
+                "tool_name": "read_file",
+                "tool_info": {"parameters": {"Path": path}}
+            }
+        }
+        proc = mock.MagicMock()
+        proc.stdout = [json.dumps(init_event).encode("utf-8") + b"\n",
+                       json.dumps(step_event).encode("utf-8") + b"\n"]
+        out = io.BytesIO()
+        run = {"meta": meta}
+        server._pump_agy(proc, out, run, meta=meta)
+
+        self.assertIn("read_guard_denial", run)
+        expected_msg = f"{path} has 1501 lines. Grep for what you need, then read a line range."
+        self.assertEqual(run["read_guard_denial"], expected_msg)
+        proc.terminate.assert_called_once()
+        self.assertEqual(meta.get("read_guard_hits"), 1)
+
+        # Worker record on disk
+        reloaded = server._load_worker(meta["id"])
+        self.assertEqual(reloaded.get("read_guard_hits"), 1)
+
+        # Model stats counter
+        stats = server._load_model_stats()
+        self.assertTrue(any(s.get("read_guard_hits") == 1 for s in stats))
+
+        # Check conversation resume
+        cmd = ["agy", "--print", "initial prompt", "--conversation", "conv-test-123"]
+        resumed = server._agy_resume(cmd, run["conversation"], run["read_guard_denial"], [])
+        self.assertEqual(resumed[resumed.index("--print") + 1], expected_msg)
+
+    def test_legacy_copilot_worker_record_marked_estimate(self):
+        legacy = {
+            "id": "worker_legacy",
+            "provider": "copilot",
+            "usage": {"input": 1500, "output": 50, "cache_read": 1200},
+        }
+        normalized = server._normalise_copilot_worker_record(legacy)
+        self.assertTrue(normalized.get("estimate"))
+        self.assertTrue(normalized["usage"].get("estimate"))
+
+        with_cache_write = {
+            "id": "worker_write",
+            "provider": "copilot",
+            "usage": {"input": 1500, "output": 50, "cache_read": 1200, "cache_write": 300},
+        }
+        normalized_write = server._normalise_copilot_worker_record(with_cache_write)
+        self.assertNotIn("estimate", normalized_write)
 
 
 class TestThreadPermissionOverride(unittest.TestCase):

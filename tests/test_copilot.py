@@ -1024,6 +1024,74 @@ class TestCopilotChatTransit(unittest.TestCase):
             self.assertEqual(server.copilot_list(), [])
             self.assertIsNone(server.chat_tokens_used("missing-session"))
 
+    def test_copilot_reader_tool_calls_permissions_subagents_and_summary_text(self):
+        sample_dir = os.path.join(self.copilot_dir, "session-state", "copilot-gaps-sample")
+        os.makedirs(sample_dir)
+        events = [
+            {"type": "session.start", "timestamp": "2026-10-02T10:00:00Z",
+             "data": {"sessionId": "copilot-gaps-sample", "selectedModel": "gpt-synthetic"}},
+            {"type": "user.message", "timestamp": "2026-10-02T10:01:00Z",
+             "data": {"content": "Run the task and fetch api data."}},
+            {"type": "tool.execution_start", "timestamp": "2026-10-02T10:02:00Z",
+             "data": {"toolName": "fetch_api", "toolCallId": "call_123",
+                      "arguments": {"endpoint": "/v1/data", "token": "ghp_1234567890abcdef123456"}}},
+            {"type": "tool.execution_complete", "timestamp": "2026-10-02T10:02:10Z",
+             "data": {"toolCallId": "call_123", "success": True,
+                      "result": "Fetched data safely with password=supersecretpassword"}},
+            {"type": "permission.requested", "timestamp": "2026-10-02T10:03:00Z",
+             "data": {"command": "curl -H 'Authorization: Bearer secrettoken123' https://api.com"}},
+            {"type": "permission.completed", "timestamp": "2026-10-02T10:03:05Z",
+             "data": {"decision": "allow"}},
+            {"type": "subagent.started", "timestamp": "2026-10-02T10:04:00Z",
+             "data": {"subagentId": "sub_1", "role": "Analyzer", "description": "Analyzing payload"}},
+            {"type": "subagent.finish", "timestamp": "2026-10-02T10:04:30Z",
+             "data": {"subagentId": "sub_1", "role": "Analyzer", "status": "completed"}},
+            {"type": "summary_text", "timestamp": "2026-10-02T10:05:00Z",
+             "data": {"text": "summary_text line that is not compaction"}},
+            {"type": "assistant.message", "timestamp": "2026-10-02T10:06:00Z",
+             "data": {"content": "DECISION: We will proceed with the verified payload."}},
+        ]
+        events_path = os.path.join(sample_dir, "events.jsonl")
+        with open(events_path, "w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+
+        chat = {"id": "copilot-gaps-sample", "source": "copilot", "path": events_path}
+
+        # 1. Test copilot_read_segments directly
+        segs_full, has_markers_full = server.copilot_read_segments(dict(chat, mode="full"))
+        # summary_text must not create compaction boundary
+        self.assertFalse(has_markers_full)
+        self.assertEqual(len(segs_full), 1)
+
+        # 2. Test read_chat mode "full"
+        full_output = server.t_read_chat("copilot-gaps-sample", source="copilot", mode="full")
+        # Check tool input and complete result
+        self.assertIn("[tool fetch_api]", full_output)
+        self.assertIn("/v1/data", full_output)
+        self.assertIn("[success]", full_output)
+        # Secrets redacted
+        self.assertNotIn("ghp_1234567890abcdef123456", full_output)
+        self.assertNotIn("supersecretpassword", full_output)
+        self.assertNotIn("secrettoken123", full_output)
+        self.assertIn("[REDACTED]", full_output)
+
+        # Check permissions
+        self.assertIn("[permission requested]", full_output)
+        self.assertIn("[permission completed] allow", full_output)
+
+        # Check subagents
+        self.assertIn("[subagent start]", full_output)
+        self.assertIn("[subagent finish]", full_output)
+        self.assertIn("Analyzer", full_output)
+
+        # 3. Test read_chat mode "decisions"
+        decisions_output = server.t_read_chat("copilot-gaps-sample", source="copilot", mode="decisions")
+        # Mode decisions keeps names only, does not show raw input/result dumps
+        self.assertNotIn("/v1/data", decisions_output)
+        self.assertNotIn("Fetched data safely", decisions_output)
+        self.assertIn("proceed with the verified payload", decisions_output)
+
 
 if __name__ == "__main__":
     unittest.main()

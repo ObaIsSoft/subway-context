@@ -680,7 +680,7 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
     used = 0
     last_i = None
     for i, e in sel:
-        r = render_exchange(i, e, "User", max_chars // 2, include_thoughts, include_tools)
+        r = render_exchange(i, e, "User", max_chars // 2, include_thoughts, include_tools or mode == "full")
         if used + len(r) > max_chars and rendered:
             break
         rendered.append(r)
@@ -1861,14 +1861,55 @@ def copilot_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
     return out
 
 
-def copilot_read_segments(chat: Dict[str, Any]) -> Tuple[List[List[Dict[str, Any]]], bool]:
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b(?:bearer\s+[A-Za-z0-9_\-\.=]+|gh[pousr]_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"
+    r"|(?:token|password|passwd|secret|api_?key|auth)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.\/+=@!#$%^&*]{6,})['\"]?"
+)
+
+
+def _redact_secrets(val: Any) -> str:
+    """Redact tokens, passwords, and API keys from display text."""
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, (dict, list)):
+                val = parsed
+        except Exception:
+            pass
+    if isinstance(val, dict):
+        clean = {}
+        for k, v in val.items():
+            if re.search(r"(?i)token|key|secret|password|passwd|auth", str(k)):
+                clean[k] = "[REDACTED]"
+            elif isinstance(v, (dict, list)):
+                clean[k] = json.loads(_redact_secrets(v))
+            else:
+                clean[k] = _SECRET_PATTERN.sub("[REDACTED]", str(v))
+        return json.dumps(clean, ensure_ascii=False)
+    if isinstance(val, list):
+        clean_list = []
+        for x in val:
+            if isinstance(x, (dict, list)):
+                clean_list.append(json.loads(_redact_secrets(x)))
+            else:
+                clean_list.append(_SECRET_PATTERN.sub("[REDACTED]", str(x)))
+        return json.dumps(clean_list, ensure_ascii=False)
+    s = str(val if val is not None else "")
+    return _SECRET_PATTERN.sub("[REDACTED]", s)
+
+
+def copilot_read_segments(chat: Dict[str, Any], mode: str = "full") -> Tuple[List[List[Dict[str, Any]]], bool]:
     if chat.get("format") == "vscode-chat":
         _state, turns = _vscode_chat_data(chat.get("path", ""))
         return [turns], False
 
+    mode = str(chat.get("mode") or mode or "full").lower()
     path = str(chat.get("path") or "")
     segs: List[List[Dict[str, Any]]] = [[]]
     has_markers = False
+    pending_tools: Dict[str, Dict[str, Any]] = {}
+    pending_list: List[Dict[str, Any]] = []
+
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -1882,6 +1923,11 @@ def copilot_read_segments(chat: Dict[str, Any]) -> Tuple[List[List[Dict[str, Any
                 data = event.get("data") or {}
                 if not isinstance(data, dict):
                     data = {}
+
+                # summary_text is left alone; it is not yet known whether it marks compaction.
+                if typ == "summary_text":
+                    continue
+
                 if re.search(r"(?:compact|compaction|summari[sz]|truncat)", typ):
                     has_markers = True
                     summary = data.get("summary") or data.get("content")
@@ -1890,6 +1936,7 @@ def copilot_read_segments(chat: Dict[str, Any]) -> Tuple[List[List[Dict[str, Any
                                          "ts": event.get("timestamp")})
                     segs.append([])
                     continue
+
                 ts = event.get("timestamp")
                 if typ == "user.message":
                     text = str(data.get("content") or data.get("transformedContent") or "").strip()
@@ -1904,11 +1951,108 @@ def copilot_read_segments(chat: Dict[str, Any]) -> Tuple[List[List[Dict[str, Any
                         segs[-1].append({"role": "assistant", "text": text, "ts": ts})
                     for request in data.get("toolRequests") or []:
                         if isinstance(request, dict):
+                            call_id = str(request.get("toolCallId") or request.get("callId") or request.get("id") or "")
                             name = request.get("name") or request.get("toolName") or "tool"
-                            segs[-1].append({"role": "assistant", "text": "", "tool": f"[tool {name}]", "ts": ts})
+                            args = request.get("arguments") or request.get("input") or request.get("parameters") or ""
+                            if mode == "decisions":
+                                segs[-1].append({"role": "assistant", "text": "", "tool": f"[tool {name}]", "ts": ts})
+                            else:
+                                if isinstance(args, (dict, list)):
+                                    args_str = json.dumps(args, ensure_ascii=False)
+                                else:
+                                    args_str = str(args) if args else ""
+                                red_input = one_line(_redact_secrets(args_str), 300)
+                                inp_line = f" input: {red_input}" if red_input else ""
+                                turn = {"role": "assistant", "text": f"[tool {name}]{inp_line}", "tool": f"[tool {name}]", "ts": ts}
+                                segs[-1].append(turn)
+                                if call_id:
+                                    pending_tools[call_id] = turn
+                                else:
+                                    pending_list.append(turn)
                 elif typ == "tool.execution_start":
+                    call_id = str(data.get("toolCallId") or data.get("callId") or data.get("id") or "")
                     name = data.get("toolTitle") or data.get("toolName") or "tool"
-                    segs[-1].append({"role": "assistant", "text": "", "tool": f"[tool {name}]", "ts": ts})
+                    args = data.get("arguments") or data.get("input") or data.get("parameters") or ""
+                    if call_id and call_id in pending_tools:
+                        continue
+                    if mode == "decisions":
+                        segs[-1].append({"role": "assistant", "text": "", "tool": f"[tool {name}]", "ts": ts})
+                    else:
+                        if isinstance(args, (dict, list)):
+                            args_str = json.dumps(args, ensure_ascii=False)
+                        else:
+                            args_str = str(args) if args else ""
+                        red_input = one_line(_redact_secrets(args_str), 300)
+                        inp_line = f" input: {red_input}" if red_input else ""
+                        turn = {"role": "assistant", "text": f"[tool {name}]{inp_line}", "tool": f"[tool {name}]", "ts": ts}
+                        segs[-1].append(turn)
+                        if call_id:
+                            pending_tools[call_id] = turn
+                        else:
+                            pending_list.append(turn)
+                elif typ == "tool.execution_complete":
+                    call_id = str(data.get("toolCallId") or data.get("callId") or data.get("id") or "")
+                    t_name = data.get("toolTitle") or data.get("toolName") or "tool"
+                    success = data.get("success")
+                    status = "failure" if (success is False or data.get("error") or str(data.get("status", "")).lower() in ("failed", "failure", "error")) else "success"
+                    res = data.get("result") if data.get("result") is not None else (
+                        data.get("output") if data.get("output") is not None else (
+                            data.get("content") if data.get("content") is not None else (data.get("error") or "")
+                        )
+                    )
+                    if isinstance(res, (dict, list)):
+                        res_str = json.dumps(res, ensure_ascii=False)
+                    else:
+                        res_str = str(res) if res is not None else ""
+                    red_res = one_line(_redact_secrets(res_str), 300)
+                    res_line = f"[{status}] {red_res}" if red_res else f"[{status}]"
+                    if mode != "decisions":
+                        matched_turn = None
+                        if call_id and call_id in pending_tools:
+                            matched_turn = pending_tools.pop(call_id)
+                        elif pending_list:
+                            matched_turn = pending_list.pop(0)
+                        if matched_turn is not None:
+                            matched_turn["text"] = f"{matched_turn['text']}\n{res_line}"
+                        else:
+                            segs[-1].append({"role": "assistant", "text": f"[tool {t_name}]\n{res_line}",
+                                             "tool": f"[tool {t_name}]", "ts": ts})
+                elif typ == "permission.requested":
+                    asked = (data.get("message") or data.get("permission") or data.get("request") or
+                             data.get("detail") or data.get("command") or data.get("tool") or data.get("title") or "")
+                    if not asked and data:
+                        asked = json.dumps(data, ensure_ascii=False)
+                    asked_line = f"[permission requested] {one_line(_redact_secrets(str(asked)), 200)}"
+                    segs[-1].append({"role": "assistant", "text": asked_line, "ts": ts})
+                elif typ == "permission.completed":
+                    answer = (data.get("decision") or data.get("answer") or data.get("result") or
+                              data.get("status") or data.get("action") or "")
+                    if not answer and "allowed" in data:
+                        answer = "allowed" if data["allowed"] else "denied"
+                    if not answer and data:
+                        answer = json.dumps(data, ensure_ascii=False)
+                    answer_line = f"[permission completed] {one_line(_redact_secrets(str(answer)), 200)}"
+                    segs[-1].append({"role": "assistant", "text": answer_line, "ts": ts})
+                elif typ.startswith("subagent."):
+                    sub_id = data.get("subagentId") or data.get("id") or data.get("agentId") or ""
+                    role = data.get("role") or data.get("name") or data.get("type") or "subagent"
+                    desc = data.get("description") or data.get("prompt") or data.get("task") or ""
+                    status = data.get("status") or data.get("result") or ""
+                    if "start" in typ:
+                        detail = f"{role}: {desc}" if desc else str(role)
+                        if sub_id:
+                            detail = f"[{sub_id}] {detail}"
+                        line = f"[subagent start] {one_line(_redact_secrets(detail), 200)}"
+                    elif "finish" in typ or "complete" in typ or "end" in typ:
+                        detail = f"{role} ({status})" if status else str(role)
+                        if desc:
+                            detail = f"{detail}: {desc}"
+                        if sub_id:
+                            detail = f"[{sub_id}] {detail}"
+                        line = f"[subagent finish] {one_line(_redact_secrets(detail), 200)}"
+                    else:
+                        line = f"[{typ}] {one_line(_redact_secrets(json.dumps(data) if data else ''), 200)}"
+                    segs[-1].append({"role": "assistant", "text": line, "ts": ts})
                 elif typ == "result" and isinstance(event.get("result"), str):
                     text = event["result"].strip()
                     if text and not any(turn.get("role") == "assistant" and turn.get("text") == text
@@ -2454,6 +2598,7 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
         raise ValueError("since must be 'last' or 'bridge -N'")
 
     c = resolve(chat_id, source, project)
+    c["mode"] = mode
     info = chat_segments_info(c, segment)
     data, seg_label, total_segments = info[0], info[1], info[2]
     note = getattr(info, "note", None)
@@ -3493,6 +3638,36 @@ def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
     return "failed"
 
 
+def _record_read_guard_hit(meta: Dict[str, Any]) -> None:
+    stats_file = os.path.join(SUBWAY_DIR, "model_stats.json")
+    with _state_lock("model_stats"):
+        stats = []
+        if os.path.exists(stats_file):
+            with contextlib.suppress(Exception):
+                with open(stats_file, "r", encoding="utf-8") as f:
+                    stats = json.load(f)
+        if not isinstance(stats, list):
+            stats = []
+        wid = meta.get("id")
+        found = False
+        for s in stats:
+            if wid and s.get("worker_id") == wid:
+                s["read_guard_hits"] = int(s.get("read_guard_hits") or 0) + 1
+                found = True
+                break
+        if not found:
+            entry = {
+                "worker_id": wid,
+                "provider": str(meta.get("provider") or ""),
+                "model": str(meta.get("model") or ""),
+                "role": meta.get("role") or "",
+                "read_guard_hits": 1,
+                "timestamp": time.time(),
+            }
+            stats.append(entry)
+        _write_json_atomic(stats_file, stats)
+
+
 def _record_worker_stat(meta: Dict[str, Any], result: Dict[str, Any]) -> None:
     provider = meta.get("provider") or ""
     model = meta.get("model") or ""
@@ -3513,6 +3688,10 @@ def _record_worker_stat(meta: Dict[str, Any], result: Dict[str, Any]) -> None:
         "outcome": outcome,
         "timestamp": time.time(),
     }
+    if meta.get("read_guard_hits"):
+        entry["read_guard_hits"] = int(meta["read_guard_hits"])
+    if meta.get("id"):
+        entry["worker_id"] = meta["id"]
     stats_file = os.path.join(SUBWAY_DIR, "model_stats.json")
     with _state_lock("model_stats"):
         stats = []
@@ -3522,7 +3701,16 @@ def _record_worker_stat(meta: Dict[str, Any], result: Dict[str, Any]) -> None:
                     stats = json.load(f)
         if not isinstance(stats, list):
             stats = []
-        stats.append(entry)
+        wid = meta.get("id")
+        updated = False
+        if wid:
+            for s in stats:
+                if s.get("worker_id") == wid and "outcome" not in s:
+                    s.update(entry)
+                    updated = True
+                    break
+        if not updated:
+            stats.append(entry)
         _write_json_atomic(stats_file, stats)
 
 
@@ -5481,9 +5669,6 @@ def thread_permission_rows() -> Dict[str, Any]:
     overrides = _load_json("thread_settings.json")
     if not overrides:
         return {"threads": []}
-    titles = {}
-    with contextlib.suppress(Exception):
-        titles = {c["id"]: c.get("title") for c in all_chats("all") if c.get("id")}
     universal = get_permission_mode()
     rows = []
     for thread_id, entry in overrides.items():
@@ -5491,7 +5676,7 @@ def thread_permission_rows() -> Dict[str, Any]:
         if mode not in PERMISSION_MODES:
             continue
         worker = _load_worker(thread_id) if WORKER_ID_RE.match(thread_id) else None
-        label = titles.get(thread_id) or (worker.get("role") if worker else None) or _short_id(thread_id)
+        label = (worker.get("role") if worker else None) or _short_id(thread_id)
         rows.append({
             "thread_id": thread_id,
             "label": label,
@@ -7119,6 +7304,10 @@ def _normalise_copilot_worker_record(meta: Dict[str, Any]) -> Dict[str, Any]:
         normalized_usage.get("input"), normalized_usage.get("cache_read"))
     normalized["usage"] = normalized_usage
     normalized["input_excludes_cache"] = True
+    if "cache_write" not in usage or usage.get("cache_write") is None:
+        normalized["estimate"] = True
+        normalized["usage_estimate"] = True
+        normalized_usage["estimate"] = True
     return normalized
 
 
@@ -7223,6 +7412,7 @@ def _pump_claude(
 def _pump_agy(
     proc: subprocess.Popen, out: Any, run: Dict[str, Any],
     quota_handler: Optional[Callable[[str, str], None]] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Turn agy's event stream into a readable log, and note what got denied."""
     def write(text: str) -> None:
@@ -7265,14 +7455,58 @@ def _pump_agy(
             _check_cap(run)
             params = (st.get("tool_info") or {}).get("parameters") or {}
             detail = params.get("CommandLine") or params.get("TargetFile") or params.get("Path") or json.dumps(params)[:200]
+            start = params.get("StartLine") if "StartLine" in params else (params.get("start_line") if "start_line" in params else params.get("startLine"))
+            end = params.get("EndLine") if "EndLine" in params else (params.get("end_line") if "end_line" in params else params.get("endLine"))
+            offset = params.get("Offset") if "Offset" in params else params.get("offset")
+            limit = params.get("Limit") if "Limit" in params else params.get("limit")
+
+            range_suffix = ""
+            if start is not None and end is not None:
+                range_suffix = f" lines {start}-{end}"
+            elif start is not None:
+                range_suffix = f" lines {start}+"
+            elif end is not None:
+                range_suffix = f" lines 1-{end}"
+            elif offset is not None and limit is not None:
+                range_suffix = f" offset {offset} limit {limit}"
+            elif offset is not None:
+                range_suffix = f" offset {offset}"
+            elif limit is not None:
+                range_suffix = f" limit {limit}"
+
+            detail_log = f"{detail}{range_suffix}"
             if st.get("step_type") == "tool":
+                tool_name = st.get("tool_name") or ""
                 if st.get("state") == "ACTIVE":
                     run["last_tool"] = str(detail)
                     run["last_tool_input"] = params
-                    write(f"[tool] {st.get('tool_name')}: {one_line(str(detail), 200)}")
+                    write(f"[tool] {tool_name}: {one_line(str(detail_log), 200)}")
+
+                    w_meta = meta if meta is not None else run.get("meta")
+                    if w_meta is None and run.get("worker_id"):
+                        w_meta = _load_worker(run["worker_id"])
+                    if w_meta and not w_meta.get("provider"):
+                        w_meta = dict(w_meta, provider="antigravity")
+                    if w_meta:
+                        denial = _large_file_read_denial(w_meta, tool_name, params)
+                        if denial:
+                            write(f"[read guard] {denial}")
+                            run["read_guard_denial"] = denial
+                            w_meta["read_guard_hits"] = int(w_meta.get("read_guard_hits") or 0) + 1
+                            if w_meta.get("id"):
+                                with contextlib.suppress(Exception):
+                                    with _state_lock("workers"):
+                                        cur = _load_worker(w_meta["id"])
+                                        if cur:
+                                            cur["read_guard_hits"] = w_meta["read_guard_hits"]
+                                            _save_worker(cur)
+                            _record_read_guard_hit(w_meta)
+                            if hasattr(proc, "terminate"):
+                                with contextlib.suppress(Exception):
+                                    proc.terminate()
                 elif st.get("state") == "ERROR":
-                    write(f"[denied or failed] {st.get('tool_name')}: {one_line(str(detail), 200)}")
-                    run["last_error"] = (st.get("tool_name"), str(detail), params)
+                    write(f"[denied or failed] {tool_name}: {one_line(str(detail_log), 200)}")
+                    run["last_error"] = (tool_name, str(detail), params)
         elif kind == "result":
             res = ev.get("result") or {}
             run["conversation"] = res.get("conversation_id") or run.get("conversation")
@@ -8427,6 +8661,8 @@ def supervise_worker(worker_id: str) -> int:
                     run["spent"] = max(run.get("spent", 0), sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output")))
                     run["cap"], run["on_cap"] = turn_cap or int(budget.get("max_tokens") or 0), budget_stop
                     run["soft"] = run["cap"] * 2 // 3 if not wrapped_up else 0
+                    run["meta"] = meta
+                    run["worker_id"] = worker_id
                     if is_acp:
                         pump = threading.Thread(
                             target=_pump_opencode, args=(proc, out, run, meta, stopped, quota_handler),
@@ -8434,8 +8670,9 @@ def supervise_worker(worker_id: str) -> int:
                         )
                     else:
                         target_pump = _pump_agy if is_agy else (_pump_copilot if is_copilot else _pump_claude)
+                        pump_args = (proc, out, run, quota_handler, meta) if is_agy else (proc, out, run, quota_handler)
                         pump = threading.Thread(
-                            target=target_pump, args=(proc, out, run, quota_handler),
+                            target=target_pump, args=pump_args,
                             name=f"worker-output-{worker_id}", daemon=True,
                         )
                 else:
@@ -8545,6 +8782,11 @@ def supervise_worker(worker_id: str) -> int:
                 if final_reason:  # It finished inside the budget after being told to wrap up.
                     result = {"status": "completed", "exit_code": code, "reason": final_reason}
                     break
+                if is_agy and run.get("read_guard_denial") and run.get("conversation"):
+                    denial_msg = run.pop("read_guard_denial")
+                    save_progress(read_guard_hits=meta.get("read_guard_hits", 0))
+                    cmd = _agy_resume(cmd, run["conversation"], denial_msg, [])
+                    continue
                 denied = run.get("last_error")
                 if is_agy and code == 0 and denied and run.get("conversation") and denied[1] not in asked_denied:
                     tool, detail, *denied_input = denied
@@ -11312,6 +11554,8 @@ def get_models_track() -> List[Dict[str, Any]]:
             groups[key]["budget_stopped"] += 1
         elif outcome == "failed":
             groups[key]["failed"] += 1
+        if "read_guard_hits" in r:
+            groups[key]["read_guard_hits"] = groups[key].get("read_guard_hits", 0) + int(r["read_guard_hits"])
 
     result = []
     for g in groups.values():
