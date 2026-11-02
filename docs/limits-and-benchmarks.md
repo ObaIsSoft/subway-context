@@ -33,3 +33,15 @@
 - Existence of an official public benchmark category specifically verifying the unannounced/internal "Gemini Argon" codename.
 - Public, non-authenticated rate-limit monitoring endpoints for consumer-tier Claude Pro subscriptions.
 - Documented HTTP reset response headers for OpenCode CLI's free-tier proxy gateway.
+
+## Reset rules, checked 2026-11-02
+
+Confirmed by the vendor:
+
+- Claude Pro and Max: the 5-hour window starts at your first message and resets 5 hours later. The weekly limit resets at a fixed day and time per account, shown under Settings > Usage. Source: support.anthropic.com/en/articles/7996848-how-often-do-my-limits-reset
+- OpenCode Go: at most 20% per rolling 5 hours, 50% per rolling week and 100% per monthly cycle. Source: opencode.ai/pricing
+
+Community reports only, so treat them as unverified:
+
+- Antigravity: paid tiers may use rolling 5-hour quotas under a weekly ceiling, and free tiers fixed weekly resets. Subway reads real reset times from the local language server rather than assuming these.
+- OpenCode free models: limits appear to be dynamic and server-side, with no published reset time.

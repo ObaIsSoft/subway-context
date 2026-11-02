@@ -10,3 +10,9 @@
 - Permissions enabled via env OPENCODE_CONFIG_CONTENT = json {"permissions":[{"action":"*","resource":"*","effect":"ask"}]}. No config file needed.
 - Token spend: usage_update 'used' is context size, not spend. Real spend is queried from read-only SQLite ~/.local/share/opencode/opencode.db table session_v2 (tokens_input, tokens_output, tokens_reasoning, tokens_cache_read).
 - Turn completion: when session/prompt replies, supervisor sets finished=True and terminates proc; exit code treated as 0. When stopped, sends notification session/cancel {sessionId}.
+
+## Answers, auto_safe and denials
+
+- Only an explicit answer counts. Some clients decline MCP elicitation prompts by themselves, with nobody having seen them, so a decline or cancel leaves the request pending in the HUD.
+- In auto_safe mode, an OpenCode worker may read, search and edit inside its own folder without asking. An edit must name a file there. Every command still asks.
+- A denied request ends the worker as stopped, not failed.

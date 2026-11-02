@@ -4688,7 +4688,8 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
 
                 kind = tool_call.get("kind")
                 places = [str(p.get("path") or "") for p in tool_call.get("locations") or [] if isinstance(p, dict)]
-                inside = all(os.path.realpath(p).startswith(os.path.realpath(workdir)) for p in places if p)
+                root = os.path.join(os.path.realpath(workdir), "")
+                inside = all(os.path.join(os.path.realpath(os.path.join(workdir, p)), "").startswith(root) for p in places if p)
                 if meta.get("permission_mode") == "auto_safe" and kind in ("read", "search", "edit") and inside and (places or kind != "edit"):
                     decision = "allow"  # The same as Antigravity's accept-edits: its own folder, nothing else.
                 else:

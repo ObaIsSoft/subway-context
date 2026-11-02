@@ -258,6 +258,7 @@ Subway Context includes a real-time, interactive **Station Departure Board HUD**
 - **Loopback Only (`127.0.0.1`)**: The HUD server binds strictly to `127.0.0.1` (or `SUBWAY_HUD_PORT`, default 7890). There is deliberately no option to bind to `0.0.0.0` or external network interfaces.
 - **Per-User Authentication Token**: Protected by a random HMAC token stored in `~/.subway-context/hud_token`. The token is injected into served HTML and validated via the `X-Subway-Token` header on all API calls. Requests missing or mismatched tokens are rejected with `403 Forbidden`.
 - **Live Updates**: HUD updates are pushed the moment a worker or permission changes (`GET /api/events`), about 1 ms locally. Chats still depend on the model taking its turn.
+- **HUD Features**: Displays budget rows with real usage, a reset card that cycles through providers, a spend chart coloured per provider, and worker history pages with Load more.
 - **No Automatic Launch**: To conserve resources, the HUD **no longer starts automatically** when MCP connects. You start it whenever you want via:
   1. The `start_hud` MCP tool
   2. CLI: `subway-context hud` (or `python3 server.py hud [--open] [port]`)
@@ -296,8 +297,9 @@ Subway Context tracks live rate limits, token usage, and session windows across 
 
 ### Budgets & Capacity
 
-- **Budgets**: `subway-context budget` shows active budgets. `subway-context budget <chat|provider> <tokens>` sets them. Warnings trigger at 80% and execution stops at 100%. The HUD pings once when a limit is reached; the HUD can raise budgets, but agents cannot.
-- **Enforcement**: Claude Code can block the chat as you type through hooks. Antigravity and OpenCode have no such hook, so there the block happens on the next Subway tool call.
+- **Budgets**: `subway-context budget` shows them; `subway-context budget <chat|provider> <tokens>` sets them; typing that command as your own chat message in Claude Code works, including 3.5M and even when blocked. The HUD sets them too. Agents can't: the guard is best effort for shell commands.
+- **Enforcement**: Warnings at 80%, block at 100%. Claude Code blocks the prompt and tools through hooks. Antigravity and OpenCode have no such hook, so there the block lands on the next Subway tool call.
+- **Worker Token Caps**: Workers are told to wrap up at two thirds, and no call is started that would pass the cap. A call already running can still overrun. Counts thinking and Claude cache creation. Set Claude caps above about 100K: one call can cost 35K. Custom providers report no tokens, so they use max_seconds.
 - **Capacity**: 4 running workers per chat. Per machine: 2 up to 8 GB, 6 up to 16 GB, 10 above, or set `max_workers` in `config.json`. A worker over the limit stays queued.
 
 ---
@@ -319,22 +321,28 @@ Workers **always require user approval** before any execution begins:
 ### Provider Dispatch & Antigravity CLI Note
 
 - **Claude Workers**: Run via the `claude` CLI with `--effort`, `--model`, and custom tool permissions.
-- **OpenCode Workers**: Run through ACP, so they ask permission and can be denied.
-- **Custom Providers**: Add a CLI to `providers.json` with `id`, `name`, `bin`, `args` using `{prompt}`, `model_args` using `{model}`, and `skills`. Custom providers have no token reporting, so they use a time cap instead.
+- **OpenCode and Local Workers**: Run through ACP, so they ask permission and can be denied. auto_safe lets them read and edit inside their own folder.
+- **Custom Providers**: Add a CLI to `providers.json` with `id`, `name`, `bin`, `args` using `{prompt}`, `model_args` using `{model}`, and `skills`. Custom providers report no tokens, so they use max_seconds.
 - **Antigravity Workers**: Run through the **`agy` CLI binary** (`agy --print ...`). Note that `agy` runs detached batch CLI sessions and **cannot continue an active Antigravity IDE conversation**.
-- **God Mode (`mode="god"`)**: Available only with explicit user consent. Disables interactive permission pauses on high-tier models.
+- **God Mode (`mode="god"`)**: No worker count, only free memory limits it. auto spreads work across providers with Claude only as a last resort. It may still pick a model with no quota left.
+- **Sign-in Failures**: Models that fail sign-in are skipped for 24 hours.
 
 ### Permission Modes
 
 Workers use permission modes to govern actions:
 - **ask (Default)**: Always ask before running actions.
-- **auto_safe**: Automatically approves safe read-only and diagnostic commands.
+- **auto_safe**: Automatically approves safe read-only and diagnostic commands; lets OpenCode and local workers read and edit inside their own folder.
 - **auto_approve**: Auto-approves actions only if the user explicitly chooses it. Agents cannot enable this mode on their own.
 
 ### Platform Support
 
-- macOS and Linux are supported.
-- Windows support is written but untested.
+- macOS and Linux are supported. Worktrees are removed after each worker.
+- Windows is written but untested.
+
+### Worker Pings & Priority
+
+- **Worker Pings**: Finished, failed or stopped workers report to the launching chat. Every client gets a line on its next tool result; Claude Code also gets it on your next message.
+- **Worker Priority**: Urgent, normal, low. Waits return as soon as an urgent worker needs attention.
 
 ### Permission Relay & Commands
 
@@ -443,7 +451,7 @@ Subway detects Ollama and treats local models as a provider, with memory as the 
 - **Big jobs**: `spin_batch` splits files into chunks that fit, runs them one at a time, and writes each result as it finishes. Run it again with the same output file to resume. It writes JSONL, one result per chunk. `spin_batch merge_prompt` combines chunk results into `<output>.merged.md`.
 - **Routing by task**: `provider='auto'` uses three signals. The task sets hard rules (private stays local, bulk work goes cheapest) and the strength needed. The role decides which skill counts (coding, reasoning, writing). Remaining allowance then chooses among good-enough models: hard work takes the strongest, everyday work the cheapest good enough. Rankings live in `models.json` and can be edited in the HUD. They're the owner's rankings, not published benchmark scores. `private=true` forces local. The reason is shown before you approve.
 
-Local workers run through OpenCode, which runs tools without asking and can't relay requests yet. So OpenCode and local workers need permission_mode='auto_approve'. Subway refuses them in the other modes, because it can't honour those promises there. spin_batch isn't affected, since it uses no tools. Custom-trained models are only used when you name them.
+Local workers run through ACP, so they ask permission and can be denied; auto_safe lets them read and edit inside their own folder. spin_batch isn't affected, since it uses no tools. Custom-trained models are only used when you name them.
 
 ## Architecture & Security
 
