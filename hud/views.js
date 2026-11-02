@@ -63,6 +63,24 @@ export function settingsCard(settings) {
     )
   );
 
+  const compactAtVal = (s.compact_at_tokens != null && s.compact_at_tokens !== "") ? s.compact_at_tokens : 300000;
+  const compactAtInput = h("input", {
+    type: "number",
+    id: "settings-compact-at",
+    min: 100000,
+    max: 1000000,
+    step: 1000,
+    value: compactAtVal,
+    on: {
+      change: (e) => {
+        const n = Number(e.target.value);
+        const at = Number.isFinite(n) ? Math.max(100000, Math.min(1000000, Math.round(n))) : 300000;
+        e.target.value = at;
+        return act("/api/settings", { compaction: currentCompaction || "suggest", compact_at_tokens: at });
+      },
+    },
+  });
+
   const autostartCheck = h("input", {
     type: "checkbox",
     id: "hud-autostart",
@@ -85,6 +103,10 @@ export function settingsCard(settings) {
       h("span", { class: "label", id: "settings-compaction-title" }, "Compaction"),
       compactionSeg,
       compactionHint ? h("div", { class: "card-sub" }, compactionHint) : null),
+    h("div", { class: "field" },
+      h("label", { class: "label", for: "settings-compact-at" }, "Compact at (tokens)"),
+      compactAtInput,
+      h("div", { class: "card-sub" }, "Ask for compaction near this context size (100,000 to 1,000,000).")),
     h("div", { class: "switches" },
       h("label", { class: "switch-row", for: "hud-autostart" },
         h("span", { class: "switch-label" }, "Start the HUD with Subway"),

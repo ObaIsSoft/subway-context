@@ -1448,6 +1448,22 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertIn("token cap", updated.get("report", ""))
 
 
+class TestIsolatedWorkerOutcome(unittest.TestCase):
+    def test_read_only_worker_with_no_changes_completes_with_reply(self):
+        result = {"status": "completed", "exit_code": 0}
+        server._settle_isolated_result(result, "Read-only research. Do not edit any file.",
+                                       "No files changed.", "Found three call sites.")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["reason"], "Found three call sites.")
+
+    def test_editing_worker_with_no_changes_still_fails(self):
+        result = {"status": "completed", "exit_code": 0}
+        server._settle_isolated_result(result, "Edit the parser and add a test.",
+                                       "No files changed.", "Done.")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "Reported work, but no files changed.")
+
+
 if __name__ == "__main__":
     unittest.main()
 

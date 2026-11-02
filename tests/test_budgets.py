@@ -349,6 +349,26 @@ class TestStreamPumps(unittest.TestCase):
         log = out.getvalue().decode("utf-8")
         self.assertIn("[cap] spent 50016 of 10000, soft 0", log)
 
+    def test_cap_line_printed_once_per_spent_value(self):
+        event = {
+            "type": "assistant",
+            "message": {
+                "id": "msg_repeat",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+                "content": [{"type": "text", "text": "hi"}],
+            },
+        }
+        raw_lines = [json.dumps(event).encode("utf-8") + b"\n"] * 5
+        proc = MagicMock()
+        proc.stdout = raw_lines
+        out = io.BytesIO()
+        run = {"cap": 10000}
+
+        server._pump_claude(proc, out, run)
+
+        log = out.getvalue().decode("utf-8")
+        self.assertEqual(log.count("[cap] spent 120 of 10000, soft 0"), 1)
+
     def test_claude_result_usage_includes_cache_creation(self):
         result_event = {
             "type": "result",

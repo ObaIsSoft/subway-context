@@ -50,6 +50,7 @@ export function helpPage() {
         { term: "token cap and wrap-up", desc: "Workers are told to wrap up at two thirds of their cap, and no tool call is started that would pass the cap." },
         { term: "verifier", desc: "Automated check returning PASS, FLAG, or FAIL; proves changes are mechanically sound, not proof of correctness." },
         { term: "compaction and segments", desc: "Context trimming modes (Suggest, Auto, Never); keeps active context compact while full history stays readable." },
+        { term: "compaction point", desc: "`subway-context compaction auto 300k` sets Auto at 300,000 tokens. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's autoCompactWindow, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only. Default 300,000; range 100,000 to 1,000,000." },
         { term: "track record routing", desc: "Assigning worker tasks to models based on task type and historical success." },
         { term: "out of quota", desc: "Occurs when a provider or model runs out of tokens or hits rate limits, pausing work or falling back." },
         { term: "desktop alerts", desc: "System notifications sent when workers need approval, finish tasks, or approach budget limits." },

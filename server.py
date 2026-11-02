@@ -2482,6 +2482,23 @@ def _job_type(tier: str, role: str = "") -> str:
     return f"{tier}:{r}" if r else tier
 
 
+def _is_read_only_prompt(prompt: str) -> bool:
+    text = (prompt or "").lower()
+    return "read-only" in text or "do not edit any file" in text
+
+
+def _settle_isolated_result(result: Dict[str, Any], prompt: str, wt_note: str, reply: str) -> None:
+    """A read-only run that changes nothing is done, not a failure. Editing runs still need a diff."""
+    if result.get("status") != "completed" or wt_note != "No files changed.":
+        return
+    if _is_read_only_prompt(prompt):
+        result["reason"] = (reply or "").strip()
+        return
+    if "Edit " in prompt or "edit" in prompt:
+        result["status"] = "failed"
+        result["reason"] = "Reported work, but no files changed."
+
+
 def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
     if "outcome" in result:
         return result["outcome"]
@@ -5161,7 +5178,10 @@ def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             context = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "output_tokens"))
             run["last_step"] = context or run.get("last_step", 0)
             if run.get("cap"):
-                write(f"[cap] spent {run['spent']} of {run['cap']}, soft {run.get('soft', 0)}")
+                spent = run.get("spent", 0)
+                if "cap_logged" not in run or run["cap_logged"] != spent:
+                    run["cap_logged"] = spent
+                    write(f"[cap] spent {spent} of {run['cap']}, soft {run.get('soft', 0)}")
             _check_cap(run)
             for block in msg.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -5208,7 +5228,10 @@ def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             # The next call resends the context, so that's its likely cost. Thinking varies too much to predict from.
             run["last_step"] = int(used.get("input_tokens") or 0) + int(used.get("output_tokens") or 0) or run.get("last_step", 0)
             if run.get("cap"):
-                write(f"[cap] spent {run['spent']} of {run['cap']}, soft {run.get('soft', 0)}")
+                spent = run.get("spent", 0)
+                if "cap_logged" not in run or run["cap_logged"] != spent:
+                    run["cap_logged"] = spent
+                    write(f"[cap] spent {spent} of {run['cap']}, soft {run.get('soft', 0)}")
             _check_cap(run)
             params = (st.get("tool_info") or {}).get("parameters") or {}
             detail = params.get("CommandLine") or params.get("TargetFile") or params.get("Path") or json.dumps(params)[:200]
@@ -5493,10 +5516,8 @@ def supervise_worker(worker_id: str) -> int:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
     if result.get("status") == "completed" and fresh.get("isolate"):
         prompt = fresh.get("prompt") or ""
-        if ("Edit " in prompt or "edit" in prompt) and wt_note == "No files changed.":
-            result["status"] = "failed"
-            result["reason"] = "Reported work, but no files changed."
-        else:
+        _settle_isolated_result(result, prompt, wt_note, str(run.get("response") or ""))
+        if result.get("status") == "completed":
             patch_file = fresh.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
             if os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
@@ -7896,6 +7917,7 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
                      "capacity": capacity(), "models": model_catalog(), "benchmarks": benchmarks_meta,
                      "chat_budget": cfg_data.get("chat_budget_tokens", 0),
                      "compaction": get_compaction(),
+                     "compact_at_tokens": compact_at_tokens(),
                      "hud_autostart": bool(cfg_data.get("hud_autostart", True)),
                      "hud_open_on_use": bool(cfg_data.get("hud_open_on_use", True)),
                      "low_limits": low_limits, "budgets": budget_rows()},
