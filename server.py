@@ -7792,7 +7792,7 @@ def _active_subworkers(worker_id: str) -> List[str]:
                 child = json.load(f)
         except (ValueError, OSError):
             continue
-        if (isinstance(child, dict) and child.get("launched_by") == worker_id and child.get("id") != worker_id
+        if (isinstance(child, dict) and worker_id in (child.get("launched_by"), child.get("parent_id")) and child.get("id") != worker_id
                 and child.get("status") in _SUBWORKER_ACTIVE_STATES):
             active.append(str(child.get("id")))
     return sorted(active)
