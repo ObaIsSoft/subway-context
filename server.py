@@ -8087,6 +8087,8 @@ def _state_of(fetched_at: Optional[float], live_for: float) -> str:
 
 
 _other_sessions_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+_other_sessions_refreshing: Set[str] = set()
+_other_sessions_refresh_lock = threading.Lock()
 
 
 def _other_sessions(provider: str) -> Optional[Dict[str, Any]]:
@@ -8097,6 +8099,33 @@ def _other_sessions(provider: str) -> Optional[Dict[str, Any]]:
     res = _other_sessions_uncached(provider, now)
     _other_sessions_cache[provider] = (now, res)
     return res
+
+
+def _other_sessions_for_hud(provider: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    cached = _other_sessions_cache.get(provider)
+    if cached and now - cached[0] < 60.0:
+        return cached[1]
+    with _other_sessions_refresh_lock:
+        if provider not in _other_sessions_refreshing:
+            _other_sessions_refreshing.add(provider)
+
+            def refresh() -> None:
+                try:
+                    _other_sessions(provider)
+                finally:
+                    with _other_sessions_refresh_lock:
+                        _other_sessions_refreshing.discard(provider)
+
+            threading.Thread(target=refresh, daemon=True).start()
+    return cached[1] if cached else None
+
+
+def _source_record_age(rec: Dict[str, Any]) -> Optional[float]:
+    fetched_at = rec.get("fetched_at")
+    if rec.get("stale") and isinstance(fetched_at, (int, float)):
+        return max(0.0, round(time.time() - fetched_at, 1))
+    return rec.get("age")
 
 
 def _other_sessions_uncached(provider: str, now: float) -> Optional[Dict[str, Any]]:
@@ -8185,15 +8214,17 @@ def _other_sessions_uncached(provider: str, now: float) -> Optional[Dict[str, An
 
 
 def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    try:
         f_cached = pool.submit(_source, "claude_cached", 3.0 if refresh else None)
         f_live = pool.submit(_source, "claude_live", 120.0 if refresh else None)
         f_tokens = pool.submit(_source, "claude_tokens", 15.0 if refresh else None)
-        f_sessions = pool.submit(_other_sessions, "claude")
         cached_rec = f_cached.result()
         live_rec = f_live.result()
         tokens_rec = f_tokens.result()
-        other_sessions = f_sessions.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    other_sessions = _other_sessions_for_hud("claude")
 
     cached = cached_rec.get("data") or {}
     live = live_rec.get("data") or {}
@@ -8211,7 +8242,7 @@ def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
 
     is_loading = bool(live_rec.get("loading"))
     is_stale = bool(live_rec.get("stale"))
-    age = live_rec.get("age")
+    age = _source_record_age(live_rec)
     state = "loading" if is_loading else ("stale" if is_stale else _state_of(fetched_at, LIVE_SECONDS["claude"]))
     source = "Claude Code /usage" if use_live else "Claude Code cache (~/.claude.json)"
     error = live_rec.get("error") if (not use_live and not is_loading and not is_stale) else None
@@ -8226,18 +8257,20 @@ def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
 
 
 def _agy_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
         f_rec = pool.submit(_source, "agy_limits", 10.0 if refresh else None)
         f_tokens = pool.submit(_source, "agy_tokens", 15.0 if refresh else None)
-        f_sessions = pool.submit(_other_sessions, "antigravity")
         rec = f_rec.result()
         tokens_rec = f_tokens.result()
-        other_sessions = f_sessions.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    other_sessions = _other_sessions_for_hud("antigravity")
     data = rec.get("data") or {}
     tokens = tokens_rec.get("data")
     is_loading = bool(rec.get("loading"))
     is_stale = bool(rec.get("stale"))
-    age = rec.get("age")
+    age = _source_record_age(rec)
     state = "loading" if is_loading else ("stale" if is_stale else _state_of(rec.get("fetched_at"), LIVE_SECONDS["antigravity"]))
     note = ""
     if state == "stale":
@@ -8514,7 +8547,7 @@ def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     data = rec.get("data") or {}
     is_loading = bool(rec.get("loading"))
     is_stale = bool(rec.get("stale"))
-    age = rec.get("age")
+    age = _source_record_age(rec)
     plan = "Signed-in provider" if data.get("signed_in") else "Free models, no account" if data else ""
     hit = data.get("limit_hit")
     note = "OpenCode doesn't publish a remaining free allowance, so limits show only when one is hit."
@@ -8525,7 +8558,7 @@ def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     return {"plan": plan, "state": state, "source": "OpenCode database", "limit_hit": hit,
             "limited": data.get("limited") or {}, "per_model": data.get("per_model") or {},
             "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"),
-            "pools": [], "tokens": data.get("tokens"), "other_sessions": _other_sessions("opencode"),
+            "pools": [], "tokens": data.get("tokens"), "other_sessions": _other_sessions_for_hud("opencode"),
             "error": rec.get("error") if not (is_loading or is_stale) else None, "model": data.get("model", ""),
             "cost": data.get("cost"), "note": note if not is_loading else "",
             "loading": is_loading, "stale": is_stale, "age": age}

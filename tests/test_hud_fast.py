@@ -209,6 +209,33 @@ class TestHUDFast(test_subway.SubwayTestCase):
         self.assertTrue(claude_prov.get("stale"))
         self.assertAlmostEqual(claude_prov.get("age", 0), 45.0, delta=5.0)
 
+    def test_slow_other_sessions_scan_runs_in_background(self):
+        provider = "hud-fast-test"
+        old_cache = server._other_sessions_cache.pop(provider, None)
+        started = threading.Event()
+        finished = threading.Event()
+
+        def slow_scan(provider, now):
+            started.set()
+            time.sleep(0.5)
+            finished.set()
+            return {"sessions": 1, "tokens_5h": 10}
+
+        try:
+            with mock.patch.object(server, "_other_sessions_uncached", side_effect=slow_scan):
+                t0 = time.perf_counter()
+                sessions = server._other_sessions_for_hud(provider)
+                elapsed = time.perf_counter() - t0
+                self.assertLess(elapsed, 0.25)
+                self.assertIsNone(sessions)
+                self.assertTrue(started.wait(timeout=1.0))
+                self.assertTrue(finished.wait(timeout=1.0))
+                self.assertEqual(server._other_sessions_cache[provider][1]["sessions"], 1)
+        finally:
+            server._other_sessions_cache.pop(provider, None)
+            if old_cache is not None:
+                server._other_sessions_cache[provider] = old_cache
+
     def test_scan_ledger_skips_unchanged_files(self):
         f1 = os.path.join(self.test_dir, "transcript1.jsonl")
         f2 = os.path.join(self.test_dir, "transcript2.jsonl")
