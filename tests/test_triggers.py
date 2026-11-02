@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -20,6 +21,7 @@ class TestWorkerTriggers(unittest.TestCase):
         self.subway = os.path.join(self.tmp, ".subway-context")
         self.stack = contextlib.ExitStack()
         patch = self.stack.enter_context
+        self.launch_worker_impl = server._launch_worker
         patch(mock.patch.object(server, "HOME", self.tmp))
         patch(mock.patch.object(server, "SUBWAY_DIR", self.subway))
         patch(mock.patch.object(server, "WORKERS_DIR", os.path.join(self.subway, "workers")))
@@ -51,6 +53,25 @@ class TestWorkerTriggers(unittest.TestCase):
 
     def children(self, parent):
         return [w for w in server._all_workers() if w.get("triggered_by") == parent]
+
+    def git_repo(self, name="review_repo"):
+        repo = os.path.join(self.tmp, name)
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        subprocess.run(["git", "-C", repo, "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+        with open(os.path.join(repo, "tracked.txt"), "w", encoding="utf-8") as f:
+            f.write("original\n")
+        subprocess.run(["git", "-C", repo, "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+        return repo
+
+    def capture_review(self, worker_id):
+        meta = server._load_worker(worker_id)
+        server._capture_in_place_review_diff(meta)
+        server._save_worker(meta)
+        server._run_triggers(worker_id, {"status": "completed"})
+        return self.children(worker_id)[0]["prompt"]
 
     def test_completed_fires_and_failed_does_not(self):
         a, _ = self.spin(role="A", prompt="build", then=json.dumps([
@@ -142,6 +163,87 @@ class TestWorkerTriggers(unittest.TestCase):
             {"role": "B", "prompt": "use the report", "provider": "claude", "include": "patch"}]))
         server._run_triggers(b, {"status": "completed", "reason": "report only"})
         self.assertIn("report only", self.children(b)[0]["prompt"])
+
+    def test_in_place_launch_records_dirty_paths(self):
+        repo = self.git_repo()
+        with open(os.path.join(repo, "tracked.txt"), "w", encoding="utf-8") as f:
+            f.write("already modified\n")
+        worker_id, _ = self.spin(role="Builder", prompt="Change a file",
+                                 project_dir=repo, review="auto")
+
+        real_popen = subprocess.Popen
+
+        def popen_worker_only(args, *popen_args, **popen_kwargs):
+            if args[0] == "git":
+                return real_popen(args, *popen_args, **popen_kwargs)
+            return mock.Mock(pid=123, wait=mock.Mock())
+
+        with mock.patch.object(server, "_launch_worker", self.launch_worker_impl), \
+                mock.patch.object(server, "_capacity_block", return_value=None), \
+                mock.patch("subprocess.Popen", side_effect=popen_worker_only):
+            server._launch_worker(worker_id)
+
+        meta = server._load_worker(worker_id)
+        self.assertIn("tracked.txt", meta["git_dirty_before"])
+        self.assertLessEqual(len(meta["git_dirty_before"]), 500)
+
+    def test_in_place_launch_dirty_path_list_is_capped(self):
+        root_result = subprocess.CompletedProcess([], 0, stdout=self.tmp, stderr="")
+        status = b"\0".join(f"?? path-{index}".encode() for index in range(501)) + b"\0"
+        status_result = subprocess.CompletedProcess([], 0, stdout=status, stderr=b"")
+        with mock.patch.object(server.subprocess, "run", side_effect=[root_result, status_result]):
+            paths = server._git_dirty_paths(self.tmp)
+        self.assertEqual(len(paths), 500)
+
+    def test_in_place_review_separates_preexisting_and_worker_changes(self):
+        repo = self.git_repo()
+        with open(os.path.join(repo, "tracked.txt"), "w", encoding="utf-8") as f:
+            f.write("already modified content\n")
+        worker_id, _ = self.spin(role="Builder", prompt="Add a file",
+                                 project_dir=repo, review="auto")
+        meta = server._load_worker(worker_id)
+        meta["git_dirty_before"] = ["tracked.txt"]
+        server._save_worker(meta)
+        with open(os.path.join(repo, "new.txt"), "w", encoding="utf-8") as f:
+            f.write("worker-added content\n")
+
+        prompt = self.capture_review(worker_id)
+
+        self.assertIn("Changed by this worker", prompt)
+        self.assertIn("Untracked file new.txt", prompt)
+        self.assertIn("worker-added content", prompt)
+        self.assertIn("Already modified before this worker started (may include this worker's edits)", prompt)
+        self.assertIn("The second group may contain other people's work.", prompt)
+        self.assertIn("already modified content", prompt)
+        self.assertIn("?? new.txt", prompt)
+        stored = server._load_worker(worker_id)
+        self.assertNotIn("patch_path", stored)
+        self.assertTrue(stored["review_diff_path"].endswith(f"{worker_id}.review_diff"))
+        self.assertFalse(os.path.exists(os.path.join(server.WORKERS_DIR, f"{worker_id}.patch")))
+
+    def test_in_place_review_explains_non_git_project(self):
+        worker_id, _ = self.spin(role="Builder", prompt="Make a change", review="auto")
+
+        prompt = self.capture_review(worker_id)
+
+        self.assertIn("No diff is available", prompt)
+        self.assertIn("not a git repository", prompt)
+
+    def test_in_place_review_trims_oversized_diff_with_note(self):
+        repo = self.git_repo("large_review_repo")
+        with open(os.path.join(repo, "tracked.txt"), "w", encoding="utf-8") as f:
+            f.write("large change " * 7000)
+        worker_id, _ = self.spin(role="Builder", prompt="Make a large change",
+                                 project_dir=repo, review="auto")
+
+        prompt = self.capture_review(worker_id)
+        review_diff_path = server._load_worker(worker_id)["review_diff_path"]
+        with open(review_diff_path, "r", encoding="utf-8") as f:
+            diff_text = f.read()
+
+        self.assertLessEqual(len(diff_text), 60000)
+        self.assertIn("[Review diff trimmed to 60000 characters.]", diff_text)
+        self.assertIn("[Review diff trimmed to 60000 characters.]", prompt)
 
 
 if __name__ == "__main__":

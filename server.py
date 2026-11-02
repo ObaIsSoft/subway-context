@@ -30,6 +30,7 @@ Writes:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import contextlib
 import datetime as _dt
 import glob
@@ -2768,16 +2769,100 @@ def _is_read_only_prompt(prompt: str) -> bool:
     return "read-only" in text or "do not edit any file" in text
 
 
-def _settle_isolated_result(result: Dict[str, Any], prompt: str, wt_note: str, reply: str) -> None:
-    """A read-only run that changes nothing is done, not a failure. Editing runs still need a diff."""
-    if result.get("status") != "completed" or wt_note != "No files changed.":
-        return
+def _worker_expected_to_edit(meta: Dict[str, Any]) -> bool:
+    role = str(meta.get("role") or "").lower()
+    if re.search(r"\b(?:review|reviewer|research|researcher|read[- ]?only)\b", role):
+        return False
+    prompt = str(meta.get("prompt") or "")
     if _is_read_only_prompt(prompt):
-        result["reason"] = (reply or "").strip()
+        return False
+    capabilities = meta.get("capabilities") or []
+    # files:write is the clearest edit signal; god mode also enables unrestricted tools.
+    if ("files:write" not in capabilities and "terminal:full" not in capabilities
+            and meta.get("mode") != "god" and meta.get("permission_mode") != "auto_approve"):
+        return False
+    return bool(re.search(
+        r"\b(?:add|change|create|implement|update|modify|edit|fix|refactor|remove|delete|rename|write|replace|introduce|extend|migrate|convert|build)\b",
+        prompt,
+        re.IGNORECASE,
+    ))
+
+
+def _git_change_fingerprint(project_dir: str) -> Optional[str]:
+    """Fingerprint tracked and untracked git changes relative to the worker's start state."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        cwd=project_dir, capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+
+    digest = hashlib.sha256(status.stdout)
+    for args in (["git", "diff", "--binary", "--"], ["git", "diff", "--cached", "--binary", "--"]):
+        diff = subprocess.run(args, cwd=project_dir, capture_output=True, check=True)
+        digest.update(diff.stdout)
+    for entry in status.stdout.split(b"\0"):
+        if not entry.startswith(b"?? "):
+            continue
+        path = os.path.join(project_dir, os.fsdecode(entry[3:]))
+        if os.path.islink(path):
+            digest.update(os.fsencode(os.readlink(path)))
+        elif os.path.isfile(path):
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_status_entries(status: bytes) -> List[Tuple[str, str]]:
+    entries = []
+    records = status.split(b"\0")
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            continue
+        code = os.fsdecode(record[:2])
+        entries.append((code, os.fsdecode(record[3:])))
+        if "R" in code or "C" in code:
+            if i < len(records) and records[i]:
+                entries.append((code, os.fsdecode(records[i])))
+                i += 1
+    return entries
+
+
+def _git_dirty_paths(project_dir: str) -> Optional[List[str]]:
+    root = subprocess.run(
+        ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if root.returncode:
+        if "not a git repository" in root.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(root.returncode, root.args, root.stdout, root.stderr)
+    status = subprocess.run(
+        ["git", "-C", root.stdout.strip(), "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+    return [path for _, path in _git_status_entries(status.stdout)][:500]
+
+
+def _settle_worker_result(result: Dict[str, Any], meta: Dict[str, Any], no_changes: bool, reply: str) -> None:
+    if result.get("status") != "completed" or not no_changes:
         return
-    if "Edit " in prompt or "edit" in prompt:
-        result["status"] = "failed"
-        result["reason"] = "Reported work, but no files changed."
+    summary = (reply or "").strip() or str(result.get("reason") or "").strip()
+    if not _worker_expected_to_edit(meta):
+        result["reason"] = summary
+        return
+    result["status"] = "failed"
+    result["reason"] = f"No changes made. {summary}".strip()
 
 
 def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
@@ -2789,7 +2874,7 @@ def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
     reason = str(result.get("reason") or meta.get("report") or "")
     if status == "budget_stopped" or "budget" in reason.lower():
         return "budget_stopped"
-    if "no files changed" in reason.lower() or reason == "Reported work, but no files changed.":
+    if "no files changed" in reason.lower() or "no changes made" in reason.lower():
         return "no_change"
     if status == "completed" or "patch applied" in reason.lower():
         return "landed"
@@ -2880,6 +2965,14 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
             _save_worker(current)
             should_record = True
     if should_record and result is not None:
+        status = str(current.get("status") or result.get("status") or "failed")
+        if ((status in ("failed", "stopped", "timed_out", "budget_stopped") or current.get("priority") == "urgent")
+                and not result.get("rerouted_to") and not result.get("stall_alerted")):
+            message = f"Worker {wid} ({current.get('role') or 'worker'}) ended: {status}."
+            reason = result.get("reason") or current.get("report")
+            if reason:
+                message += f" {reason}"
+            notify_desktop_event(f"worker_ended|{wid}|{status}", "Subway Context", message[:500], route="workers")
         _record_worker_stat(current, result)
     return current
 
@@ -3388,8 +3481,63 @@ def _catalog_stamp() -> Tuple[float, ...]:
     return tuple(stamps)
 
 
+def _opencode_free_exhausted_models(providers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, float]:
+    """Map of OpenCode model name -> timestamp when it hit free limit within the last 24 hours."""
+    exhausted: Dict[str, float] = {}
+    now = time.time()
+    rec = None
+    if providers:
+        rec = next((p for p in providers if p.get("id") == "opencode"), None)
+    if not rec:
+        with contextlib.suppress(Exception):
+            src = _source("opencode", 5.0)
+            rec = src.get("data")
+    if not rec:
+        with contextlib.suppress(Exception):
+            rec = _fetch_opencode_usage()
+    if isinstance(rec, dict):
+        limited = rec.get("limited") or {}
+        for k, v in limited.items():
+            if isinstance(v, dict):
+                at = float(v.get("at") or 0)
+                if at and (now - at <= 86400):
+                    m = str(v.get("model") or k)
+                    if m:
+                        exhausted[m] = at
+                        if "/" in m:
+                            exhausted[m.split("/", 1)[1]] = at
+        hit = rec.get("limit_hit")
+        if isinstance(hit, dict):
+            at = float(hit.get("at") or 0)
+            if at and (now - at <= 86400):
+                m = str(hit.get("model") or rec.get("model") or "")
+                if m and m != "Free model":
+                    exhausted[m] = at
+                    if "/" in m:
+                        exhausted[m.split("/", 1)[1]] = at
+    return exhausted
+
+
+def _is_opencode_model_exhausted(model: str, providers: Optional[List[Dict[str, Any]]] = None) -> bool:
+    if not model:
+        return False
+    ex = _opencode_free_exhausted_models(providers)
+    if model in ex:
+        return True
+    clean = model.split("/", 1)[1] if "/" in model else model
+    return clean in ex
+
+
 def model_catalog() -> List[Dict[str, Any]]:
-    return [dict(m) for m in _model_catalog(_catalog_stamp())]
+    catalog = [dict(m) for m in _model_catalog(_catalog_stamp())]
+    oc_ex = _opencode_free_exhausted_models()
+    for entry in catalog:
+        m_prov = entry.get("provider", "")
+        m_name = (entry.get("model") or "").strip()
+        is_bad = _model_is_bad(m_name) if m_name else False
+        is_oc_ex = (m_prov == "opencode" and (m_name in oc_ex or m_name.split("/", 1)[-1] in oc_ex))
+        entry["exhausted"] = bool(is_bad or is_oc_ex)
+    return catalog
 
 
 @ttl_cached(120.0)
@@ -3551,6 +3699,8 @@ def _pool_left(providers: List[Dict[str, Any]], provider: str, model: str) -> Op
     if not record:
         return None
     if provider == "opencode":
+        if _is_opencode_model_exhausted(model, providers):
+            return 0.0
         return 0.0 if (record.get("limited") or {}).get(model, {}).get("recent") else None
     pool = _select_pool(record, model)
     if not pool:
@@ -3616,20 +3766,24 @@ def _model_is_bad(model: str) -> bool:
         return False
     bad = _load_json("bad_models.json")
     entry = _match_bad_entry(bad, model)
-    if not entry:
-        return False
-    if isinstance(entry, dict) and ("reset_time" in entry or "resets_at" in entry):
-        rt = entry.get("reset_time") or entry.get("resets_at")
-        try:
-            return time.time() < float(rt)
-        except (TypeError, ValueError):
-            pass
-    ts = entry.get("timestamp") if isinstance(entry, dict) else entry
-    try:
-        ts_val = float(ts)
-    except (TypeError, ValueError):
-        return False
-    return (time.time() - ts_val) < 24 * 3600
+    if entry:
+        if isinstance(entry, dict) and ("reset_time" in entry or "resets_at" in entry):
+            rt = entry.get("reset_time") or entry.get("resets_at")
+            try:
+                return time.time() < float(rt)
+            except (TypeError, ValueError):
+                pass
+        else:
+            ts = entry.get("timestamp") if isinstance(entry, dict) else entry
+            try:
+                if (time.time() - float(ts)) < 24 * 3600:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    with contextlib.suppress(Exception):
+        if _is_opencode_model_exhausted(model):
+            return True
+    return False
 
 
 def _resolve_agy_model(model: str = "") -> str:
@@ -3712,7 +3866,7 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             if m["provider"] == "local":
                 model_name = choose_local_model(need_tools=False) or "local"
             elif m["provider"] == "opencode":
-                oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om)]
+                oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om) and not _is_opencode_model_exhausted(om, providers)]
                 model_name = oc_cand[0] if oc_cand else ""
             elif m["provider"] == "copilot":
                 cp_cand = [cm["model"] for cm in _copilot_models() if cm.get("model") and not _model_is_bad(cm["model"]) and not is_copilot_cli_refused(cm["model"])]
@@ -3720,6 +3874,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             else:
                 model_name = m["provider"]
         if not model_name or _model_is_bad(model_name):
+            continue
+        if m["provider"] == "opencode" and _is_opencode_model_exhausted(model_name, providers):
             continue
         if m["provider"] == "copilot" and is_copilot_cli_refused(model_name):
             continue
@@ -4309,7 +4465,7 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
     pct = (usage / window) * 100.0
     level = 90 if pct >= 90 else (80 if pct >= 80 else (75 if (pct >= 75 and thresh_pct <= 75) else 60))
     level = f"{level}|{usage // 100000}"  # Warn again for every 100K more, not only at window shares.
-    sid = session_id or _self_id()
+    sid = session_id or _self_id() or "unknown-chat"
     key = f"compaction_warning|{sid}|{level}"
     now = time.time()
     with _state_lock("pings"):
@@ -4527,14 +4683,26 @@ def budget_rows() -> List[Dict[str, Any]]:
 
 
 def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] = None,
-                        chat_id: Optional[str] = None) -> str:
+                        chat_id: Optional[str] = None, subject_id: Optional[str] = None,
+                        window: Optional[str] = None, reset_at: Any = None,
+                        desktop: bool = False) -> str:
     if not limit or limit <= 0:
         return ""
     pct = (used / limit) * 100
     if pct < 80 or pct >= 100:
         return ""
     level = 90 if pct >= 90 else 80
-    key = f"budget_warning|{scope}|{limit}|{level}"
+    if scope == "chat":
+        subject = subject_id or chat_id or _self_id() or "unknown-chat"
+        key = f"budget_warning|chat|{subject}|{limit}|{level}"
+    else:
+        key = f"budget_warning|provider|{scope}|{window or '5h'}|{reset_at or 'unknown'}|{limit}|{level}"
+    label = label or scope
+    cmd = f"subway-context budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
+    message = (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
+               f"Add more with: {cmd}, or in the HUD.")
+    if desktop:
+        return message if notify_desktop_event(key, "Subway Context budget warning", message, route="overview") else ""
     now = time.time()
     with _state_lock("pings"):
         sent = _load_json("limit_pings.json")
@@ -4542,10 +4710,25 @@ def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] =
             return ""
         sent[key] = now
         _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
-    label = label or scope
-    cmd = f"subway-context budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
-    return (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
-            f"Add more with: {cmd}, or in the HUD.")
+    return message
+
+
+def _provider_budget_reset(provider_id: str) -> Optional[float]:
+    for provider in discover_connected_providers(refresh=False):
+        if provider.get("id") != provider_id:
+            continue
+        for pool in provider.get("pools") or []:
+            for window in pool.get("windows") or []:
+                key = str(window.get("key") or "").lower()
+                label = str(window.get("label") or "").lower()
+                if key in ("5h", "five_hour") or "5-hour" in label:
+                    reset = window.get("resets_at")
+                    try:
+                        return float(reset) if reset is not None else None
+                    except (TypeError, ValueError):
+                        return None
+    return None
+
 
 def enforce_budgets() -> None:
     try:
@@ -4733,6 +4916,88 @@ def _reviewer_task_text(prompt: str, limit: int = 6000) -> str:
     return text[:limit].rstrip()
 
 
+_REVIEW_DIFF_LIMIT = 60000
+
+
+def _capture_in_place_review_diff(meta: Dict[str, Any]) -> None:
+    """Save an in-place worker's git changes as reviewer context, not as an applicable patch."""
+    project_dir = str(meta.get("project_dir") or "")
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diff_text = f"No diff is available: could not inspect the project git repository: {one_line(str(exc), 200)}"
+    else:
+        if root_result.returncode:
+            diff_text = "No diff is available: the project folder is not a git repository."
+        else:
+            root = root_result.stdout.strip()
+            try:
+                status_result = subprocess.run(
+                    ["git", "-C", root, "status", "--porcelain=1", "-z", "--untracked-files=all"],
+                    capture_output=True, timeout=60,
+                )
+                if status_result.returncode:
+                    diff_text = ("No diff is available: could not capture git changes. "
+                                 + one_line(status_result.stderr, 200))
+                else:
+                    status_entries = _git_status_entries(status_result.stdout)
+                    dirty_before = set(meta.get("git_dirty_before") or [])
+                    changed = [(code, path) for code, path in status_entries if path not in dirty_before]
+                    preexisting = [(code, path) for code, path in status_entries if path in dirty_before]
+                    pieces = []
+                    for index, (title, entries) in enumerate((
+                            ("Changed by this worker", changed),
+                            ("Already modified before this worker started (may include this worker's edits)", preexisting))):
+                        if index:
+                            pieces.append("")
+                        pieces.append(title)
+                        if index:
+                            pieces.append("The second group may contain other people's work.")
+                        paths = list(dict.fromkeys(path for _, path in entries))
+                        if not paths:
+                            pieces.append("(none)")
+                            continue
+                        pieces.extend(f"{code} {path}" for code, path in entries)
+                        tracked_paths = [path for code, path in entries if not code.startswith("??")]
+                        pathspecs = [f":(literal){path}" for path in dict.fromkeys(tracked_paths)]
+                        if pathspecs:
+                            for label, args in (
+                                ("Git diff", ["git", "-C", root, "diff", "--no-ext-diff", "--"] + pathspecs),
+                                ("Git staged diff", ["git", "-C", root, "diff", "--cached", "--no-ext-diff", "--"] + pathspecs),
+                            ):
+                                result = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=60)
+                                if result.returncode:
+                                    raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+                                if result.stdout.strip():
+                                    pieces.append(f"{label}:\n{result.stdout.rstrip()}")
+                        for code, rel_path in entries:
+                            if not code.startswith("??"):
+                                continue
+                            file_path = os.path.realpath(os.path.join(root, rel_path))
+                            if os.path.commonpath((root, file_path)) != root or not os.path.isfile(file_path):
+                                continue
+                            with open(file_path, "rb") as f:
+                                content = f.read(_REVIEW_DIFF_LIMIT + 1).decode("utf-8", "replace")
+                            pieces.append(f"Untracked file {rel_path}:\n{content}")
+                    diff_text = "\n\n".join(piece for piece in pieces if piece.strip())
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                diff_text = f"No diff is available: could not capture git changes: {one_line(str(exc), 200)}"
+
+    trimmed_note = "\n\n[Review diff trimmed to 60000 characters.]"
+    if len(diff_text) > _REVIEW_DIFF_LIMIT:
+        diff_text = diff_text[:_REVIEW_DIFF_LIMIT - len(trimmed_note)] + trimmed_note
+    review_diff_path = os.path.join(WORKERS_DIR, f"{meta['id']}.review_diff")
+    try:
+        with open(review_diff_path, "w", encoding="utf-8") as f:
+            f.write(diff_text)
+        meta["review_diff_path"] = review_diff_path
+    except OSError as exc:
+        meta["review_diff_note"] = f"No diff is available: could not save reviewer diff: {one_line(str(exc), 200)}"
+
+
 def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
     """Parse and validate worker follow-up steps. Bad input is refused before anything is queued."""
     if raw in (None, "", []):
@@ -4821,6 +5086,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     """Queue a worker for user approval. Agents can request workers, but only the user can launch them."""
     if not role or not prompt:
         return "Error: role and prompt are required."
+    original_prompt = prompt
     try:
         steps = _parse_trigger_steps(then)
         review_step = _review_trigger_step(review)
@@ -4998,9 +5264,38 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "swarm_id": swarm_id,
         "isolate": bool(isolate),
         "priority": priority,
+        "private": bool(route.get("private")),
+        "spin_args": {
+            "role": role,
+            "prompt": original_prompt,
+            "provider": selected_provider,
+            "track": track,
+            "project_dir": cwd,
+            "timeout_seconds": int(timeout_seconds or 0),
+            "effort": chosen_effort,
+            "mode": "god" if is_god_mode else "standard",
+            "model": target_model,
+            "permission_mode": permission_mode,
+            "capabilities": list(capabilities),
+            "budget_session_pct": budget_session_pct,
+            "budget_weekly_pct": budget_weekly_pct,
+            "max_budget_usd": max_budget_usd,
+            "thread": thread,
+            "private": bool(route.get("private")),
+            "max_tokens": int(max_tokens or 0),
+            "max_seconds": int(max_seconds or 0),
+            "swarm_id": swarm_id,
+            "isolate": bool(isolate),
+            "route_reason": route_reason,
+            "priority": priority,
+            "code": list(code) if code is not None else None,
+            "then": then,
+            "review": review,
+        },
         "code_hashes": file_hashes,
         "route": route_reason or (route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}."),
         "then": steps,
+        "review": review,
         "usage": {"input": 0, "output": 0, "cache_read": 0},
         "status": "pending_approval",
         "cmd": cmd,
@@ -5467,6 +5762,17 @@ def _launch_worker(worker_id: str) -> str:
                     _save_worker(meta)
                     return f"Error: couldn't create a worktree: {exc}"
                 meta["isolate"] = False  # Not a git folder, so there's nothing to copy: it works in place.
+        if not meta.get("isolate") and _worker_expected_to_edit(meta):
+            try:
+                git_state = _git_change_fingerprint(meta.get("project_dir") or HOME)
+                git_dirty_before = _git_dirty_paths(meta.get("project_dir") or HOME)
+            except (OSError, subprocess.SubprocessError) as exc:
+                meta["status"] = "pending_approval"
+                _save_worker(meta)
+                return f"Error: couldn't record starting git state: {exc}"
+            if git_state is not None:
+                meta["git_state_before"] = git_state
+                meta["git_dirty_before"] = git_dirty_before or []
         _save_worker(meta)
 
     try:
@@ -5476,6 +5782,8 @@ def _launch_worker(worker_id: str) -> str:
     except OSError as exc:
         meta.update({"status": "failed", "report": f"Could not start supervisor: {exc}"})
         _save_worker(meta)
+        notify_desktop_event(f"worker_ended|{worker_id}|failed", "Subway Context",
+                             f"Worker {worker_id} failed to start: {exc}", route="workers")
         return f"Error spawning approved worker process: {exc}"
     threading.Thread(target=proc.wait, daemon=True).start()  # Reap the child, so no zombie lingers.
 
@@ -5531,97 +5839,164 @@ def _escape_xml(s: str) -> str:
     )
 
 
-def _send_desktop_notification(title: str, message: str) -> None:
-    """Send a desktop notification: macOS via terminal-notifier/osascript, Linux via notify-send, Windows via native toast."""
-    if os.environ.get("SUBWAY_NO_NOTIFY"):  # Tests and sandboxes must never reach the real desktop.
-        return
+_notification_log_lock = threading.Lock()
+
+
+def _log_notification_failure(mechanism: str, error: Any) -> None:
+    """Keep the notification failure log bounded without making alerts fatal."""
+    path = os.path.expanduser("~/.subway-context/notify.log")
+    entry = f"{_dt.datetime.now().astimezone().isoformat(timespec='seconds')} [{mechanism}] {error}\n"
     try:
-        if sys.platform == "darwin":
-            notifier = shutil.which("terminal-notifier")
-            if notifier:  # Unlike osascript, it can open the HUD when the alert is clicked.
-                subprocess.run([notifier, "-title", title, "-message", message, "-group", "subway-context",
-                                "-open", f"http://127.0.0.1:{_hud_port()}/#workers"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            else:
-                safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
-                safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-                script = f'display notification "{safe_msg}" with title "{safe_title}"'
-                subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        elif sys.platform.startswith("linux"):
-            if not shutil.which("notify-send"):
-                return
-            has_action = False
+        with _notification_log_lock:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             try:
-                proc = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=2)
-                has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
-            except Exception:
-                has_action = False
-            if has_action:
-                url = f"http://127.0.0.1:{_hud_port()}/#workers"
-                def _linux_wait() -> None:
-                    try:
-                        res = subprocess.run(
-                            ["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
-                            capture_output=True, text=True
-                        )
-                        if res.stdout and res.stdout.strip() == "open":
-                            subprocess.run(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception:
-                        pass
-                threading.Thread(target=_linux_wait, daemon=True).start()
-            else:
-                subprocess.run(["notify-send", title, message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        elif sys.platform.startswith("win"):
-            url = f"http://127.0.0.1:{_hud_port()}/#workers"
-            xml_url = _escape_xml(url)
-            safe_title = _escape_xml(title).replace("'", "''")
-            safe_msg = _escape_xml(message).replace("'", "''")
-            xml = (
-                f'<toast activationType="protocol" launch="{xml_url}">'
-                f'<visual><binding template="ToastGeneric">'
-                f'<text>{safe_title}</text><text>{safe_msg}</text>'
-                f'</binding></visual></toast>'
-            )
-            app_id = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
-            cmd = (
-                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
-                "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
-                f"$xml = [Windows.Data.Xml.Dom.XmlDocument]::new(); $xml.LoadXml('{xml}'); "
-                f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
-                f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast)"
-            )
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.run(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
-                creationflags=creationflags,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-    except Exception:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines((lines + [entry])[-200:])
+    except (OSError, UnicodeError):
         pass
 
 
-def notify_if_still_waiting(key: str, message: str, still_waiting: Callable[[], bool], delay: float = 20.0) -> None:
+def _run_notification_command(mechanism: str, command: List[str], timeout: Optional[float] = None,
+                              **kwargs: Any) -> Optional[str]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, **kwargs)
+        return_code = getattr(result, "returncode", 0)
+        if isinstance(return_code, int) and return_code != 0:
+            error = (result.stderr or result.stdout or f"exited with status {return_code}").strip()
+            _log_notification_failure(mechanism, error)
+            return error
+    except Exception as exc:
+        error = str(exc)
+        _log_notification_failure(mechanism, error)
+        return error
+    return None
+
+
+def _find_executable(name: str, fallback_paths: Tuple[str, ...] = ()) -> Optional[str]:
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    for path in fallback_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _send_desktop_notification(title: str, message: str, route: str = "workers") -> Tuple[str, Optional[str]]:
+    """Send a desktop notification and report the mechanism and any non-fatal error."""
+    if os.environ.get("SUBWAY_NO_NOTIFY"):  # Tests and sandboxes must never reach the real desktop.
+        return "disabled", "SUBWAY_NO_NOTIFY is set"
+    route = route if route in ("overview", "usage", "workers") else "workers"
+    url = f"http://127.0.0.1:{_hud_port()}/#{route}"
+    if sys.platform == "darwin":
+        notifier = _find_executable(
+            "terminal-notifier",
+            ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"),
+        )
+        if notifier:
+            error = _run_notification_command(
+                "terminal-notifier",
+                [notifier, "-title", title, "-message", message, "-group", "subway-context", "-open", url],
+                timeout=3,
+            )
+            return "terminal-notifier", error
+        safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'display notification "{safe_msg}" with title "{safe_title}"'
+        error = _run_notification_command("osascript", ["osascript", "-e", script], timeout=2)
+        return "osascript", error
+    if sys.platform.startswith("linux"):
+        notifier = _find_executable("notify-send", ("/usr/bin/notify-send",))
+        if not notifier:
+            error = "notify-send was not found"
+            _log_notification_failure("notify-send", error)
+            return "notify-send", error
+        try:
+            proc = subprocess.run([notifier, "--help"], capture_output=True, text=True, timeout=2)
+            has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
+        except Exception as exc:
+            _log_notification_failure("notify-send capability check", exc)
+            has_action = False
+        if has_action:
+            def _linux_wait() -> None:
+                try:
+                    res = subprocess.run(
+                        [notifier, "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
+                        capture_output=True, text=True,
+                    )
+                    return_code = getattr(res, "returncode", 0)
+                    if isinstance(return_code, int) and return_code != 0:
+                        _log_notification_failure("notify-send", res.stderr or f"exited with status {return_code}")
+                    elif res.stdout and res.stdout.strip() == "open":
+                        _run_notification_command("xdg-open", ["xdg-open", url])
+                except Exception as exc:
+                    _log_notification_failure("notify-send", exc)
+
+            threading.Thread(target=_linux_wait, daemon=True).start()
+            return "notify-send", None
+        error = _run_notification_command("notify-send", [notifier, title, message], timeout=2)
+        return "notify-send", error
+    if sys.platform.startswith("win"):
+        xml_url = _escape_xml(url)
+        safe_title = _escape_xml(title).replace("'", "''")
+        safe_msg = _escape_xml(message).replace("'", "''")
+        xml = (
+            f'<toast activationType="protocol" launch="{xml_url}">'
+            f'<visual><binding template="ToastGeneric">'
+            f'<text>{safe_title}</text><text>{safe_msg}</text>'
+            f'</binding></visual></toast>'
+        )
+        app_id = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+        cmd = (
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+            "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
+            f"$xml = [Windows.Data.Xml.Dom.XmlDocument]::new(); $xml.LoadXml('{xml}'); "
+            f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+            f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast)"
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        error = _run_notification_command(
+            "Windows toast",
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
+            timeout=5,
+            creationflags=creationflags,
+        )
+        return "Windows toast", error
+    error = f"unsupported platform: {sys.platform}"
+    _log_notification_failure("desktop notification", error)
+    return "none", error
+
+
+def notify_if_still_waiting(key: str, message: str, still_waiting: Callable[[], bool], delay: float = 20.0,
+                            route: str = "workers") -> None:
     """Alert only for what's really waiting on the user: most requests are answered or launched within seconds."""
     def later() -> None:
         time.sleep(delay)
-        with contextlib.suppress(Exception):
+        try:
             if still_waiting():
-                notify_desktop_event(key, "Subway Context", message)
+                notify_desktop_event(key, "Subway Context", message, route=route)
+        except Exception as exc:
+            _log_notification_failure("waiting check", exc)
     threading.Thread(target=later, daemon=True).start()
 
 
-def notify_desktop_event(key: str, title: str, message: str) -> bool:
+def notify_desktop_event(key: str, title: str, message: str, route: str = "workers") -> bool:
     """Send one desktop notification per event, keyed in limit_pings.json so each event notifies once."""
     now = time.time()
-    with _state_lock("pings"):
-        sent = _load_json("limit_pings.json")
-        if key in sent:
-            return False
-        sent[key] = now
-        _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
-    _send_desktop_notification(title, message)
+    try:
+        with _state_lock("pings"):
+            sent = _load_json("limit_pings.json")
+            if key in sent:
+                return False
+            sent[key] = now
+            _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+    except Exception as exc:
+        _log_notification_failure("notification dedupe", exc)
+    _send_desktop_notification(title, message, route=route)
     return True
 
 
@@ -5646,8 +6021,8 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
                                         "text": f"Permission needed ({rid}): {tool}: {detail}"}) + "\n")
     _broadcast_track_internal(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
                               track=meta.get("track", "main"), station_id=meta["id"])
-    notify_if_still_waiting(f"permission_request|{rid}", f"Permission needed ({meta['id']}): {tool}",
-                            lambda: rid in {r["id"] for r in _pending_permissions()})
+    notify_if_still_waiting(f"permission_request|{meta['id']}|{rid}", f"Permission needed ({meta['id']}): {tool}",
+                            lambda: rid in {r["id"] for r in _pending_permissions()}, route="workers")
     return rid
 
 
@@ -5850,7 +6225,36 @@ def _check_cap(run: Dict[str, Any]) -> None:
         run["on_cap"](f"Stopped at {spent:,} of its {cap:,} token budget: the next call would pass it.")
 
 
-def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
+def _quota_error_event_text(event: Any) -> Optional[str]:
+    """Extract an explicit provider error payload without inspecting assistant messages."""
+    if not isinstance(event, dict):
+        return None
+    kind = str(event.get("type") or event.get("event") or "").lower()
+    if "assistant" in kind or kind in ("message", "text"):
+        return None
+    error = event.get("error")
+    if error is not None:
+        return json.dumps(error, ensure_ascii=False) if isinstance(error, (dict, list)) else str(error)
+    if kind in ("error", "error_event", "provider_error"):
+        return json.dumps(event, ensure_ascii=False)
+    return None
+
+
+def _pump_plain(proc: subprocess.Popen, out: Any, quota_handler: Callable[[str, str], None]) -> None:
+    """Log a non-structured provider stream while watching error-shaped lines."""
+    for raw in proc.stdout:  # type: ignore[union-attr]
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if not line:
+            continue
+        out.write((line + "\n").encode("utf-8", "replace"))
+        out.flush()
+        quota_handler(line, "stdout")
+
+
+def _pump_claude(
+    proc: subprocess.Popen, out: Any, run: Dict[str, Any],
+    quota_handler: Optional[Callable[[str, str], None]] = None,
+) -> None:
     """Read Claude's stream-json output, log text, track tokens and caps."""
     def write(text: str) -> None:
         out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
@@ -5864,7 +6268,12 @@ def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             ev = json.loads(line)
         except ValueError:
             write(line)
+            if quota_handler:
+                quota_handler(line, "stdout")
             continue
+        error_text = _quota_error_event_text(ev)
+        if error_text and quota_handler:
+            quota_handler(error_text, "error_event")
         kind = ev.get("type")
         run["conversation"] = ev.get("session_id") or run.get("conversation")  # A stopped run never reaches its result.
         if kind == "assistant":
@@ -5901,7 +6310,10 @@ def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             if run["response"]:
                 write(str(run["response"]))
 
-def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
+def _pump_agy(
+    proc: subprocess.Popen, out: Any, run: Dict[str, Any],
+    quota_handler: Optional[Callable[[str, str], None]] = None,
+) -> None:
     """Turn agy's event stream into a readable log, and note what got denied."""
     def write(text: str) -> None:
         out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
@@ -5915,11 +6327,16 @@ def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             ev = json.loads(line)
         except ValueError:
             write(line)
+            if quota_handler:
+                quota_handler(line, "stdout")
             # File tools don't report an error step: this notice is the only sign they were denied.
             m = re.search(r'required the "(\w+)" permission', line)
             if m and run.get("last_tool"):
                 run["last_error"] = (m.group(1), run["last_tool"])
             continue
+        error_text = _quota_error_event_text(ev)
+        if error_text and quota_handler:
+            quota_handler(error_text, "error_event")
         kind = ev.get("event")
         if kind == "init":
             run["conversation"] = ev.get("conversation_id") or run.get("conversation")
@@ -6103,7 +6520,10 @@ def parse_copilot_jsonl(stream: Any) -> Dict[str, Any]:
     return run
 
 
-def _pump_copilot(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
+def _pump_copilot(
+    proc: subprocess.Popen, out: Any, run: Dict[str, Any],
+    quota_handler: Optional[Callable[[str, str], None]] = None,
+) -> None:
     """Read Copilot's JSONL output, track text, tokens, credits and caps."""
     def write(text: str) -> None:
         out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
@@ -6119,7 +6539,12 @@ def _pump_copilot(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None
             ev = json.loads(line)
         except ValueError:
             write(line)
+            if quota_handler:
+                quota_handler(line, "stdout")
             continue
+        error_text = _quota_error_event_text(ev)
+        if error_text and quota_handler:
+            quota_handler(error_text, "error_event")
         _process_copilot_event(ev, run, write)
     if raw_lines:
         run["raw_output"] = "\n".join(raw_lines)
@@ -6185,11 +6610,14 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         want = step.get("include") or "patch"
         patch_text = ""
         if want in ("patch", "both"):
-            patch_file = meta.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
+            patch_file = (meta.get("patch_path") or meta.get("review_diff_path")
+                          or os.path.join(WORKERS_DIR, f"{worker_id}.patch"))
             with contextlib.suppress(OSError):
                 with open(patch_file, "r", encoding="utf-8", errors="replace") as f:
-                    patch_text = f.read(40000)
+                    patch_text = f.read(_REVIEW_DIFF_LIMIT)
         report_text = str(result.get("reason") or meta.get("report") or "").strip()
+        if not patch_text and meta.get("review_diff_note"):
+            patch_text = str(meta["review_diff_note"])
         if want in ("patch", "both") and not patch_text:
             patch_text = report_text[:40000]
         pieces = []
@@ -6285,6 +6713,366 @@ def t_on_worker_done(worker_id: str, then: str = "") -> str:
     return f"[TRIGGERS FIRED] Worker `{worker_id}` already finished; started its follow-up steps."
 
 
+DEFAULT_STALL_TIMEOUT = 120.0
+
+QUOTA_ERROR_PATTERNS: Dict[str, List[str]] = {
+    "opencode": [
+        r"free\s+usage\s+limit\s+reached",
+        r"usage\s+limit\s+reached",
+        r"rate\s+limit\s+exceeded",
+        r"resource_exhausted",
+    ],
+    "antigravity": [
+        r"usage\s+limit\s+reached",
+        r"rate\s+limit\s+exceeded",
+        r"resource_exhausted",
+    ],
+    "claude": [
+        r"usage\s+limit\s+reached",
+        r"rate\s+limit\s+exceeded",
+    ],
+    "copilot": [
+        r"usage\s+limit\s+reached",
+        r"rate\s+limit\s+exceeded",
+        r"is\s+not\s+available",
+    ],
+}
+
+
+def check_quota_error(provider: str, text: str, source: str = "stdout") -> Optional[str]:
+    """Match provider error shapes only; assistant response text is never a quota signal."""
+    if not text or source == "assistant":
+        return None
+    patterns = QUOTA_ERROR_PATTERNS.get(provider, [])
+    for line in text.splitlines() or [text]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_error_shape = (
+            source in ("stderr", "error_event")
+            or re.match(r"^(?:error\b|error:)", stripped, re.IGNORECASE) is not None
+            or re.search(r"\bHTTP\s*429\b", stripped, re.IGNORECASE) is not None
+        )
+        for pat in patterns:
+            match = re.search(pat, stripped, re.IGNORECASE)
+            if match:
+                stdout_prefix = re.fullmatch(
+                    r"(?:\s*(?:\[(?:error|warning)\]\s*|(?:api\s+)?error\b\s*:?\s*|[!✗]\s*|"
+                    r"(?:claude(?:\s+ai)?|copilot|antigravity|opencode)\b\s*[:,\-]?\s*))*",
+                    stripped[:match.start()],
+                    re.IGNORECASE,
+                )
+                if is_error_shape or (
+                    source == "stdout" and len(stripped) <= 300 and stdout_prefix is not None
+                ):
+                    return match.group(0)
+        if source == "error_event":
+            match = re.search(r"\b(?:status|code)[\"']?\s*[:=]\s*[\"']?429\b", stripped, re.IGNORECASE)
+            if match:
+                return "429"
+        if is_error_shape:
+            match = re.search(r"\bHTTP\s*429\b", stripped, re.IGNORECASE)
+            if match:
+                return match.group(0)
+    return None
+
+
+def get_stall_timeout(meta: Dict[str, Any]) -> float:
+    """Configurable stall timeout (default 120s; long thinking models get more)."""
+    cfg = _load_json("config.json")
+    val = (
+        meta.get("stall_timeout")
+        or os.environ.get("SUBWAY_STALL_TIMEOUT")
+        or (cfg.get("stall_timeout") if isinstance(cfg, dict) else None)
+        or (cfg.get("worker_stall_timeout") if isinstance(cfg, dict) else None)
+        or DEFAULT_STALL_TIMEOUT
+    )
+    try:
+        timeout = float(val)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_STALL_TIMEOUT
+    model = str(meta.get("model") or "").lower()
+    effort = str(meta.get("effort") or "").lower()
+    if "thinking" in model or effort in ("high", "max"):
+        timeout = max(timeout * 2, timeout + 120.0)
+    return timeout
+
+
+def _poll_opencode_worker_retry(
+    meta: Dict[str, Any],
+    started_at: float,
+    seen: Optional[Set[Tuple[str, str]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read an OpenCode worker's latest retry error without waiting on its database."""
+    db_path = os.path.join(OPENCODE_DIR, "opencode.db")
+    if not os.path.exists(db_path):
+        return None
+    worker_dir = meta.get("worktree") or meta.get("project_dir") or HOME
+    directory = os.path.abspath(worker_dir)
+    real_directory = os.path.realpath(directory)
+    uri_path = urllib.parse.quote(db_path, safe="/")
+    try:
+        con = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=0.1)
+        try:
+            con.execute("PRAGMA busy_timeout=100")
+            session = con.execute(
+                "select id from session_v2 where directory in (?, ?) and time_created>=? "
+                "order by time_created desc limit 1",
+                (directory, real_directory, int(started_at * 1000)),
+            ).fetchone()
+            if not session:
+                return None
+            message = con.execute(
+                "select seq, data from session_message where session_id=? and type='assistant' "
+                "order by seq desc limit 1",
+                (session[0],),
+            ).fetchone()
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if not message:
+        return None
+    seq, raw_data = message
+    try:
+        data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+    except (TypeError, ValueError):
+        return None
+    retry = data.get("retry") if isinstance(data, dict) else None
+    error = retry.get("error") if isinstance(retry, dict) else None
+    if not isinstance(error, dict):
+        return None
+
+    session_id = str(session[0])
+    error_type = one_line(str(error.get("type") or "unknown"), 120)
+    message_text = one_line(str(error.get("message") or ""), 500)
+    attempt = retry.get("attempt", "?")
+    retry_at = retry.get("at")
+    retry_key = (session_id, f"{seq}:{attempt}:{retry_at}:{error_type}:{message_text}")
+    if seen is not None and retry_key in seen:
+        return None
+    if seen is not None:
+        seen.add(retry_key)
+
+    try:
+        retry_clock = _dt.datetime.fromtimestamp(float(retry_at) / 1000).strftime("%H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        retry_clock = "--:--"
+    line = f"[opencode] {error_type}: {message_text} (retry {attempt} at {retry_clock})"
+    log_path = meta.get("log_file")
+    if log_path:
+        with contextlib.suppress(OSError):
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(line + "\n")
+
+    reason = f"{error_type}: {message_text}".strip(": ")
+    with _state_lock("workers"):
+        current = _load_worker(meta.get("id")) or meta
+        current["status_reason"] = reason
+        _save_worker(current)
+
+    quota_error = error_type.lower() == "provider.rate-limit" or bool(
+        check_quota_error("opencode", message_text, source="error_event")
+    )
+    result = None
+    if quota_error:
+        try:
+            reset_time = float(retry_at) / 1000
+        except (TypeError, ValueError):
+            reset_time = None
+        handler_reason = f"Quota/usage limit error: {reason}"
+        result = _handle_worker_exhaustion_or_stall(
+            str(meta.get("id") or ""), meta, handler_reason, is_stall=False, reset_time=reset_time,
+        )
+    return {"reason": reason, "quota": quota_error, "result": result}
+
+
+def _ping_launcher(launcher: str, text: str, from_id: str = "") -> None:
+    if not launcher:
+        return
+    _ensure_subway_dir()
+    targets = {launcher}
+    with contextlib.suppress(Exception):
+        res = resolve(launcher, strict=False)
+        if isinstance(res, dict) and "id" in res and res["id"]:
+            targets.add(res["id"])
+    inbox_dir = os.path.join(SUBWAY_DIR, "inbox")
+    os.makedirs(inbox_dir, exist_ok=True)
+    with contextlib.suppress(Exception):
+        with _state_lock("inbox"):
+            for tid in targets:
+                with open(os.path.join(inbox_dir, f"{tid}.jsonl"), "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "from": from_id or "subway",
+                        "shared_chat": None,
+                        "text": text,
+                    }) + "\n")
+
+
+def _handle_worker_exhaustion_or_stall(
+    worker_id: str,
+    meta: Dict[str, Any],
+    reason: str,
+    is_stall: bool = False,
+    reset_time: Optional[float] = None,
+) -> Dict[str, Any]:
+    """On quota/stall: stop worker, mark model exhausted, reroute once or mark failed."""
+    model = (meta.get("model") or "").strip()
+    if not model or model in ("auto", "inherit", "default"):
+        model = (meta.get("model_used") or "").strip()
+    if not model:
+        cmd = meta.get("cmd") or []
+        if "--model" in cmd:
+            idx = cmd.index("--model")
+            if idx + 1 < len(cmd):
+                model = cmd[idx + 1]
+    if not model:
+        model = meta.get("provider", "")
+
+    # Reset time when known, else a few hours
+    if reset_time is None and reason:
+        m_retry = re.search(r"retry\s+(?:after|in)\s+(\d+)", reason, re.IGNORECASE)
+        if m_retry:
+            reset_time = time.time() + float(m_retry.group(1))
+    if reset_time is None:
+        reset_time = time.time() + 4 * 3600
+
+    _mark_model_bad(model, reason=reason, reset_time=reset_time)
+    if "/" in model:
+        _mark_model_bad(model.split("/", 1)[1], reason=reason, reset_time=reset_time)
+    if (meta.get("provider") == "opencode"
+            and model.lower().split("/", 1)[-1].endswith("-free")
+            and re.search(r"free\s+usage\s+limit\s+reached", reason, re.IGNORECASE)):
+        for free_model in _opencode_models():
+            clean_model = str(free_model).lower().split("/", 1)[-1]
+            if clean_model.endswith("-free"):
+                _mark_model_bad(str(free_model), reason=reason, reset_time=reset_time)
+                if "/" in str(free_model):
+                    _mark_model_bad(str(free_model).split("/", 1)[1], reason=reason, reset_time=reset_time)
+
+    launcher = str(meta.get("launched_by") or "")
+
+    def fail_worker(fail_msg: str) -> Dict[str, Any]:
+        _ping_launcher(launcher, fail_msg, from_id=worker_id)
+        notify_desktop_event(
+            f"worker_stall_or_exhausted|{worker_id}", "Subway Context",
+            fail_msg[:500], route="workers",
+        )
+        return {"status": "failed", "exit_code": 1, "reason": fail_msg, "stall_alerted": True}
+
+    # Loop prevention: once per original task (no loops; keep a chain 'rerouted_from')
+    if meta.get("rerouted_from"):
+        fail_msg = f"Model '{model}' exhausted/stalled; worker `{worker_id}` was already rerouted from `{meta['rerouted_from']}`, not rerouting again."
+        return fail_worker(fail_msg)
+
+    # Route next model
+    prompt = meta.get("prompt", "")
+    role = meta.get("role", "")
+    private = bool(meta.get("private"))
+    is_god = meta.get("mode") == "god"
+    route = route_task(prompt, role=role, private=private, god=is_god)
+    picks = route.get("picks", [])
+
+    excluded = {model.lower(), (model.split("/", 1)[1] if "/" in model else model).lower()}
+    binaries = {
+        "claude": find_claude_binary(),
+        "opencode": find_opencode_binary(),
+        "antigravity": find_agy_binary(),
+        "local": find_opencode_binary(),
+        "copilot": find_copilot_binary(),
+    }
+    for cid, cp in {p["id"]: p for p in load_custom_providers()}.items():
+        binaries[cid] = shutil.which(cp.get("bin", ""))
+
+    next_cand = None
+    for cand in picks:
+        cand_m = (cand.get("model") or "").lower()
+        cand_m_clean = (cand_m.split("/", 1)[1] if "/" in cand_m else cand_m).lower()
+        if cand_m in excluded or cand_m_clean in excluded:
+            continue
+        if private and cand.get("provider") != "local":
+            continue
+        if _model_is_bad(cand.get("model") or ""):
+            continue
+        cand_prov = cand.get("provider", "")
+        if not binaries.get(cand_prov):
+            continue
+        next_cand = cand
+        break
+
+    if not next_cand:
+        no_candidate_reason = route.get("reason", "no candidates")
+        if private:
+            no_candidate_reason = f"Private worker cannot leave the local provider; no alternative local model is available. {no_candidate_reason}"
+        fail_msg = f"Model '{model}' exhausted/stalled and no alternative model available to reroute: {no_candidate_reason}"
+        return fail_worker(fail_msg)
+
+    # Keep the original request intact and only replace the provider/model choice.
+    spin_args = dict(meta.get("spin_args") or {})
+    if not spin_args:
+        budget = meta.get("budget") or {}
+        then = meta.get("then") or []
+        spin_args = {
+            "role": meta.get("role", ""),
+            "prompt": prompt,
+            "track": meta.get("track", "main"),
+            "project_dir": meta.get("project_dir", ""),
+            "timeout_seconds": int(meta.get("timeout_seconds") or DEFAULT_WORKER_TIMEOUT),
+            "effort": meta.get("effort", "auto"),
+            "mode": meta.get("mode", "standard"),
+            "permission_mode": meta.get("permission_mode", ""),
+            "capabilities": meta.get("capabilities"),
+            "budget_session_pct": budget.get("session_pct"),
+            "budget_weekly_pct": budget.get("weekly_pct"),
+            "max_budget_usd": budget.get("max_usd"),
+            "max_tokens": int(budget.get("max_tokens") or 0),
+            "max_seconds": int(budget.get("max_seconds") or 0),
+            "thread": meta.get("thread", ""),
+            "private": private,
+            "isolate": bool(meta.get("isolate")),
+            "priority": meta.get("priority", "normal"),
+            "swarm_id": meta.get("swarm_id", ""),
+            "then": json.dumps(then) if isinstance(then, list) else then,
+            "review": meta.get("review", ""),
+        }
+    spin_args.pop("provider", None)
+    spin_args.pop("model", None)
+    spin_args.update(provider=next_cand["provider"], model=next_cand["model"])
+    spin_res = t_spin_worker(**spin_args)
+
+    m_wid = re.search(r"Worker `(worker_[0-9a-f]+)`", spin_res)
+    if not m_wid:
+        fail_msg = f"Model '{model}' exhausted/stalled; reroute failed: {spin_res}"
+        return fail_worker(fail_msg)
+
+    new_worker_id = m_wid.group(1)
+    with _state_lock("workers"):
+        new_meta = _load_worker(new_worker_id)
+        if new_meta:
+            new_meta["rerouted_from"] = worker_id
+            if meta.get("launched_by"):
+                new_meta["launched_by"] = meta.get("launched_by")
+            if meta.get("priority"):
+                new_meta["priority"] = meta.get("priority")
+            if meta.get("review"):
+                new_meta["review"] = meta.get("review")
+            if meta.get("then") and not new_meta.get("then"):
+                new_meta["then"] = meta.get("then")
+            _save_worker(new_meta)
+
+    ping_text = f"Worker `{worker_id}` model `{model}` exhausted/stalled. Task rerouted to `{next_cand['model']}` (`{new_worker_id}`)."
+    _ping_launcher(launcher, ping_text, from_id=worker_id)
+    t_broadcast_track(ping_text, track=meta.get("track", "main"), station_id=worker_id)
+
+    return {
+        "status": "stopped",
+        "exit_code": 0,
+        "reason": f"Model '{model}' exhausted/stalled; stopped and rerouted to `{new_worker_id}` ({next_cand['model']}).",
+        "rerouted_to": new_worker_id,
+    }
+
+
 def supervise_worker(worker_id: str) -> int:
     """Own one worker: enforce its timeout, relay permission requests, and record how it really ended."""
     meta = _load_worker(worker_id)
@@ -6292,6 +7080,8 @@ def supervise_worker(worker_id: str) -> int:
         return 2
     stopped = {"flag": False}
     current: Dict[str, Optional[subprocess.Popen]] = {"proc": None}
+    budget_stop_event = threading.Event()
+    budget_thread: Optional[threading.Thread] = None
 
     def _on_term(_sig: int, _frame: Any) -> None:
         stopped["flag"] = True
@@ -6350,7 +7140,7 @@ def supervise_worker(worker_id: str) -> int:
             except Exception:
                 return 0
         prov_tok_start = _fetch_prov_tok()
-        while not stopped["flag"]:
+        while not stopped["flag"] and not budget_stop_event.is_set():
             try:
                 record = next((p for p in discover_connected_providers() if p["id"] == meta.get("provider")), None)
                 pool = _select_pool(record, meta.get("model", "")) if record else None
@@ -6370,9 +7160,10 @@ def supervise_worker(worker_id: str) -> int:
                 if spent >= float(cap):
                     budget_stop(f"Stopped at its budget: {spent:.1f} points of the {w['label']} limit, cap {cap}.")
                     return
-            time.sleep(30)
+            budget_stop_event.wait(30)
 
-    threading.Thread(target=budget_watch, daemon=True).start()
+    budget_thread = threading.Thread(target=budget_watch, name=f"worker-budget-{worker_id}", daemon=True)
+    budget_thread.start()
 
     def remaining() -> Optional[float]:
         return None if deadline is None else max(1.0, deadline - time.time())
@@ -6392,13 +7183,20 @@ def supervise_worker(worker_id: str) -> int:
     if meta.get("kind") == "batch":
         result = run_batch(meta, stopped, deadline, save_progress)
         _write_json_atomic(_exit_file(worker_id), result)
+        stopped["flag"] = True
+        budget_stop_event.set()
+        budget_thread.join(timeout=2)
         return 0
     if is_local and not _wait_for_memory(meta["model"], stopped, min(remaining() or 900, 900)):
         reason = "Stopped on request." if stopped["flag"] else "Not enough free memory for this model within 15 minutes."
         _write_json_atomic(_exit_file(worker_id), {"status": "stopped" if stopped["flag"] else "failed", "exit_code": None, "reason": reason})
+        stopped["flag"] = True
+        budget_stop_event.set()
+        budget_thread.join(timeout=2)
         return 0
     try:
         with open(meta["log_file"], "ab") as out:
+            worker_started_at = time.time()
             while True:
                 run = shared_spent
                 workdir = meta.get("worktree") or meta.get("project_dir") or HOME
@@ -6409,22 +7207,108 @@ def supervise_worker(worker_id: str) -> int:
                 env["SUBWAY_WORKER_ID"] = meta["id"]
                 env["SUBWAY_STATION_ID"] = meta["id"]
                 proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
-                                        stdout=subprocess.PIPE if (is_agy or is_claude or is_acp or is_copilot) else out, stderr=subprocess.STDOUT)
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 current["proc"] = proc
                 pump = None
+                stall_timeout = get_stall_timeout(meta)
+                stall_event = threading.Event()
+                start_time = time.time()
+                next_opencode_check = start_time
+                opencode_retries_seen: Set[Tuple[str, str]] = set()
+                has_output = {"seen": False}
+                run["has_output"] = has_output
+
+                def quota_handler(text: str, source: str) -> None:
+                    q_err = check_quota_error(str(meta.get("provider") or ""), text, source=source)
+                    if not q_err or stopped.get("quota_error"):
+                        return
+                    if (meta.get("provider") == "copilot"
+                            and "from --model flag is not available" in text.lower()):
+                        return
+                    stopped["quota_error"] = f"Quota/usage limit error: {q_err}"
+                    stopped["flag"] = True
+                    if proc.poll() is None:
+                        with contextlib.suppress(OSError):
+                            proc.terminate()
+
+                def pump_stderr() -> None:
+                    for raw in proc.stderr:  # type: ignore[union-attr]
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if line:
+                            out.write((line + "\n").encode("utf-8", "replace"))
+                            out.flush()
+                            quota_handler(line, "stderr")
+
+                def stall_watchdog() -> None:
+                    nonlocal next_opencode_check
+                    while not stall_event.is_set() and not stopped["flag"]:
+                        if is_acp and meta.get("provider") == "opencode" and time.time() >= next_opencode_check:
+                            next_opencode_check = time.time() + 3
+                            retry = _poll_opencode_worker_retry(meta, worker_started_at, opencode_retries_seen)
+                            if retry and retry.get("quota"):
+                                stopped["quota_error"] = f"Quota/usage limit error: {retry['reason']}"
+                                stopped["quota_result"] = retry.get("result")
+                                stopped["quota_handled"] = True
+                                stopped["flag"] = True
+                                if run.get("conversation") and proc.poll() is None:
+                                    with contextlib.suppress(Exception):
+                                        proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                                        proc.stdin.flush()
+                                if proc.poll() is None:
+                                    proc.terminate()
+                                return
+                        if not has_output["seen"]:
+                            log_p = meta.get("log_file")
+                            if log_p and os.path.exists(log_p) and os.path.getsize(log_p) > 0:
+                                has_output["seen"] = True
+                            elif run.get("spent", 0) > 0:
+                                has_output["seen"] = True
+                        if not has_output["seen"] and (time.time() - start_time) >= stall_timeout:
+                            stopped["stall"] = f"No output at all for {int(stall_timeout)}s after start."
+                            stopped["flag"] = True
+                            if is_acp and run.get("conversation") and proc.poll() is None:
+                                with contextlib.suppress(Exception):
+                                    proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                                    proc.stdin.flush()
+                            if proc.poll() is None:
+                                proc.terminate()
+                            return
+                        stall_event.wait(0.2)
+
+                stall_thread = threading.Thread(
+                    target=stall_watchdog, name=f"worker-stall-{worker_id}", daemon=True,
+                )
+                stall_thread.start()
+                stderr_thread = threading.Thread(
+                    target=pump_stderr, name=f"worker-stderr-{worker_id}", daemon=True,
+                )
+                stderr_thread.start()
+
                 if is_agy or is_claude or is_acp or is_copilot:
                     run["spent"] = max(run.get("spent", 0), sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output")))
                     run["cap"], run["on_cap"] = turn_cap or int(budget.get("max_tokens") or 0), budget_stop
                     run["soft"] = run["cap"] * 2 // 3 if not wrapped_up else 0
                     if is_acp:
-                        pump = threading.Thread(target=_pump_opencode, args=(proc, out, run, meta, stopped), daemon=True)
+                        pump = threading.Thread(
+                            target=_pump_opencode, args=(proc, out, run, meta, stopped, quota_handler),
+                            name=f"worker-output-{worker_id}", daemon=True,
+                        )
                     else:
                         target_pump = _pump_agy if is_agy else (_pump_copilot if is_copilot else _pump_claude)
-                        pump = threading.Thread(target=target_pump, args=(proc, out, run), daemon=True)
-                    pump.start()
+                        pump = threading.Thread(
+                            target=target_pump, args=(proc, out, run, quota_handler),
+                            name=f"worker-output-{worker_id}", daemon=True,
+                        )
+                else:
+                    pump = threading.Thread(
+                        target=_pump_plain, args=(proc, out, quota_handler),
+                        name=f"worker-output-{worker_id}", daemon=True,
+                    )
+                pump.start()
                 try:
                     code = proc.wait(timeout=remaining())
                 except subprocess.TimeoutExpired:
+                    stall_event.set()
                     if is_acp and run.get("conversation") and proc.poll() is None:
                         with contextlib.suppress(Exception):
                             proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
@@ -6435,10 +7319,26 @@ def supervise_worker(worker_id: str) -> int:
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         code = proc.wait()
+                    stall_event.set()
+                    pump.join(timeout=5)
+                    stderr_thread.join(timeout=5)
+                    stall_thread.join(timeout=1)
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if callable(getattr(stream, "close", None)):
+                            with contextlib.suppress(OSError):
+                                stream.close()
                     result = {"status": "timed_out", "exit_code": code, "reason": f"Stopped after the {limit}s timeout."}
                     break
+                stall_event.set()
                 if pump:
                     pump.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                stall_thread.join(timeout=1)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if callable(getattr(stream, "close", None)):
+                        with contextlib.suppress(OSError):
+                            stream.close()
+                if pump:
                     save_kwargs = {}
                     if run.get("model_used"):
                         meta["model_used"] = run["model_used"]
@@ -6459,6 +7359,14 @@ def supervise_worker(worker_id: str) -> int:
                         diff = run["spent"] - (int(usage.get("input") or 0) + int(usage.get("output") or 0))
                         usage["input"] = int(usage.get("input") or 0) + diff
                         save_progress(usage=usage)
+
+                if stopped.get("stall") or stopped.get("quota_error"):
+                    reason = str(stopped.get("stall") or stopped.get("quota_error"))
+                    if stopped.get("quota_handled"):
+                        result = stopped.get("quota_result") or {"status": "failed", "exit_code": code, "reason": reason}
+                    else:
+                        result = _handle_worker_exhaustion_or_stall(worker_id, meta, reason, is_stall=bool(stopped.get("stall")))
+                    break
 
                 if stopped["flag"]:
                     fresh_meta = _load_worker(worker_id) or meta
@@ -6561,6 +7469,13 @@ def supervise_worker(worker_id: str) -> int:
                             used_m = cmd[idx + 1]
                     if used_m and used_m != "auto":
                         record_copilot_cli_accepted(used_m)
+
+                raw_out = run.get("raw_output") or ""
+                if not raw_out and os.path.exists(meta.get("log_file", "")):
+                    with contextlib.suppress(Exception):
+                        with open(meta["log_file"], "r", encoding="utf-8", errors="replace") as f:
+                            raw_out = f.read()
+
                 if code != 0:
                     fresh_meta = _load_worker(worker_id) or meta
                     stop_r = fresh_meta.get("stop_reason") or ""
@@ -6579,6 +7494,9 @@ def supervise_worker(worker_id: str) -> int:
                 break
     except OSError as exc:
         result = {"status": "failed", "exit_code": None, "reason": f"Could not start agent: {exc}"}
+    stopped["flag"] = True
+    budget_stop_event.set()
+    budget_thread.join(timeout=2)
     if is_local and local_profile(memory_snapshot()["total"])["keep_alive"] == "0":
         _unload_local(meta["model"])  # On a small machine, memory goes back the moment the work ends.
     fresh = _load_worker(worker_id) or meta
@@ -6593,14 +7511,24 @@ def supervise_worker(worker_id: str) -> int:
                 _save_worker(fresh)
         except (OSError, subprocess.SubprocessError) as exc:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
-    if result.get("status") == "completed" and fresh.get("isolate"):
-        prompt = fresh.get("prompt") or ""
-        _settle_isolated_result(result, prompt, wt_note, str(run.get("response") or ""))
+    no_changes = bool(fresh.get("isolate") and wt_note == "No files changed.")
+    if result.get("status") == "completed" and fresh.get("git_state_before"):
+        try:
+            no_changes = _git_change_fingerprint(fresh.get("project_dir") or HOME) == fresh["git_state_before"]
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["status"] = "failed"
+            result["reason"] = f"Could not verify worker changes: {exc}"
+    if result.get("status") == "completed" and (fresh.get("isolate") or fresh.get("git_state_before")):
+        _settle_worker_result(result, fresh, no_changes, str(run.get("response") or ""))
         if result.get("status") == "completed":
             patch_file = fresh.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
-            if os.path.exists(patch_file):
+            if fresh.get("isolate") and os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
                     verify_worker(worker_id)
+    if (result.get("status") == "completed" and not fresh.get("isolate")
+            and any(step.get("verdict") for step in fresh.get("then") or [])):
+        _capture_in_place_review_diff(fresh)
+        _save_worker(fresh)
     with contextlib.suppress(Exception):
         result["response"] = str(run.get("response") or "")
     _write_json_atomic(_exit_file(worker_id), result)
@@ -6841,7 +7769,10 @@ def _opencode_session_tokens(session_id: str) -> Dict[str, int]:
     return {}
 
 
-def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: Dict[str, Any], stopped: Dict[str, Any]) -> None:
+def _pump_opencode(
+    proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: Dict[str, Any], stopped: Dict[str, Any],
+    quota_handler: Optional[Callable[[str, str], None]] = None,
+) -> None:
     """Run OpenCode / local agent via ACP protocol over stdin/stdout pipes."""
     def write(text: str) -> None:
         out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
@@ -6881,6 +7812,7 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
     curr_config_id = None
     response_chunks: List[str] = []
     stop_monitor = threading.Event()
+    monitor_threads: List[threading.Thread] = []
     cancel_sent = False
     last_msg_time = time.time()
     had_tool_call = False
@@ -6904,7 +7836,9 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 return
             stop_monitor.wait(0.05 if timeout < 5 else 1.0)
 
-    threading.Thread(target=watchdog, daemon=True).start()
+    watchdog_thread = threading.Thread(target=watchdog, name="opencode-worker-watchdog", daemon=True)
+    monitor_threads.append(watchdog_thread)
+    watchdog_thread.start()
 
     def monitor_tokens(sid: str) -> None:
         nonlocal cancel_sent
@@ -6913,9 +7847,11 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
             hit = None
             with contextlib.suppress(Exception):
                 hit = _fetch_opencode_usage().get("limit_hit")
-            if run.get("on_cap") and hit and hit.get("at", 0) >= began and hit.get("model") == meta.get("model"):
+            if hit and hit.get("at", 0) >= began and (not hit.get("model") or hit.get("model") == meta.get("model")):
                 send_cancel()
-                run["on_cap"](f"OpenCode's free limit was reached, so it stopped instead of sitting in a retry loop. {hit['message']}")
+                stopped["quota_error"] = f"OpenCode free limit reached: {hit['message']}"
+                stopped["flag"] = True
+                proc.terminate()
                 return
 
             toks = _opencode_session_tokens(sid)
@@ -6944,7 +7880,12 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 msg = json.loads(line)
             except ValueError:
                 write(line)
+                if quota_handler:
+                    quota_handler(line, "stdout")
                 continue
+            error_text = _quota_error_event_text(msg)
+            if error_text and quota_handler:
+                quota_handler(error_text, "error_event")
 
             msg_id = msg.get("id")
             method = msg.get("method")
@@ -6963,7 +7904,11 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 session_id = res.get("sessionId")
                 run["conversation"] = session_id
                 if session_id:
-                    threading.Thread(target=monitor_tokens, args=(session_id,), daemon=True).start()
+                    monitor_thread = threading.Thread(
+                        target=monitor_tokens, args=(session_id,), name="opencode-token-poller", daemon=True,
+                    )
+                    monitor_threads.append(monitor_thread)
+                    monitor_thread.start()
 
                 if config_ops:
                     cfg_id, cfg_val = config_ops.pop(0)
@@ -7131,6 +8076,9 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 continue
     finally:
         stop_monitor.set()
+        for monitor_thread in monitor_threads:
+            if monitor_thread is not threading.current_thread():
+                monitor_thread.join(timeout=3)
         if session_id and not run.get("usage"):
             final_toks = _opencode_session_tokens(session_id)
             if final_toks:
@@ -7252,6 +8200,7 @@ def _worker_detail(m: Dict[str, Any]) -> str:
         f"- **Mode**: {m.get('mode', 'standard').upper()}",
         f"- **Effort**: {m.get('effort', 'auto')}",
         f"- **Status**: [{m.get('status', 'unknown').upper()}]",
+        *([f"- **Reason**: {m.get('status_reason')}"] if m.get("status_reason") else []),
         f"- **Exit code**: {code}",
         f"- **PID**: {m.get('pid')}",
         f"- **Track**: {m.get('track')}",
@@ -7288,7 +8237,8 @@ def worker_listing(track: str = "", show_codes: bool = False) -> str:
         arch = ", archived" if r.get("archived") else ""
         ticket = f" | approval code: {approval_code(r['id'])}" if show_codes and r.get("status") == "pending_approval" else ""
         lines.append(f"- `{r.get('id')}` [{r.get('provider', '').upper()}{god}] **{r.get('role')}** :: "
-                     f"[{r.get('status', '').upper()}] (PID {r.get('pid')}{code}, track: {r.get('track')}{arch}){ticket}")
+                     f"[{r.get('status', '').upper()}] (PID {r.get('pid')}{code}, track: {r.get('track')}{arch})"
+                     f"{' :: ' + str(r.get('status_reason')) if r.get('status_reason') else ''}{ticket}")
     for wid in orphan_logs:
         lines.append(f"- `{wid}` :: log only, metadata was deleted. Read `{_log_file(wid)}`.")
     for wid, tr in sorted(remembered.items()):
@@ -7673,29 +8623,58 @@ def _window_totals(events: List[Tuple[float, int, int, int]], now: float) -> Dic
     return totals
 
 
+_ledger_cache: Dict[Any, Dict[str, Any]] = {}
+
+
 def _scan_ledger(paths: List[str], parse: Callable[[str], List[Tuple[float, int, int, int]]]) -> Dict[str, Dict[str, int]]:
     """Token windows across transcripts, re-reading only files that changed."""
     now = time.time()
-    events: List[Tuple[float, int, int, int]] = []
+    state = _ledger_cache.setdefault(parse, {"last_scan": 0.0, "last_result": None, "files": {}})
+    last_scan = state.get("last_scan", 0.0)
+    last_result = state.get("last_result")
+    files: Dict[str, Tuple[Tuple[float, int], List[Tuple[float, int, int, int]]]] = state["files"]
+
+    current_paths = set(paths)
+    any_changed = False
+
+    for p in list(files.keys()):
+        if p not in current_paths:
+            del files[p]
+            any_changed = True
+
     for p in paths:
         try:
             st = os.stat(p)
         except OSError:
+            if p in files:
+                del files[p]
+                any_changed = True
             continue
         if st.st_mtime < now - SEVEN_D:
+            if p in files:
+                del files[p]
+                any_changed = True
             continue
         key = (st.st_mtime, st.st_size)
-        cached = _ledger_files.get(p)
-        if cached and cached[0] == key:
-            events.extend(cached[1])
+        cached = files.get(p)
+        if cached is not None and cached[0] == key:
             continue
+        any_changed = True
         try:
             parsed = parse(p)
         except OSError:
             continue
+        files[p] = (key, parsed)
         _ledger_files[p] = (key, parsed)
-        events.extend(parsed)
-    return _window_totals(events, now)
+
+    if not any_changed and last_result is not None and (now - last_scan < 60.0):
+        return last_result
+
+    events = [ev for _, file_events in files.values() for ev in file_events]
+    result = _window_totals(events, now)
+    state["last_scan"] = now
+    state["last_result"] = result
+    return result
 
 
 _usage_tails: Dict[str, Tuple[int, Dict[str, Tuple[float, int, int, int]]]] = {}
@@ -7994,6 +8973,8 @@ def _wait_for_memory(model: str, stopped: Dict[str, bool], wait: float) -> bool:
 
 # ---- Source registry ------------------------------------------------------
 
+SOURCE_DEADLINE: float = float(os.environ.get("SUBWAY_SOURCE_DEADLINE", "1.5"))
+
 _SOURCES: Dict[str, Tuple[Callable[[], Dict[str, Any]], float]] = {
     "agy_limits": (_fetch_agy_limits, 10.0),
     "agy_tokens": (_fetch_agy_tokens, 30.0),
@@ -8005,40 +8986,134 @@ _SOURCES: Dict[str, Tuple[Callable[[], Dict[str, Any]], float]] = {
 }
 _SHARED_SOURCES = ("agy_limits", "claude_live")  # Reused across processes, and kept as last-known values.
 
+_source_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="subway-source")
+_source_in_flight: Dict[str, Tuple[concurrent.futures.Future, Any]] = {}
+_source_in_flight_lock = threading.Lock()
 
-def _refresh_source(name: str) -> Dict[str, Any]:
+
+def _run_source_task(name: str) -> Dict[str, Any]:
     fn, _ttl = _SOURCES[name]
     t0 = time.time()
     try:
         data, err = fn(), None
-    except Exception as e:  # Any failure of an outside tool becomes a visible source error.
+    except Exception as e:
         data, err = None, one_line(str(e), 160)
     now = time.time()
     with _usage_lock:
         rec = dict(_usage.get(name) or {})
-        rec.update({"checked_at": now, "latency_ms": int((now - t0) * 1000), "error": err})
+        rec.update({
+            "checked_at": now,
+            "latency_ms": int((now - t0) * 1000),
+            "error": err,
+            "loading": False,
+            "stale": False,
+        })
+        rec.pop("age", None)
         if data is not None:
             rec.update({"data": data, "fetched_at": now})
         _usage[name] = rec
-    if data is not None and name in _SHARED_SOURCES:
+
+    if data is not None:
         with _state_lock("usage"):
             shared = _load_json("usage_cache.json")
             shared[name] = {"data": data, "fetched_at": now}
             _save_json("usage_cache.json", shared)
+
+    with _source_in_flight_lock:
+        entry = _source_in_flight.get(name)
+        if entry and entry[0].done():
+            _source_in_flight.pop(name, None)
+
+    with _hud_cache_lock:
+        for entry in _hud_cache.values():
+            entry["stale"] = True
+            if "data" in entry and isinstance(entry["data"], dict) and "quotas" in entry["data"]:
+                lq = getattr(sys.modules[__name__], "load_quotas", None)
+                if lq is not None:
+                    entry["data"]["quotas"] = lq(refresh=False)
+
     return rec
+
+
+def _fallback_source_record(name: str) -> Dict[str, Any]:
+    now = time.time()
+    saved = None
+    with _state_lock("usage"):
+        shared = _load_json("usage_cache.json")
+        saved = shared.get(name)
+
+    if saved and saved.get("data") is not None:
+        fetched_at = saved.get("fetched_at", now)
+        age = max(0.0, round(now - fetched_at, 1))
+        rec = {
+            "data": saved["data"],
+            "fetched_at": fetched_at,
+            "stale": True,
+            "age": age,
+            "loading": False,
+            "checked_at": now,
+            "latency_ms": None,
+            "error": None,
+        }
+    else:
+        rec = {
+            "data": None,
+            "fetched_at": None,
+            "stale": False,
+            "loading": True,
+            "checked_at": now,
+            "latency_ms": None,
+            "error": None,
+        }
+    with _usage_lock:
+        cur = _usage.get(name)
+        if not cur or cur.get("loading") or not cur.get("data"):
+            _usage[name] = rec
+    return rec
+
+
+def _refresh_source(name: str, deadline: Optional[float] = None) -> Dict[str, Any]:
+    if name not in _SOURCES:
+        return {}
+    if deadline is None:
+        deadline = SOURCE_DEADLINE
+
+    cur_fn = _SOURCES[name][0]
+    with _source_in_flight_lock:
+        entry = _source_in_flight.get(name)
+        if entry is not None:
+            fut, fn = entry
+            if fut.done() or fn != cur_fn:
+                _source_in_flight.pop(name, None)
+                entry = None
+        if entry is None:
+            fut = _source_pool.submit(_run_source_task, name)
+            _source_in_flight[name] = (fut, cur_fn)
+        else:
+            fut, _ = entry
+
+    if deadline <= 0:
+        with _usage_lock:
+            rec = _usage.get(name)
+        return rec or _fallback_source_record(name)
+
+    try:
+        return fut.result(timeout=deadline)
+    except (concurrent.futures.TimeoutError, TimeoutError):
+        return _fallback_source_record(name)
 
 
 def _source(name: str, max_age: Optional[float] = None) -> Dict[str, Any]:
     """A source's latest record, refreshed if older than max_age. None never refreshes."""
     with _usage_lock:
         rec = _usage.get(name)
-    if name in _SHARED_SOURCES and (not rec or not rec.get("data")):
+    if not rec or not rec.get("data"):
         saved = _load_json("usage_cache.json").get(name)
         if saved:
             with _usage_lock:
                 rec = dict(saved, **(_usage.get(name) or {}))
                 _usage[name] = rec
-    if max_age is not None and (not rec or time.time() - rec.get("checked_at", 0) > max_age):
+    if max_age is not None and (not rec or rec.get("loading") or rec.get("stale") or time.time() - rec.get("checked_at", 0) > max_age):
         rec = _refresh_source(name)
     return rec or {}
 
@@ -8055,7 +9130,7 @@ def _sampler_loop() -> None:
                 continue
             rec = _usage.get(name) or {}
             if now - rec.get("checked_at", 0) >= ttl:
-                _refresh_source(name)
+                _refresh_source(name, deadline=0.0)
         if now - last_slow >= 10:  # Neither needs checking every second.
             last_slow = now
             with contextlib.suppress(Exception):
@@ -8222,6 +9297,8 @@ def _state_of(fetched_at: Optional[float], live_for: float) -> str:
 
 
 _other_sessions_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+_other_sessions_refreshing: Set[str] = set()
+_other_sessions_refresh_lock = threading.Lock()
 
 
 def _other_sessions(provider: str) -> Optional[Dict[str, Any]]:
@@ -8232,6 +9309,33 @@ def _other_sessions(provider: str) -> Optional[Dict[str, Any]]:
     res = _other_sessions_uncached(provider, now)
     _other_sessions_cache[provider] = (now, res)
     return res
+
+
+def _other_sessions_for_hud(provider: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    cached = _other_sessions_cache.get(provider)
+    if cached and now - cached[0] < 60.0:
+        return cached[1]
+    with _other_sessions_refresh_lock:
+        if provider not in _other_sessions_refreshing:
+            _other_sessions_refreshing.add(provider)
+
+            def refresh() -> None:
+                try:
+                    _other_sessions(provider)
+                finally:
+                    with _other_sessions_refresh_lock:
+                        _other_sessions_refreshing.discard(provider)
+
+            threading.Thread(target=refresh, daemon=True).start()
+    return cached[1] if cached else None
+
+
+def _source_record_age(rec: Dict[str, Any]) -> Optional[float]:
+    fetched_at = rec.get("fetched_at")
+    if rec.get("stale") and isinstance(fetched_at, (int, float)):
+        return max(0.0, round(time.time() - fetched_at, 1))
+    return rec.get("age")
 
 
 def _other_sessions_uncached(provider: str, now: float) -> Optional[Dict[str, Any]]:
@@ -8320,8 +9424,18 @@ def _other_sessions_uncached(provider: str, now: float) -> Optional[Dict[str, An
 
 
 def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
-    cached_rec = _source("claude_cached", 3.0 if refresh else None)
-    live_rec = _source("claude_live", 120.0 if refresh else None)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    try:
+        f_cached = pool.submit(_source, "claude_cached", 3.0 if refresh else None)
+        f_live = pool.submit(_source, "claude_live", 120.0 if refresh else None)
+        f_tokens = pool.submit(_source, "claude_tokens", 15.0 if refresh else None)
+        cached_rec = f_cached.result()
+        live_rec = f_live.result()
+        tokens_rec = f_tokens.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    other_sessions = _other_sessions_for_hud("claude")
+
     cached = cached_rec.get("data") or {}
     live = live_rec.get("data") or {}
     live_at = live_rec.get("fetched_at")
@@ -8336,32 +9450,48 @@ def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         reset = w.get("resets_at") or (fallback.get(key) or {}).get("resets_at")
         windows.append(_window(wk, label, w.get("used_pct"), reset))
 
-    state = _state_of(fetched_at, LIVE_SECONDS["claude"])
+    is_loading = bool(live_rec.get("loading"))
+    is_stale = bool(live_rec.get("stale"))
+    age = _source_record_age(live_rec)
+    state = "loading" if is_loading else ("stale" if is_stale else _state_of(fetched_at, LIVE_SECONDS["claude"]))
     source = "Claude Code /usage" if use_live else "Claude Code cache (~/.claude.json)"
-    error = live_rec.get("error") if not use_live else None
+    error = live_rec.get("error") if (not use_live and not is_loading and not is_stale) else None
     return {"plan": cached.get("plan") or "", "state": state, "source": source, "fetched_at": fetched_at,
             "latency_ms": live_rec.get("latency_ms") if use_live else cached_rec.get("latency_ms"),
             "pools": [{"key": "claude", "name": "Subscription", "windows": windows}] if fetched_at else [],
-            "tokens": (_source("claude_tokens", 15.0 if refresh else None).get("data")),
-            "other_sessions": _other_sessions("claude"),
+            "tokens": tokens_rec.get("data"),
+            "other_sessions": other_sessions,
             "error": error,
-            "note": "" if fetched_at else "Claude Code has not reported usage yet."}
+            "note": "" if (fetched_at or is_loading) else "Claude Code has not reported usage yet.",
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 def _agy_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
-    rec = _source("agy_limits", 10.0 if refresh else None)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
+        f_rec = pool.submit(_source, "agy_limits", 10.0 if refresh else None)
+        f_tokens = pool.submit(_source, "agy_tokens", 15.0 if refresh else None)
+        rec = f_rec.result()
+        tokens_rec = f_tokens.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    other_sessions = _other_sessions_for_hud("antigravity")
     data = rec.get("data") or {}
-    tokens = _source("agy_tokens", 15.0 if refresh else None).get("data")
-    state = _state_of(rec.get("fetched_at"), LIVE_SECONDS["antigravity"])
+    tokens = tokens_rec.get("data")
+    is_loading = bool(rec.get("loading"))
+    is_stale = bool(rec.get("stale"))
+    age = _source_record_age(rec)
+    state = "loading" if is_loading else ("stale" if is_stale else _state_of(rec.get("fetched_at"), LIVE_SECONDS["antigravity"]))
     note = ""
     if state == "stale":
         note = "Antigravity isn't answering, so these are the last known limits."
-    elif state == "unavailable":
+    elif state == "unavailable" and not is_loading:
         note = "Open Antigravity to read its limits."
     return {"plan": data.get("plan") or "", "state": state, "source": "Antigravity language server",
             "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"),
-            "pools": data.get("pools") or [], "tokens": tokens, "other_sessions": _other_sessions("antigravity"),
-            "error": rec.get("error"), "note": note}
+            "pools": data.get("pools") or [], "tokens": tokens, "other_sessions": other_sessions,
+            "error": rec.get("error") if not (is_loading or is_stale) else None, "note": note,
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 @ttl_cached(120.0)
@@ -8625,32 +9755,43 @@ def _kimi_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
 def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     rec = _source("opencode", 5.0 if refresh else None)
     data = rec.get("data") or {}
+    is_loading = bool(rec.get("loading"))
+    is_stale = bool(rec.get("stale"))
+    age = _source_record_age(rec)
     plan = "Signed-in provider" if data.get("signed_in") else "Free models, no account" if data else ""
     hit = data.get("limit_hit")
     note = "OpenCode doesn't publish a remaining free allowance, so limits show only when one is hit."
     if hit and (time.time() - hit.get("at", 0) <= 86400):
         model_name = hit.get("model") or data.get("model") or "Free model"
         note = f"{model_name} hit its free limit at {fmt_ts(hit['at'])}; other free models may still run"
-    return {"plan": plan, "state": "live" if data else "unavailable", "source": "OpenCode database", "limit_hit": hit,
+    state = "loading" if is_loading else ("stale" if is_stale else ("live" if data else "unavailable"))
+    return {"plan": plan, "state": state, "source": "OpenCode database", "limit_hit": hit,
             "limited": data.get("limited") or {}, "per_model": data.get("per_model") or {},
             "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"),
-            "pools": [], "tokens": data.get("tokens"), "other_sessions": _other_sessions("opencode"),
-            "error": rec.get("error"), "model": data.get("model", ""),
-            "cost": data.get("cost"), "note": note}
+            "pools": [], "tokens": data.get("tokens"), "other_sessions": _other_sessions_for_hud("opencode"),
+            "error": rec.get("error") if not (is_loading or is_stale) else None, "model": data.get("model", ""),
+            "cost": data.get("cost"), "note": note if not is_loading else "",
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 def _local_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     rec = _source("local", 5.0 if refresh else None)
     data = rec.get("data") or {}
+    is_loading = bool(rec.get("loading"))
+    is_stale = bool(rec.get("stale"))
+    age = rec.get("age")
     running = bool(data.get("running"))
     client["dispatchable"] = client["dispatchable"] and running
     room = max(0, local_room(data)) if data.get("memory") else 0
     models = [dict(m, fits=local_fit(m["name"], data)[0]) for m in data.get("models") or []]
     note = "No session or weekly limit. Memory is the limit." if running else "Start Ollama to use local models."
-    return {"plan": (data.get("profile") or {}).get("tier", ""), "state": "live" if running else "unavailable",
+    state = "loading" if is_loading else ("stale" if is_stale else ("live" if running else "unavailable"))
+    return {"plan": (data.get("profile") or {}).get("tier", ""), "state": state,
             "source": "Ollama", "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"), "pools": [], "tokens": None,
-            "error": rec.get("error"), "note": note, "memory": data.get("memory"), "room": room, "models": models,
-            "loaded": data.get("loaded") or [], "profile": data.get("profile")}
+            "error": rec.get("error") if not (is_loading or is_stale) else None, "note": note if not is_loading else "",
+            "memory": data.get("memory"), "room": room, "models": models,
+            "loaded": data.get("loaded") or [], "profile": data.get("profile"),
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
@@ -8673,11 +9814,10 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
         if cid not in keys:
             keys.append(cid)
 
-    providers = []
-    for key in keys:
+    def _build_provider_view(key: str) -> Optional[Dict[str, Any]]:
         client = clients.get(key)
         if not client or not client["installed"]:
-            continue
+            return None
         if key in custom_ids:
             view = {
                 "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
@@ -8710,13 +9850,31 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
                 view["source"] = f"set_quota at {fmt_ts(override.get('set_at'))}"
                 view["manual"] = True
         view.update({"id": key, "category": key, "name": names.get(key, key), "client": client})
-        providers.append(view)
+        return view
+
+    installed_keys = [k for k in keys if clients.get(k) and clients[k]["installed"]]
+    if refresh and len(installed_keys) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(installed_keys), 6)) as pool:
+            futures = {pool.submit(_build_provider_view, k): k for k in installed_keys}
+            res_map = {}
+            for fut in concurrent.futures.as_completed(futures):
+                k = futures[fut]
+                try:
+                    res_map[k] = fut.result()
+                except Exception:
+                    res_map[k] = None
+            providers = [res_map[k] for k in installed_keys if res_map.get(k) is not None]
+    else:
+        providers = [_build_provider_view(k) for k in installed_keys]
+        providers = [p for p in providers if p is not None]
     return providers
 
 
 def load_quotas(refresh: bool = True) -> Dict[str, Any]:
     """Usage across every detected client, from each tool's own source."""
-    return {"providers": discover_connected_providers(refresh),
+    providers = discover_connected_providers(refresh)
+    return {"providers": providers,
+            "sources": {k: dict(v) for k, v in _usage.items()},
             "updated_at": _dt.datetime.now().astimezone().isoformat()}
 
 
@@ -8747,24 +9905,24 @@ def low_limit_notice() -> str:
         return ""
     _limit_checked = now
     threshold = _load_json("config.json").get("shed_at_pct", 20)
+    notices = []
+    for p in discover_connected_providers(refresh=False):
+        for pool in p.get("pools") or []:
+            for w in pool["windows"]:
+                if w.get("disabled") or w.get("left_pct") is None or w["left_pct"] > threshold:
+                    continue
+                if w.get("resets_at") and w["resets_at"] <= now:
+                    continue
+                level = 10 if w["left_pct"] <= 10 else threshold  # A second ping at 10%.
+                reset = int(w.get("resets_at") or 0)
+                key = f"{p['id']}|{pool['name']}|{w['label']}|{reset}|{level}"
+                text = (f"{p['name']} ({pool['name']}): {w['left_pct']}% of its {w['label']} limit left, "
+                        f"resets in {_fmt_reset(w.get('resets_at'))}")
+                notices.append((key, text))
     notes = []
-    with _state_lock("pings"):
-        sent = _load_json("limit_pings.json")
-        for p in discover_connected_providers(refresh=False):
-            for pool in p.get("pools") or []:
-                for w in pool["windows"]:
-                    if w.get("disabled") or w.get("left_pct") is None or w["left_pct"] > threshold:
-                        continue
-                    if w.get("resets_at") and w["resets_at"] <= now:
-                        continue
-                    level = 10 if w["left_pct"] <= 10 else threshold  # A second ping at 10%.
-                    key = f"{p['id']}|{pool['name']}|{w['label']}|{int(w.get('resets_at') or 0)}|{level}"
-                    if key not in sent:
-                        sent[key] = now
-                        notes.append(f"{p['name']} ({pool['name']}): {w['left_pct']}% of its {w['label']} limit left, "
-                                     f"resets in {_fmt_reset(w.get('resets_at'))}")
-        if notes:
-            _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+    for key, text in notices:
+        if notify_desktop_event(key, "Subway Context limit warning", text, route="usage"):
+            notes.append(text)
     return "[LOW LIMIT] " + "; ".join(notes) + ". Plan around it, and shed load if it's yours." if notes else ""
 
 def _fmt_reset(resets_at: Any) -> str:
@@ -9099,7 +10257,8 @@ def _compile_hud_data(project: str = "") -> Dict[str, Any]:
     cfg_data = _load_json("config.json")
     shed_pct = cfg_data.get("shed_at_pct", 20)
     low_limits = []
-    provs = discover_connected_providers(refresh=False)
+    quotas_data = load_quotas(refresh=not _sampler_running)
+    provs = quotas_data.get("providers") or []
     for p_val in provs:
         p_name = p_val["id"]
         if not isinstance(p_val, dict):
@@ -9140,7 +10299,7 @@ def _compile_hud_data(project: str = "") -> Dict[str, Any]:
                      "hud_open_on_use": bool(cfg_data.get("hud_open_on_use", True)),
                      "low_limits": low_limits, "budgets": budget_rows()},
         "tracks": tracks_summary,
-        "quotas": load_quotas(refresh=not _sampler_running),
+        "quotas": quotas_data,
     }
     chat_ctx = get_chat_context()
     if chat_ctx is not None:
@@ -9216,7 +10375,8 @@ def t_hud_status(project: str = "") -> str:
         lines.append(f"  (No active workers.{hist_note})")
     for w in workers[:6]:
         lines.append(f"  [*] {w['id']:<14} [{w.get('provider', '').upper():<11}] [{w.get('status', '').upper()}] "
-                     f"Track: {w.get('track', 'main')} Role: {w.get('role')}")
+                     f"Track: {w.get('track', 'main')} Role: {w.get('role')}"
+                     f"{' :: ' + str(w.get('status_reason')) if w.get('status_reason') else ''}")
 
     lines.extend([subsep, "[SHARED CONTEXT TRACKS]"])
     if not tracks:
@@ -9397,7 +10557,7 @@ def _open_hud(port: int) -> None:
             if EDITOR_HINT.get("text"):
                 log(EDITOR_HINT["text"])
                 with contextlib.suppress(Exception):
-                    notify_desktop_event("editor_extension_missing", "Subway Context", EDITOR_HINT["text"][:180])
+                    notify_desktop_event("editor_extension_missing|editor", "Subway Context", EDITOR_HINT["text"][:180])
 
 
 def t_start_hud(port: int = 0) -> str:
@@ -10348,6 +11508,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         c_label = "This chat's budget" if c_scope == "chat" else "The universal chat budget"
                         c_cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if c_scope == "chat" else "")
                         block_msg = f"{c_label} is reached: {used:,} of {limit:,} tokens. Add more with: {c_cmd}, or in the HUD."
+                        notify_desktop_event(f"chat_budget_blocked|{sid or 'unknown-chat'}|{limit}", "Subway Context",
+                                             block_msg, route="overview")
                         return {"jsonrpc": "2.0", "id": rid, "result": {
                             "content": [{"type": "text", "text": block_msg}],
                             "isError": True
@@ -10364,7 +11526,7 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     used = chat_tokens_used(sid)
                     if used is not None:
                         c_ping = budget_ping_notice("chat", used, limit, label=("this chat's" if c_scope == "chat" else "the universal chat"),
-                                                     chat_id=sid if c_scope == "chat" else None)
+                                                     chat_id=sid if c_scope == "chat" else None, subject_id=sid, desktop=True)
                         if c_ping:
                             text = f"{text}\n\n{c_ping}"
                 budgets = cfg.get("budgets") or {}
@@ -10372,7 +11534,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     p_lim = int(p_lim or 0)
                     if p_lim > 0:
                         p_used = _provider_5h_tokens(p_prov)
-                        p_ping = budget_ping_notice(p_prov, p_used, p_lim)
+                        p_reset = _provider_budget_reset(p_prov)
+                        p_ping = budget_ping_notice(p_prov, p_used, p_lim, window="5h", reset_at=p_reset, desktop=True)
                         if p_ping:
                             text = f"{text}\n\n{p_ping}"
                 lln = low_limit_notice()
@@ -10403,6 +11566,7 @@ USAGE = """Subway Context v{version}
   subway-context allow|always|deny <request_id>
   subway-context tail <worker_id>    Show a worker's status and log
   subway-context locks | track [name] | quota [source]
+  subway-context notify test           Send a test desktop notification
   subway-context install | status | uninstall
   subway-context <tool> '<json args>' Call any MCP tool directly"""
 
@@ -10472,8 +11636,9 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if used is not None and used >= limit:
             label = "This chat's budget" if scope == "chat" else "The universal chat budget"
             cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" else "")
-            notify_desktop_event(f"chat_budget_blocked|{sid}|{limit}", "Subway Context",
-                                 f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD.")
+            notify_desktop_event(f"chat_budget_blocked|{sid or _self_id() or 'unknown-chat'}|{limit}", "Subway Context",
+                                 f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD.",
+                                 route="overview")
             return {
                 "decision": "block",
                 "reason": f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD."
@@ -10488,7 +11653,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     notices = []
     if limit:
         notice = budget_ping_notice("chat", used, limit, label=("this chat's" if scope == "chat" else "the universal chat"),
-                                     chat_id=sid if scope == "chat" else None)
+                                     chat_id=sid if scope == "chat" else None, subject_id=sid, desktop=True)
         if notice:
             notices.append(notice)
 
@@ -10718,6 +11883,28 @@ def run_cli(argv: List[str]) -> int:
                 chat_sid = extra[idx + 1]
         msg = set_budget(scope, tokens, session_id=chat_sid)
         print(msg)
+        return 0
+    if arg == "notify":
+        if not rest or rest[0] != "test":
+            print("Usage: subway-context notify test")
+            return 2
+        mechanism, error = _send_desktop_notification(
+            "Subway Context test", "Desktop notifications are working.", route="workers")
+        if error:
+            print(f"Notification test failed using {mechanism}: {error}")
+            return 1
+        if mechanism == "terminal-notifier":
+            path = _find_executable(
+                "terminal-notifier",
+                ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"),
+            )
+        elif mechanism == "notify-send":
+            path = _find_executable("notify-send", ("/usr/bin/notify-send",))
+        elif mechanism == "osascript":
+            path = _find_executable("osascript")
+        else:
+            path = None
+        print(f"Test notification sent using {mechanism} ({path or mechanism}).")
         return 0
     if arg in ("hud-autostart", "--hud-autostart"):
         if not rest or rest[0].lower() not in ("on", "off"):
