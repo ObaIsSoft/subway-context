@@ -178,3 +178,22 @@ export function ask(title, label) {
     input.focus();
   });
 }
+
+export function providerColour(id) {
+  if (!id) return "var(--gold)";
+  const cleanId = String(id).toLowerCase().trim();
+  if (typeof document !== "undefined" && document.documentElement) {
+    const val = getComputedStyle(document.documentElement).getPropertyValue(`--series-${cleanId}`);
+    if (val && val.trim()) return `var(--series-${cleanId})`;
+  }
+  if (["claude", "antigravity", "opencode", "copilot"].includes(cleanId)) {
+    return `var(--series-${cleanId})`;
+  }
+  let hash = 0;
+  for (let i = 0; i < cleanId.length; i++) {
+    hash = ((hash << 5) - hash) + cleanId.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue}, 65%, 55%)`;
+}
