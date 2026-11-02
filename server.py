@@ -30,6 +30,7 @@ Writes:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import contextlib
 import datetime as _dt
 import glob
@@ -7412,29 +7413,58 @@ def _window_totals(events: List[Tuple[float, int, int, int]], now: float) -> Dic
     return totals
 
 
+_ledger_cache: Dict[Any, Dict[str, Any]] = {}
+
+
 def _scan_ledger(paths: List[str], parse: Callable[[str], List[Tuple[float, int, int, int]]]) -> Dict[str, Dict[str, int]]:
     """Token windows across transcripts, re-reading only files that changed."""
     now = time.time()
-    events: List[Tuple[float, int, int, int]] = []
+    state = _ledger_cache.setdefault(parse, {"last_scan": 0.0, "last_result": None, "files": {}})
+    last_scan = state.get("last_scan", 0.0)
+    last_result = state.get("last_result")
+    files: Dict[str, Tuple[Tuple[float, int], List[Tuple[float, int, int, int]]]] = state["files"]
+
+    current_paths = set(paths)
+    any_changed = False
+
+    for p in list(files.keys()):
+        if p not in current_paths:
+            del files[p]
+            any_changed = True
+
     for p in paths:
         try:
             st = os.stat(p)
         except OSError:
+            if p in files:
+                del files[p]
+                any_changed = True
             continue
         if st.st_mtime < now - SEVEN_D:
+            if p in files:
+                del files[p]
+                any_changed = True
             continue
         key = (st.st_mtime, st.st_size)
-        cached = _ledger_files.get(p)
-        if cached and cached[0] == key:
-            events.extend(cached[1])
+        cached = files.get(p)
+        if cached is not None and cached[0] == key:
             continue
+        any_changed = True
         try:
             parsed = parse(p)
         except OSError:
             continue
+        files[p] = (key, parsed)
         _ledger_files[p] = (key, parsed)
-        events.extend(parsed)
-    return _window_totals(events, now)
+
+    if not any_changed and last_result is not None and (now - last_scan < 60.0):
+        return last_result
+
+    events = [ev for _, file_events in files.values() for ev in file_events]
+    result = _window_totals(events, now)
+    state["last_scan"] = now
+    state["last_result"] = result
+    return result
 
 
 _usage_tails: Dict[str, Tuple[int, Dict[str, Tuple[float, int, int, int]]]] = {}
@@ -7733,6 +7763,8 @@ def _wait_for_memory(model: str, stopped: Dict[str, bool], wait: float) -> bool:
 
 # ---- Source registry ------------------------------------------------------
 
+SOURCE_DEADLINE: float = float(os.environ.get("SUBWAY_SOURCE_DEADLINE", "1.5"))
+
 _SOURCES: Dict[str, Tuple[Callable[[], Dict[str, Any]], float]] = {
     "agy_limits": (_fetch_agy_limits, 10.0),
     "agy_tokens": (_fetch_agy_tokens, 30.0),
@@ -7744,40 +7776,134 @@ _SOURCES: Dict[str, Tuple[Callable[[], Dict[str, Any]], float]] = {
 }
 _SHARED_SOURCES = ("agy_limits", "claude_live")  # Reused across processes, and kept as last-known values.
 
+_source_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="subway-source")
+_source_in_flight: Dict[str, Tuple[concurrent.futures.Future, Any]] = {}
+_source_in_flight_lock = threading.Lock()
 
-def _refresh_source(name: str) -> Dict[str, Any]:
+
+def _run_source_task(name: str) -> Dict[str, Any]:
     fn, _ttl = _SOURCES[name]
     t0 = time.time()
     try:
         data, err = fn(), None
-    except Exception as e:  # Any failure of an outside tool becomes a visible source error.
+    except Exception as e:
         data, err = None, one_line(str(e), 160)
     now = time.time()
     with _usage_lock:
         rec = dict(_usage.get(name) or {})
-        rec.update({"checked_at": now, "latency_ms": int((now - t0) * 1000), "error": err})
+        rec.update({
+            "checked_at": now,
+            "latency_ms": int((now - t0) * 1000),
+            "error": err,
+            "loading": False,
+            "stale": False,
+        })
+        rec.pop("age", None)
         if data is not None:
             rec.update({"data": data, "fetched_at": now})
         _usage[name] = rec
-    if data is not None and name in _SHARED_SOURCES:
+
+    if data is not None:
         with _state_lock("usage"):
             shared = _load_json("usage_cache.json")
             shared[name] = {"data": data, "fetched_at": now}
             _save_json("usage_cache.json", shared)
+
+    with _source_in_flight_lock:
+        entry = _source_in_flight.get(name)
+        if entry and entry[0].done():
+            _source_in_flight.pop(name, None)
+
+    with _hud_cache_lock:
+        for entry in _hud_cache.values():
+            entry["stale"] = True
+            if "data" in entry and isinstance(entry["data"], dict) and "quotas" in entry["data"]:
+                lq = getattr(sys.modules[__name__], "load_quotas", None)
+                if lq is not None:
+                    entry["data"]["quotas"] = lq(refresh=False)
+
     return rec
+
+
+def _fallback_source_record(name: str) -> Dict[str, Any]:
+    now = time.time()
+    saved = None
+    with _state_lock("usage"):
+        shared = _load_json("usage_cache.json")
+        saved = shared.get(name)
+
+    if saved and saved.get("data") is not None:
+        fetched_at = saved.get("fetched_at", now)
+        age = max(0.0, round(now - fetched_at, 1))
+        rec = {
+            "data": saved["data"],
+            "fetched_at": fetched_at,
+            "stale": True,
+            "age": age,
+            "loading": False,
+            "checked_at": now,
+            "latency_ms": None,
+            "error": None,
+        }
+    else:
+        rec = {
+            "data": None,
+            "fetched_at": None,
+            "stale": False,
+            "loading": True,
+            "checked_at": now,
+            "latency_ms": None,
+            "error": None,
+        }
+    with _usage_lock:
+        cur = _usage.get(name)
+        if not cur or cur.get("loading") or not cur.get("data"):
+            _usage[name] = rec
+    return rec
+
+
+def _refresh_source(name: str, deadline: Optional[float] = None) -> Dict[str, Any]:
+    if name not in _SOURCES:
+        return {}
+    if deadline is None:
+        deadline = SOURCE_DEADLINE
+
+    cur_fn = _SOURCES[name][0]
+    with _source_in_flight_lock:
+        entry = _source_in_flight.get(name)
+        if entry is not None:
+            fut, fn = entry
+            if fut.done() or fn != cur_fn:
+                _source_in_flight.pop(name, None)
+                entry = None
+        if entry is None:
+            fut = _source_pool.submit(_run_source_task, name)
+            _source_in_flight[name] = (fut, cur_fn)
+        else:
+            fut, _ = entry
+
+    if deadline <= 0:
+        with _usage_lock:
+            rec = _usage.get(name)
+        return rec or _fallback_source_record(name)
+
+    try:
+        return fut.result(timeout=deadline)
+    except (concurrent.futures.TimeoutError, TimeoutError):
+        return _fallback_source_record(name)
 
 
 def _source(name: str, max_age: Optional[float] = None) -> Dict[str, Any]:
     """A source's latest record, refreshed if older than max_age. None never refreshes."""
     with _usage_lock:
         rec = _usage.get(name)
-    if name in _SHARED_SOURCES and (not rec or not rec.get("data")):
+    if not rec or not rec.get("data"):
         saved = _load_json("usage_cache.json").get(name)
         if saved:
             with _usage_lock:
                 rec = dict(saved, **(_usage.get(name) or {}))
                 _usage[name] = rec
-    if max_age is not None and (not rec or time.time() - rec.get("checked_at", 0) > max_age):
+    if max_age is not None and (not rec or rec.get("loading") or rec.get("stale") or time.time() - rec.get("checked_at", 0) > max_age):
         rec = _refresh_source(name)
     return rec or {}
 
@@ -7794,7 +7920,7 @@ def _sampler_loop() -> None:
                 continue
             rec = _usage.get(name) or {}
             if now - rec.get("checked_at", 0) >= ttl:
-                _refresh_source(name)
+                _refresh_source(name, deadline=0.0)
         if now - last_slow >= 10:  # Neither needs checking every second.
             last_slow = now
             with contextlib.suppress(Exception):
@@ -8059,8 +8185,16 @@ def _other_sessions_uncached(provider: str, now: float) -> Optional[Dict[str, An
 
 
 def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
-    cached_rec = _source("claude_cached", 3.0 if refresh else None)
-    live_rec = _source("claude_live", 120.0 if refresh else None)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        f_cached = pool.submit(_source, "claude_cached", 3.0 if refresh else None)
+        f_live = pool.submit(_source, "claude_live", 120.0 if refresh else None)
+        f_tokens = pool.submit(_source, "claude_tokens", 15.0 if refresh else None)
+        f_sessions = pool.submit(_other_sessions, "claude")
+        cached_rec = f_cached.result()
+        live_rec = f_live.result()
+        tokens_rec = f_tokens.result()
+        other_sessions = f_sessions.result()
+
     cached = cached_rec.get("data") or {}
     live = live_rec.get("data") or {}
     live_at = live_rec.get("fetched_at")
@@ -8075,32 +8209,46 @@ def _claude_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         reset = w.get("resets_at") or (fallback.get(key) or {}).get("resets_at")
         windows.append(_window(wk, label, w.get("used_pct"), reset))
 
-    state = _state_of(fetched_at, LIVE_SECONDS["claude"])
+    is_loading = bool(live_rec.get("loading"))
+    is_stale = bool(live_rec.get("stale"))
+    age = live_rec.get("age")
+    state = "loading" if is_loading else ("stale" if is_stale else _state_of(fetched_at, LIVE_SECONDS["claude"]))
     source = "Claude Code /usage" if use_live else "Claude Code cache (~/.claude.json)"
-    error = live_rec.get("error") if not use_live else None
+    error = live_rec.get("error") if (not use_live and not is_loading and not is_stale) else None
     return {"plan": cached.get("plan") or "", "state": state, "source": source, "fetched_at": fetched_at,
             "latency_ms": live_rec.get("latency_ms") if use_live else cached_rec.get("latency_ms"),
             "pools": [{"key": "claude", "name": "Subscription", "windows": windows}] if fetched_at else [],
-            "tokens": (_source("claude_tokens", 15.0 if refresh else None).get("data")),
-            "other_sessions": _other_sessions("claude"),
+            "tokens": tokens_rec.get("data"),
+            "other_sessions": other_sessions,
             "error": error,
-            "note": "" if fetched_at else "Claude Code has not reported usage yet."}
+            "note": "" if (fetched_at or is_loading) else "Claude Code has not reported usage yet.",
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 def _agy_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
-    rec = _source("agy_limits", 10.0 if refresh else None)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_rec = pool.submit(_source, "agy_limits", 10.0 if refresh else None)
+        f_tokens = pool.submit(_source, "agy_tokens", 15.0 if refresh else None)
+        f_sessions = pool.submit(_other_sessions, "antigravity")
+        rec = f_rec.result()
+        tokens_rec = f_tokens.result()
+        other_sessions = f_sessions.result()
     data = rec.get("data") or {}
-    tokens = _source("agy_tokens", 15.0 if refresh else None).get("data")
-    state = _state_of(rec.get("fetched_at"), LIVE_SECONDS["antigravity"])
+    tokens = tokens_rec.get("data")
+    is_loading = bool(rec.get("loading"))
+    is_stale = bool(rec.get("stale"))
+    age = rec.get("age")
+    state = "loading" if is_loading else ("stale" if is_stale else _state_of(rec.get("fetched_at"), LIVE_SECONDS["antigravity"]))
     note = ""
     if state == "stale":
         note = "Antigravity isn't answering, so these are the last known limits."
-    elif state == "unavailable":
+    elif state == "unavailable" and not is_loading:
         note = "Open Antigravity to read its limits."
     return {"plan": data.get("plan") or "", "state": state, "source": "Antigravity language server",
             "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"),
-            "pools": data.get("pools") or [], "tokens": tokens, "other_sessions": _other_sessions("antigravity"),
-            "error": rec.get("error"), "note": note}
+            "pools": data.get("pools") or [], "tokens": tokens, "other_sessions": other_sessions,
+            "error": rec.get("error") if not (is_loading or is_stale) else None, "note": note,
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 @ttl_cached(120.0)
@@ -8364,32 +8512,43 @@ def _kimi_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
 def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     rec = _source("opencode", 5.0 if refresh else None)
     data = rec.get("data") or {}
+    is_loading = bool(rec.get("loading"))
+    is_stale = bool(rec.get("stale"))
+    age = rec.get("age")
     plan = "Signed-in provider" if data.get("signed_in") else "Free models, no account" if data else ""
     hit = data.get("limit_hit")
     note = "OpenCode doesn't publish a remaining free allowance, so limits show only when one is hit."
     if hit and (time.time() - hit.get("at", 0) <= 86400):
         model_name = hit.get("model") or data.get("model") or "Free model"
         note = f"{model_name} hit its free limit at {fmt_ts(hit['at'])}; other free models may still run"
-    return {"plan": plan, "state": "live" if data else "unavailable", "source": "OpenCode database", "limit_hit": hit,
+    state = "loading" if is_loading else ("stale" if is_stale else ("live" if data else "unavailable"))
+    return {"plan": plan, "state": state, "source": "OpenCode database", "limit_hit": hit,
             "limited": data.get("limited") or {}, "per_model": data.get("per_model") or {},
             "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"),
             "pools": [], "tokens": data.get("tokens"), "other_sessions": _other_sessions("opencode"),
-            "error": rec.get("error"), "model": data.get("model", ""),
-            "cost": data.get("cost"), "note": note}
+            "error": rec.get("error") if not (is_loading or is_stale) else None, "model": data.get("model", ""),
+            "cost": data.get("cost"), "note": note if not is_loading else "",
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 def _local_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     rec = _source("local", 5.0 if refresh else None)
     data = rec.get("data") or {}
+    is_loading = bool(rec.get("loading"))
+    is_stale = bool(rec.get("stale"))
+    age = rec.get("age")
     running = bool(data.get("running"))
     client["dispatchable"] = client["dispatchable"] and running
     room = max(0, local_room(data)) if data.get("memory") else 0
     models = [dict(m, fits=local_fit(m["name"], data)[0]) for m in data.get("models") or []]
     note = "No session or weekly limit. Memory is the limit." if running else "Start Ollama to use local models."
-    return {"plan": (data.get("profile") or {}).get("tier", ""), "state": "live" if running else "unavailable",
+    state = "loading" if is_loading else ("stale" if is_stale else ("live" if running else "unavailable"))
+    return {"plan": (data.get("profile") or {}).get("tier", ""), "state": state,
             "source": "Ollama", "fetched_at": rec.get("fetched_at"), "latency_ms": rec.get("latency_ms"), "pools": [], "tokens": None,
-            "error": rec.get("error"), "note": note, "memory": data.get("memory"), "room": room, "models": models,
-            "loaded": data.get("loaded") or [], "profile": data.get("profile")}
+            "error": rec.get("error") if not (is_loading or is_stale) else None, "note": note if not is_loading else "",
+            "memory": data.get("memory"), "room": room, "models": models,
+            "loaded": data.get("loaded") or [], "profile": data.get("profile"),
+            "loading": is_loading, "stale": is_stale, "age": age}
 
 
 def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
@@ -8412,11 +8571,10 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
         if cid not in keys:
             keys.append(cid)
 
-    providers = []
-    for key in keys:
+    def _build_provider_view(key: str) -> Optional[Dict[str, Any]]:
         client = clients.get(key)
         if not client or not client["installed"]:
-            continue
+            return None
         if key in custom_ids:
             view = {
                 "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
@@ -8449,13 +8607,31 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
                 view["source"] = f"set_quota at {fmt_ts(override.get('set_at'))}"
                 view["manual"] = True
         view.update({"id": key, "category": key, "name": names.get(key, key), "client": client})
-        providers.append(view)
+        return view
+
+    installed_keys = [k for k in keys if clients.get(k) and clients[k]["installed"]]
+    if refresh and len(installed_keys) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(installed_keys), 6)) as pool:
+            futures = {pool.submit(_build_provider_view, k): k for k in installed_keys}
+            res_map = {}
+            for fut in concurrent.futures.as_completed(futures):
+                k = futures[fut]
+                try:
+                    res_map[k] = fut.result()
+                except Exception:
+                    res_map[k] = None
+            providers = [res_map[k] for k in installed_keys if res_map.get(k) is not None]
+    else:
+        providers = [_build_provider_view(k) for k in installed_keys]
+        providers = [p for p in providers if p is not None]
     return providers
 
 
 def load_quotas(refresh: bool = True) -> Dict[str, Any]:
     """Usage across every detected client, from each tool's own source."""
-    return {"providers": discover_connected_providers(refresh),
+    providers = discover_connected_providers(refresh)
+    return {"providers": providers,
+            "sources": {k: dict(v) for k, v in _usage.items()},
             "updated_at": _dt.datetime.now().astimezone().isoformat()}
 
 
@@ -8838,7 +9014,8 @@ def _compile_hud_data(project: str = "") -> Dict[str, Any]:
     cfg_data = _load_json("config.json")
     shed_pct = cfg_data.get("shed_at_pct", 20)
     low_limits = []
-    provs = discover_connected_providers(refresh=False)
+    quotas_data = load_quotas(refresh=not _sampler_running)
+    provs = quotas_data.get("providers") or []
     for p_val in provs:
         p_name = p_val["id"]
         if not isinstance(p_val, dict):
@@ -8879,7 +9056,7 @@ def _compile_hud_data(project: str = "") -> Dict[str, Any]:
                      "hud_open_on_use": bool(cfg_data.get("hud_open_on_use", True)),
                      "low_limits": low_limits, "budgets": budget_rows()},
         "tracks": tracks_summary,
-        "quotas": load_quotas(refresh=not _sampler_running),
+        "quotas": quotas_data,
     }
     chat_ctx = get_chat_context()
     if chat_ctx is not None:

@@ -77,7 +77,17 @@ function memoryBlock(p) {
 
 export function providerCard(p, now) {
   const c = p.client || {};
-  const [label, cls] = STATE[p.state] || [p.state, ""];
+  let label, cls;
+  if (p.loading || p.state === "loading") {
+    label = "loading";
+    cls = "";
+  } else if (p.stale || p.state === "stale") {
+    const age = (typeof p.age === "number") ? Math.round(p.age) : (p.fetched_at ? Math.max(0, Math.round(now - p.fetched_at)) : null);
+    label = (age !== null && !isNaN(age)) ? `stale, ${age} s old` : "stale";
+    cls = "";
+  } else {
+    [label, cls] = STATE[p.state] || [p.state, ""];
+  }
   const pools = (p.pools || []).map((pool) => h("div", { class: "pool" }, ring(pool, now),
     h("div", { class: "legend" }, (p.pools.length > 1 || p.manual) ? h("div", { class: "pool-name" }, pool.name) : null,
       pool.windows.map((w, i) => windowRow(w, i, now)))));
@@ -85,14 +95,14 @@ export function providerCard(p, now) {
   return h("article", { class: "card" },
     h("div", { class: "provider-top" },
       h("div", {}, h("div", { class: "provider-name" }, p.name), p.plan ? h("div", { class: "card-sub" }, p.plan) : null),
-      h("span", { class: `tag ${cls}` }, label)),
+      h("span", { class: `tag ${cls}`.trim() }, label)),
     h("div", { class: "tags" }, chips(c, p.id === "local")),
     pools.length ? h("div", { class: "pools" }, pools) : null,
     p.memory ? memoryBlock(p) : null,
     p.tokens ? tokenTable(p.tokens) : null,
     p.other_sessions ? h("div", { class: "row-sub" }, `Other sessions, last 5h: ${p.other_sessions.sessions ?? p.other_sessions.count ?? p.other_sessions.total ?? p.other_sessions} sessions, ${tokens(p.other_sessions.tokens ?? 0)} tokens`) : null,
     p.note ? h("div", { class: "note" }, p.note) : null,
-    p.error && p.state !== "live" ? h("div", { class: "err" }, p.error) : null,
+    p.error && p.state !== "live" && !p.loading && !p.stale && p.state !== "loading" && p.state !== "stale" ? h("div", { class: "err" }, p.error) : null,
     foot || p.fetched_at ? h("div", { class: "foot" }, foot,
       p.fetched_at ? [foot ? " · updated " : "Updated ", ticking("span", { class: "num" }, p.fetched_at, "age")] : null,
       typeof p.latency_ms === "number" && p.fetched_at ? ` · read in ${p.latency_ms >= 1000 ? (p.latency_ms / 1000).toFixed(1) + " s" : p.latency_ms + " ms"}` : null) : null,
