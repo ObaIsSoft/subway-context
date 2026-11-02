@@ -176,8 +176,8 @@ Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier na
 | :--- | :--- | :--- | :--- |
 | **1. Explicit Pins** | `@<alias>` | `@claude-main`, `@agy-live`, `@opencode-terminal` | **Immutable & sticky** via `tag_chat`. Never drifts when switching tabs or opening side tasks. |
 | **2. Floating Latest** | `@<agent>-latest`, `@latest` | `@agy-latest`, `@claude-latest`, `@latest` | Dynamically resolves to the most recently touched session globally or per-platform. |
-| **3. Workspace Heads** | `@<agent>-<project>` | `@agy-my-project`, `@claude-portfolio` | Dynamically resolves to the **latest active chat in that workspace folder**. |
-| **4. Topic Slugs** | `@<agent>-<topic>` | `@agy-subway`, `@agy-gitignore`, `@agy-previous-chats` | Automatically extracted from conversation titles. Reference chats by **topic** rather than ID. |
+| **3. Workspace Heads** | `@<agent>-<project>` | `@agy-my-project`, `@claude-portfolio`, `@copilot-subway-context` | Dynamically resolves to the **latest active chat in that workspace folder**. |
+| **4. Topic Slugs** | `@<agent>-<topic>` | `@agy-subway`, `@agy-gitignore`, `@copilot-parser` | Automatically extracted from conversation titles. Reference chats by **topic** rather than ID. |
 
 ---
 
@@ -186,13 +186,14 @@ Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier na
 Subway Context exposes 29 MCP tools divided across functional roles:
 
 ### 1. Navigation & Transit
-- **`list_chats(source, project, query, limit, include_subagents)`**: List active stations across agents, highlighting open tabs and sticky `@aliases`.
+- **`list_chats(source, project, query, limit, include_subagents)`**: List active stations across Antigravity, Claude Code, OpenCode, and GitHub Copilot (CLI and VS Code), highlighting open tabs, worker sessions, token usage, and sticky `@aliases`.
 - **`search_chat(quote, query, source, project, limit, include_subagents)`**: Search all transcripts for an exact phrase or snippet; returns station ID and stop index.
 - **`tag_chat(alias, chat_id)`**: Assign a sticky station alias (`tag_chat(alias='claude-main')`). Omit `chat_id` to tag current chat.
 - **`read_chat(chat_id, mode, turns, start, since, anchor_text, max_chars, include_tools, include_thoughts, source, project)`**: Board and read another agent's transcript.
   - `since="last"`: Reads only new turns since previous transit.
   - `mode="decisions"`: Cuts 85-90% token noise by extracting user intent, thought rationale, decisions, and files touched.
   - `anchor_text="phrase"`: Boards at the exact quote.
+  - `segment="latest"` or a segment number: Read history split at provider-reported compaction boundaries. Copilot transcripts without such a marker stay in one segment.
 - **`send_note(to, text, from_chat, share_chat)`**: Send transit dispatch to another agent window's inbox.
 - **`check_notes(my_chat_id, keep)`**: Read and clear incoming dispatches for this window.
 - **`whoami()`**: Reports current station ID, provider, and active tab identity.
@@ -336,6 +337,7 @@ Subway Context tracks live rate limits, token usage, and session windows across 
 - **Worker Token Caps**: Workers are told to wrap up at two thirds, and no call is started that would pass the cap. A call already running can still overrun. Counts thinking and Claude cache creation. Set Claude caps above about 100K: one call can cost 35K. Custom providers report no tokens, so they use max_seconds.
 - **Context Compaction**: `subway-context compaction` shows the mode; `subway-context compaction <suggest|auto|never> [tokens]` sets it, e.g. `subway-context compaction auto 300k`. The compaction point defaults to 300,000 tokens and accepts 100K to 1M; the HUD's "Compact at (tokens)" field sets it too. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's `autoCompactWindow`, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only.
 - **Capacity**: 4 running workers per chat. Per machine: 2 up to 8 GB, 6 up to 16 GB, 10 above, or set `max_workers` in `config.json`. A worker over the limit stays queued.
+- **Worker safeguards**: `worker_rules: false` omits the standard rules from edit-worker prompts. Antigravity and OpenCode deny identifiable whole-file reads over 1,500 lines inside the worker folder; set `large_file_read_lines` to change the limit or `large_file_reads: "allow"` to disable the guard.
 
 ---
 

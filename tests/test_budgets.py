@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os as _sandbox_os, sys as _sandbox_sys  # Isolate HOME, SUBWAY_DIR and agent folders before server loads.
+_sandbox_sys.path.insert(0, _sandbox_os.path.dirname(_sandbox_os.path.abspath(__file__)))
+import _sandbox  # noqa: E402,F401
 """Comprehensive test suite for Subway Context budgets."""
 import os as _os
 _os.environ["SUBWAY_NO_NOTIFY"] = "1"  # Never send real desktop alerts from tests.
@@ -290,30 +293,12 @@ class TestEnforceBudgets(unittest.TestCase):
             mock_stop.assert_not_called()
 
     def test_isolate_worker_claims_edits_without_changes_fails(self):
-        worker_id = "w_isolate_test"
-        meta = {
-            "id": worker_id,
-            "provider": "claude",
-            "model": "haiku",
-            "cmd": ["test"],
-            "timeout_seconds": 10,
-            "worktree": "/tmp/test_wt",
-            "repo": "/tmp/test_repo",
-            "base": "HEAD",
-            "isolate": True,
-            "prompt": "Edit server.py to add tests",
-            "status": "running",
-        }
-        # Simulate exit file processing in supervise_worker or test logic
+        meta = {"role": "Builder", "prompt": "Edit server.py to add tests",
+                "mode": "standard", "capabilities": ["files:read", "files:write"]}
         exit_res = {"status": "completed", "exit_code": 0}
-        wt_note = "No files changed."
-        if exit_res.get("status") == "completed" and meta.get("isolate"):
-            prompt = meta.get("prompt") or ""
-            if ("Edit " in prompt or "edit" in prompt) and wt_note == "No files changed.":
-                exit_res["status"] = "failed"
-                exit_res["reason"] = "Reported work, but no files changed."
+        server._settle_worker_result(exit_res, meta, True, "Done.")
         self.assertEqual(exit_res["status"], "failed")
-        self.assertEqual(exit_res["reason"], "Reported work, but no files changed.")
+        self.assertIn("no changes made", exit_res["reason"].lower())
 
 
 class TestCheckBudgetPreflight(unittest.TestCase):
@@ -1057,10 +1042,10 @@ class DesktopNotificationTests(unittest.TestCase):
         def fake_run(cmd, *args, **kwargs):
             calls.append(cmd)
             res = mock.MagicMock()
-            if cmd == ["notify-send", "--help"]:
+            if cmd[0] == "/usr/bin/notify-send" and cmd[1:] == ["--help"]:
                 res.stdout = "Usage: notify-send [OPTION...] ... --action=... -w, --wait"
                 res.stderr = ""
-            elif len(cmd) > 1 and cmd[0] == "notify-send" and "--action=open=Open" in cmd:
+            elif len(cmd) > 1 and cmd[0] == "/usr/bin/notify-send" and "--action=open=Open" in cmd:
                 res.stdout = "open\n"
                 res.stderr = ""
             else:
@@ -1080,8 +1065,8 @@ class DesktopNotificationTests(unittest.TestCase):
              patch("threading.Thread", side_effect=fake_thread):
             server._send_desktop_notification("Job Done", "All tasks finished")
 
-        self.assertIn(["notify-send", "--help"], calls)
-        self.assertIn(["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", "Job Done", "All tasks finished"], calls)
+        self.assertIn(["/usr/bin/notify-send", "--help"], calls)
+        self.assertIn(["/usr/bin/notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", "Job Done", "All tasks finished"], calls)
         self.assertIn(["xdg-open", "http://127.0.0.1:7890/#workers"], calls)
 
     def test_linux_notify_without_action(self):
@@ -1100,8 +1085,8 @@ class DesktopNotificationTests(unittest.TestCase):
              patch("subprocess.run", side_effect=fake_run):
             server._send_desktop_notification("Job Done", "All tasks finished")
 
-        self.assertIn(["notify-send", "--help"], calls)
-        self.assertIn(["notify-send", "Job Done", "All tasks finished"], calls)
+        self.assertIn(["/usr/bin/notify-send", "--help"], calls)
+        self.assertIn(["/usr/bin/notify-send", "Job Done", "All tasks finished"], calls)
         self.assertNotIn(["xdg-open", "http://127.0.0.1:7890/#workers"], calls)
 
     def test_linux_notify_missing(self):
@@ -1150,6 +1135,7 @@ class DesktopNotificationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), \
              patch("sys.platform", "darwin"), \
              patch("shutil.which", return_value=None), \
+             patch.object(server.os.path, "isfile", return_value=False), \
              patch("subprocess.run") as mock_run:
             server._send_desktop_notification('Alert "1"', 'Msg with "quotes"')
             mock_run.assert_called_once()

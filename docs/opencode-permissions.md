@@ -15,4 +15,5 @@
 
 - Only an explicit answer counts. Some clients decline MCP elicitation prompts by themselves, with nobody having seen them, so a decline or cancel leaves the request pending in the HUD.
 - In auto_safe mode, an OpenCode worker may read, search and edit inside its own folder without asking. An edit must name a file there. Every command still asks.
+- Whole-file reads over `large_file_read_lines` (default 1,500) inside the worker folder are denied in every permission mode. Subway uses `toolCall.rawInput` and locations to distinguish paths and ranges; `large_file_reads: "allow"` disables this efficiency guard.
 - A denied request ends the worker as stopped, not failed.

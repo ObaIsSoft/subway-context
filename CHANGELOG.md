@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.3 - 2026-11-02
+
+> [!IMPORTANT]
+> Copilot input tokens counted cache reads and writes again, inflating a long worker's input about 30-fold (credits were always right). Each token is now counted once; older records are corrected for display.
+
+- **Notifications you can trust**: each alert is keyed to its event, so one event alerts once, and each opens the HUD page it is about. Failures are written to `notify.log` (in your Subway folder) instead of vanishing; `subway-context notify test` sends a test alert. terminal-notifier is found in Homebrew folders even when it isn't on PATH. Tests no longer write your real `notify.log`, and every test file runs in its own sandbox, so a single test file can't add workers to your real Subway folder or reach your desktop.
+- **No false stalls**: a worker is stalled only when every activity signal it has has been quiet for the stall timeout: its output, its Copilot session events, its OpenCode session, changes in its folder, and its CPU time. Copilot and Antigravity get 5 minutes, others 2. A stall stops and re-routes the worker and gives the model a 15-minute cool-down; only a real quota or usage-limit error marks a model exhausted, until its reset. A successful run clears the cool-down.
+- **Quota errors are recognised by shape**, including OpenCode's silent free-limit retries, which are read from its database; one exhausted free model marks the account-wide free limit.
+- **Copilot permissions follow your setting**: ask mode runs Copilot over ACP so each tool asks in the HUD (falling back to safe-command approval, with a note, if ACP can't start); safe mode allows only workspace writes and safe commands; `--allow-all-tools` is passed only when permissions are skipped. Worker sessions no longer sync into VS Code, so VS Code shows no approval prompts for them. A USD cap becomes `--max-ai-credits` (1 credit = $0.01).
+- **Copilot chats are readable**: `read_chat`, `search_chat` and `/api/chats` cover Copilot CLI sessions and VS Code Copilot chats (workspace, empty-window and Agent Host).
+- **Workers work efficiently**: every edit worker's brief carries Subway's standing rules (reading limits, edge cases, test isolation, run the suite twice); reviewers get the reading rule. OpenCode and local workers are refused whole-file reads of files over 1,500 lines (`large_file_read_lines`; `large_file_reads: "allow"` turns it off). Antigravity reads can't be intercepted, so for Gemini the rules are advisory.
+- **Edit workers that change nothing fail** with "No changes made", and reviewers are given the worker's diff.
+- **Ledger posts are signed by the caller Subway detects**; unverifiable posts are marked unverified and HUD posts are credited to you.
+- **The HUD's first load is fast**: each source has its own deadline and late values are shown with their age.
+
 ## 1.3.2 - 2026-11-02
 
 - **HUD status is fast**: `/api/status` answers from the last snapshot (per project) and refreshes in the background once it is 10 seconds old or after any change made from the HUD. Only the first request after a restart waits for a full read. Routing, budgets and workers still read live data.
