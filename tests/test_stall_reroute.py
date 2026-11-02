@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -132,6 +133,269 @@ class TestStallAndReroute(unittest.TestCase):
             self.assertIsNone(server._poll_opencode_worker_retry(meta, time.time(), set()))
         handler.assert_not_called()
         self.assertFalse(os.path.exists(meta["log_file"]))
+
+    def test_assistant_reply_mentioning_quota_does_not_reroute(self):
+        worker_id = "worker_777777"
+        assistant_event = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Your quota discussion is complete."}]},
+        })
+        result_event = json.dumps({"type": "result", "result": "Finished."})
+        meta = {
+            "id": worker_id,
+            "role": "Writer",
+            "provider": "claude",
+            "model": "sonnet",
+            "prompt": "Write a short note",
+            "project_dir": self.temp_dir,
+            "timeout_seconds": 10,
+            "status": "running",
+            "cmd": [sys.executable, "-c", f"print({assistant_event!r}); print({result_event!r})"],
+            "log_file": server._log_file(worker_id),
+        }
+        server._save_worker(meta)
+
+        with mock.patch.object(server, "find_claude_binary", return_value="/bin/sh"), \
+             mock.patch.object(server, "_handle_worker_exhaustion_or_stall") as handler:
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+
+        handler.assert_not_called()
+        self.assertEqual(len(server._all_workers()), 1)
+
+    def test_quota_matcher_requires_an_error_shape_or_provider_phrase(self):
+        self.assertIsNone(server.check_quota_error("claude", "The quota and insufficient balance are discussed."))
+        self.assertIsNone(server.check_quota_error("claude", "Usage limit reached", source="assistant"))
+        self.assertEqual(
+            server.check_quota_error("claude", "Error: Usage limit reached"),
+            "Usage limit reached",
+        )
+        self.assertEqual(
+            server.check_quota_error("antigravity", '{"type":"error","message":"RESOURCE_EXHAUSTED"}', source="error_event"),
+            "RESOURCE_EXHAUSTED",
+        )
+        self.assertEqual(
+            server.check_quota_error("opencode", '{"error":{"status":429}}', source="error_event"),
+            "429",
+        )
+
+    def test_quota_error_in_stderr_is_handled_while_process_is_running(self):
+        worker_id = "worker_888888"
+        meta = {
+            "id": worker_id,
+            "role": "Worker",
+            "provider": "opencode",
+            "model": "opencode/example-free",
+            "prompt": "Run a task",
+            "project_dir": self.temp_dir,
+            "timeout_seconds": 30,
+            "stall_timeout": 20,
+            "status": "running",
+            "cmd": [
+                sys.executable, "-c",
+                "import sys,time; print('Free usage limit reached', file=sys.stderr, flush=True); time.sleep(10)",
+            ],
+            "log_file": server._log_file(worker_id),
+        }
+        server._save_worker(meta)
+        t_start = time.time()
+        with mock.patch.object(server, "_handle_worker_exhaustion_or_stall", return_value={"status": "failed"}) as handler:
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+        self.assertLess(time.time() - t_start, 4)
+        handler.assert_called_once()
+
+    def test_worker_watchdogs_exit_after_normal_finish(self):
+        worker_id = "worker_999999"
+        meta = {
+            "id": worker_id,
+            "role": "Worker",
+            "provider": "custom",
+            "model": "custom-model",
+            "prompt": "Finish",
+            "project_dir": self.temp_dir,
+            "timeout_seconds": 10,
+            "status": "running",
+            "cmd": [sys.executable, "-c", "print('done')"],
+            "log_file": server._log_file(worker_id),
+        }
+        server._save_worker(meta)
+        original_thread = threading.Thread
+        worker_threads = []
+
+        def capture_thread(*args, **kwargs):
+            thread = original_thread(*args, **kwargs)
+            if str(kwargs.get("name", "")).startswith(("worker-budget-", "worker-stall-")):
+                worker_threads.append(thread)
+            return thread
+
+        with mock.patch.object(server.threading, "Thread", side_effect=capture_thread):
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+
+        self.assertEqual(len(worker_threads), 2)
+        self.assertTrue(all(not thread.is_alive() for thread in worker_threads))
+
+    def test_private_reroute_preserves_original_spin_arguments(self):
+        worker_id = "worker_101010"
+        new_worker_id = "worker_202020"
+        args = {
+            "role": "Private Worker",
+            "prompt": "Handle private data",
+            "track": "private-track",
+            "project_dir": self.temp_dir,
+            "timeout_seconds": 123,
+            "effort": "high",
+            "mode": "standard",
+            "permission_mode": "auto_safe",
+            "capabilities": ["files:read", "files:write"],
+            "budget_session_pct": 12,
+            "budget_weekly_pct": 34,
+            "max_budget_usd": 5.5,
+            "thread": "private-thread",
+            "private": True,
+            "max_tokens": 4500,
+            "max_seconds": 90,
+            "isolate": True,
+            "priority": "urgent",
+            "code": ["server.py:1-2"],
+            "then": '[{"when":"completed","role":"follow-up","prompt":"check"}]',
+            "review": "auto",
+        }
+        meta = {
+            "id": worker_id,
+            "provider": "local",
+            "model": "ollama/old-free",
+            "prompt": args["prompt"],
+            "private": True,
+            "launched_by": "launcher",
+            "spin_args": {**args, "provider": "local", "model": "ollama/old-free"},
+        }
+        route = {
+            "private": True,
+            "reason": "Private data, so it stays on this machine.",
+            "picks": [
+                {"provider": "claude", "model": "sonnet"},
+                {"provider": "local", "model": "ollama/new-model"},
+            ],
+        }
+        new_meta = {"id": new_worker_id}
+        with mock.patch.object(server, "route_task", return_value=route), \
+             mock.patch.object(server, "find_opencode_binary", return_value="/bin/sh"), \
+             mock.patch.object(server, "find_claude_binary", return_value="/bin/sh"), \
+             mock.patch.object(server, "t_spin_worker", return_value=f"Worker `{new_worker_id}` queued") as spin, \
+             mock.patch.object(server, "_load_worker", return_value=new_meta), \
+             mock.patch.object(server, "_save_worker") as save_worker, \
+             mock.patch.object(server, "_ping_launcher"), \
+             mock.patch.object(server, "notify_desktop_event") as notify:
+            result = server._handle_worker_exhaustion_or_stall(worker_id, meta, "stalled", is_stall=True)
+
+        kwargs = spin.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "local")
+        self.assertEqual(kwargs["model"], "ollama/new-model")
+        for key, value in args.items():
+            self.assertEqual(kwargs[key], value, key)
+        self.assertEqual(new_meta["launched_by"], "launcher")
+        save_worker.assert_called_once_with(new_meta)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["rerouted_to"], new_worker_id)
+        notify.assert_not_called()
+
+    def test_spin_worker_persists_privacy_and_all_original_spin_arguments(self):
+        captured = {}
+        spin_args = {
+            "role": "Private Worker",
+            "prompt": "Keep data local",
+            "provider": "local",
+            "track": "private-track",
+            "project_dir": self.temp_dir,
+            "timeout_seconds": 123,
+            "effort": "high",
+            "mode": "standard",
+            "model": "private-model",
+            "permission_mode": "auto_safe",
+            "capabilities": ["files:read", "files:write"],
+            "budget_session_pct": 12,
+            "budget_weekly_pct": 34,
+            "max_budget_usd": 5.5,
+            "thread": "private-thread",
+            "private": True,
+            "max_tokens": 4500,
+            "max_seconds": 90,
+            "isolate": True,
+            "priority": "urgent",
+            "code": None,
+            "then": "[]",
+            "review": "auto",
+        }
+
+        def capture_meta(meta):
+            captured.update(meta)
+
+        with mock.patch.object(server, "route_task", return_value={
+            "private": True, "reason": "Private data, so it stays on this machine.",
+            "picks": [{"provider": "local", "model": "private-model"}],
+        }), mock.patch.object(server, "find_opencode_binary", return_value="/bin/sh"), \
+             mock.patch.object(server, "_worker_command", return_value=["true"]), \
+             mock.patch.object(server, "resolve", return_value={"source": "local", "id": "thread-id"}), \
+             mock.patch.object(server, "check_budget_preflight", return_value=(True, "budget ok")), \
+             mock.patch.object(server, "_save_worker", side_effect=capture_meta), \
+             mock.patch.object(server, "t_broadcast_track"), \
+             mock.patch.object(server, "notify_if_still_waiting"):
+            result = server.t_spin_worker(**spin_args)
+
+        self.assertIn("[APPROVAL REQUIRED]", result)
+        self.assertTrue(captured["private"])
+        for key in ("max_tokens", "max_seconds", "budget_session_pct", "budget_weekly_pct", "max_budget_usd",
+                    "permission_mode", "capabilities", "isolate", "mode", "effort", "priority", "thread",
+                    "track", "project_dir", "code", "then", "review"):
+            expected = os.path.realpath(spin_args[key]) if key == "project_dir" else spin_args[key]
+            self.assertEqual(captured["spin_args"][key], expected, key)
+
+    def test_private_worker_without_local_alternative_fails_and_alerts(self):
+        worker_id = "worker_303030"
+        meta = {
+            "id": worker_id,
+            "provider": "local",
+            "model": "ollama/old-model",
+            "prompt": "private",
+            "private": True,
+            "launched_by": "launcher",
+        }
+        with mock.patch.object(server, "route_task", return_value={
+            "private": True, "reason": "Private data, so it stays on this machine.",
+            "picks": [{"provider": "claude", "model": "sonnet"}],
+        }), mock.patch.object(server, "_ping_launcher"), \
+             mock.patch.object(server, "notify_desktop_event") as notify:
+            result = server._handle_worker_exhaustion_or_stall(worker_id, meta, "stalled", is_stall=True)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("cannot leave the local provider", result["reason"])
+        notify.assert_called_once()
+        self.assertIn(worker_id, notify.call_args.args[0])
+        self.assertEqual(notify.call_args.kwargs["route"], "workers")
+
+    def test_opencode_free_usage_limit_marks_all_free_models_only(self):
+        worker_id = "worker_404040"
+        reset_time = time.time() + 1800
+        meta = {
+            "id": worker_id,
+            "provider": "opencode",
+            "model": "opencode/first-free",
+            "prompt": "task",
+        }
+        with mock.patch.object(server, "_opencode_models", return_value=[
+            "opencode/first-free", "opencode/second-free", "opencode/paid-model",
+        ]), mock.patch.object(server, "route_task", return_value={"picks": [], "reason": "No candidates"}), \
+             mock.patch.object(server, "_ping_launcher"), mock.patch.object(server, "notify_desktop_event"):
+            result = server._handle_worker_exhaustion_or_stall(
+                worker_id, meta, "Free usage limit reached", reset_time=reset_time,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        bad = server._load_json("bad_models.json")
+        self.assertAlmostEqual(bad["opencode/first-free"]["reset_time"], reset_time)
+        self.assertAlmostEqual(bad["opencode/second-free"]["reset_time"], reset_time)
+        self.assertNotIn("opencode/paid-model", bad)
+        self.assertTrue(server._model_is_bad("opencode/second-free"))
+        self.assertFalse(server._model_is_bad("opencode/paid-model"))
 
     def test_quota_error_worker_stops_marks_exhausted_and_reroutes(self):
         """A fake worker whose output contains a quota error is stopped, the model marked exhausted,
@@ -297,7 +561,7 @@ class TestStallAndReroute(unittest.TestCase):
             "status": "running",
             "pid": os.getpid(),
             "rerouted_from": "worker_orig_1",  # Already rerouted once
-            "cmd": [sys.executable, "-c", "import sys; print('Rate limit exceeded: 429'); sys.exit(1)"],
+            "cmd": [sys.executable, "-c", "import sys; print('Error: Rate limit exceeded: HTTP 429'); sys.exit(1)"],
             "log_file": log_file,
         }
         server._save_worker(meta)
@@ -404,7 +668,7 @@ class TestStallAndReroute(unittest.TestCase):
             "track": "main",
             "status": "running",
             "pid": os.getpid(),
-            "cmd": [sys.executable, "-c", "import sys; print('Free limit reached'); sys.exit(1)"],
+            "cmd": [sys.executable, "-c", "import sys; print('Error: Free usage limit reached'); sys.exit(1)"],
             "log_file": log_file,
         }
         server._save_worker(meta)
