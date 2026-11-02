@@ -1405,6 +1405,46 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertEqual(updated["status"], "completed")
         self.assertIn("Report: allowed and finished", updated.get("report", ""))
 
+    def test_copilot_acp_permission_uses_subway_relay(self):
+        script_path = self._create_fake_opencode2()
+        worker_id = "worker_c0a001"
+        meta = {
+            "id": worker_id,
+            "role": "ACP Worker",
+            "provider": "copilot",
+            "cmd": [sys.executable, script_path, "--acp"],
+            "project_dir": self.test_dir,
+            "log_file": server._log_file(worker_id),
+            "status": "running",
+            "pid": os.getpid(),
+            "prompt": "test_allow",
+            "model": "auto",
+            "effort": "auto",
+            "permission_mode": "ask",
+            "timeout_seconds": 10,
+        }
+        server._save_worker(meta)
+        original_request = server.request_permission
+        captured = {}
+
+        def answer_via_subway(*args, **kwargs):
+            rid = original_request(*args, **kwargs)
+            captured["rid"] = rid
+            server._answer_permission(rid, "allow", "tester")
+            return rid
+
+        with mock.patch.object(server, "request_permission", side_effect=answer_via_subway) as request:
+            code = server.supervise_worker(worker_id)
+
+        self.assertEqual(code, 0)
+        request.assert_called_once()
+        permission = server._load_json(server._perm_file(captured["rid"]))
+        self.assertEqual(permission["provider"], "copilot")
+        self.assertEqual(permission["decision"], "allow")
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("Report: allowed and finished", updated.get("report", ""))
+
     def test_opencode_acp_deny_is_sent_as_reject_once(self):
         script_path = self._create_fake_opencode2()
         worker_id = "worker_a0c002"
