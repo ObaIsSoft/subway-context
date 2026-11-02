@@ -10,7 +10,7 @@
     "directory": "vscode"
   },
   "engines": {
-    "vscode": "^1.74.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "Other"
@@ -25,7 +25,29 @@
       {
         "command": "subway.openHud",
         "title": "Subway: Open HUD"
+      },
+      {
+        "command": "subway.shareTerminal",
+        "title": "Subway: Share This Terminal"
+      },
+      {
+        "command": "subway.stopSharingTerminal",
+        "title": "Subway: Stop Sharing This Terminal"
+      },
+      {
+        "command": "subway.allowTerminalCommands",
+        "title": "Subway: Allow Commands From HUD In This Terminal"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Subway Context",
+      "properties": {
+        "subway.terminalSharing.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable capturing commands from terminals you explicitly share with Subway Context."
+        }
+      }
+    }
   }
 }

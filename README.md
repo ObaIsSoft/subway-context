@@ -313,6 +313,16 @@ export SUBWAY_HUD_ORIGINS="vscode-webview://*,http://127.0.0.1:3000"
 
 ---
 
+## Terminals
+
+Subway Context can capture commands from terminals you explicitly share with it, so agents and the HUD can see what failed and hand it to a worker — nothing is captured from anywhere you haven't opted in.
+
+- **VS Code / Antigravity / Cursor / Windsurf extension**: install the Subway Context VS Code extension, then enable the `subway.terminalSharing.enabled` setting and run **Subway: Share This Terminal** on the terminal you want captured (no shell integration → nothing is captured, shown in the HUD as "no shell integration"). **Subway: Allow Commands From HUD In This Terminal** additionally lets `run_terminal` execute commands there. **Subway: Stop Sharing This Terminal** opts back out.
+- **Standalone zsh/bash shells**: `subway-context terminal hook install [zsh|bash]` adds a marked block to your `.zshrc`/`.bashrc` (backing up the original first) that reports each finished command's text, exit code and working directory in the background — never its output. `subway-context terminal hook status` and `subway-context terminal hook uninstall [zsh|bash]` check or cleanly remove it.
+- Captured commands are redacted (tokens, keys, passwords, `Authorization` headers) before they reach the store, and are visible via `read_terminal`, `search_terminal`, and the HUD's **Terminals** page, where a failed command can be handed straight to a worker.
+
+---
+
 ## Quota & Rate Limit Tracking
 
 Subway Context tracks live rate limits, token usage, and session windows across detected AI clients:
@@ -440,6 +450,7 @@ subway-context tail <worker_id>                   # Inspect worker status and lo
 subway-context locks                              # View active workspace leases
 subway-context track [name]                       # View shared context track
 subway-context quota [source]                     # View quota and token metrics
+subway-context terminal hook install|uninstall|status [zsh|bash]  # Manage the shell capture hook
 subway-context install | status | uninstall       # Manage agent registrations
 subway-context <tool> '<json args>'               # Call any MCP tool directly
 ```

@@ -4,6 +4,7 @@ import _sandbox  # noqa: E402,F401
 
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -302,6 +303,263 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         res = server.t_run_terminal("t1", "rm -rf something", timeout_seconds=5)
         t.join(timeout=5)
         self.assertIn("DENIED", res)
+
+
+class TerminalHookTests(unittest.TestCase):
+    """Exercises hook install, uninstall, status and script in terminals.py."""
+
+    def setUp(self):
+        self.temp_home = tempfile.mkdtemp(prefix="subway_hook_home_")
+        self.env_patcher = mock.patch.dict(os.environ, {"HOME": self.temp_home, "SHELL": "/bin/bash"})
+        self.env_patcher.start()
+        self.orig_subway_dir = server.SUBWAY_DIR
+        self.orig_workers_dir = server.WORKERS_DIR
+        self.orig_tracks_dir = server.TRACKS_DIR
+        server.SUBWAY_DIR = os.path.join(self.temp_home, ".subway-context")
+        server.WORKERS_DIR = os.path.join(server.SUBWAY_DIR, "workers")
+        server.TRACKS_DIR = os.path.join(server.SUBWAY_DIR, "tracks")
+
+    def tearDown(self):
+        server.SUBWAY_DIR = self.orig_subway_dir
+        server.WORKERS_DIR = self.orig_workers_dir
+        server.TRACKS_DIR = self.orig_tracks_dir
+        self.env_patcher.stop()
+        shutil.rmtree(self.temp_home, ignore_errors=True)
+
+    def test_install_fresh_rc(self):
+        # Bash on fresh home
+        msg = terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890", token="secret_hud_token")
+        self.assertIn("Installed the bash hook", msg)
+        self.assertIn("http://127.0.0.1:7890", msg)
+        self.assertNotIn("secret_hud_token", msg)
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        backup_path = rc_path + ".subway-bak"
+        self.assertTrue(os.path.exists(rc_path))
+        self.assertTrue(os.path.exists(backup_path))
+        with open(backup_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "")
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            self.assertIn(terminals.HOOK_BEGIN_MARKER, content)
+            self.assertIn(terminals.HOOK_END_MARKER, content)
+            self.assertIn("SUBWAY_TERMINAL_ID", content)
+
+        script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
+        self.assertTrue(os.path.exists(script_path))
+
+        # Zsh on fresh home
+        msg_zsh = terminals.install_hook(shell="zsh", server_url="http://127.0.0.1:7890")
+        self.assertIn("Installed the zsh hook", msg_zsh)
+        zsh_rc = os.path.join(self.temp_home, ".zshrc")
+        self.assertTrue(os.path.exists(zsh_rc))
+        with open(zsh_rc, "r", encoding="utf-8") as f:
+            zsh_content = f.read()
+            self.assertIn("preexec_functions+=(_subway_preexec)", zsh_content)
+
+    def test_install_existing_content_preserved_and_backed_up(self):
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        initial = "export MY_VAR=123\nalias g=git\n"
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write(initial)
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        backup_path = rc_path + ".subway-bak"
+        with open(backup_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), initial)
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            self.assertTrue(content.startswith("export MY_VAR=123\nalias g=git\n\n" + terminals.HOOK_BEGIN_MARKER))
+
+    def test_install_twice_no_duplicates_and_backup_not_overwritten(self):
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        initial = "# my initial config\n"
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write(initial)
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        backup_path = rc_path + ".subway-bak"
+        with open(backup_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), initial)
+
+        # Second install
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        with open(backup_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), initial)  # Still original, not modified by first install
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            self.assertEqual(content.count(terminals.HOOK_BEGIN_MARKER), 1)
+            self.assertEqual(content.count(terminals.HOOK_END_MARKER), 1)
+
+    def test_uninstall_hook(self):
+        rc_path = os.path.join(self.temp_home, ".zshrc")
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write("export ZSH_VAR=1\n")
+        terminals.install_hook(shell="zsh", server_url="http://127.0.0.1:7890")
+        script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
+        self.assertTrue(os.path.exists(script_path))
+
+        res = terminals.uninstall_hook(shell="zsh")
+        self.assertIn("Uninstalled the zsh hook", res)
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            self.assertNotIn(terminals.HOOK_BEGIN_MARKER, content)
+            self.assertNotIn(terminals.HOOK_END_MARKER, content)
+            self.assertIn("export ZSH_VAR=1", content)
+        self.assertFalse(os.path.exists(script_path))
+
+    def test_uninstall_not_installed(self):
+        # Case 1: rc does not exist
+        res = terminals.uninstall_hook(shell="bash")
+        self.assertIn("does not exist", res)
+
+        # Case 2: rc exists but no hook
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write("# no hooks here\n")
+        res = terminals.uninstall_hook(shell="bash")
+        self.assertIn("No subway-context hook installed", res)
+        with open(rc_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# no hooks here\n")
+
+    def test_hook_status(self):
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        # Fresh home, no rc file
+        res = terminals.hook_status(shell="bash")
+        self.assertIn("Not installed", res)
+        self.assertIn("does not exist", res)
+
+        # rc exists without hook
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write("echo hi\n")
+        res = terminals.hook_status(shell="bash")
+        self.assertIn("Not installed in", res)
+
+        # After install
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        res = terminals.hook_status(shell="bash")
+        self.assertEqual(res, f"Installed in {rc_path}.")
+
+    def test_unsupported_or_undetected_shell(self):
+        # Explicit unsupported shell
+        for fn in (terminals.install_hook, terminals.uninstall_hook, terminals.hook_status):
+            msg = fn(shell="fish")
+            self.assertIn("Unsupported or undetected shell 'fish'", msg)
+
+        # Undetected shell from environment
+        with mock.patch.dict(os.environ, {"SHELL": "/bin/csh"}):
+            for fn in (terminals.install_hook, terminals.uninstall_hook, terminals.hook_status):
+                msg = fn(shell="")
+                self.assertIn("Unsupported or undetected shell 'csh'", msg)
+
+        # Unset shell
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SHELL", None)
+            for fn in (terminals.install_hook, terminals.uninstall_hook, terminals.hook_status):
+                msg = fn(shell="")
+                self.assertIn("Unsupported or undetected shell '?'", msg)
+
+    def test_default_shell_from_env(self):
+        with mock.patch.dict(os.environ, {"SHELL": "/usr/local/bin/zsh"}):
+            msg = terminals.hook_status(shell="")
+            self.assertIn(".zshrc", msg)
+
+        with mock.patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+            msg = terminals.hook_status(shell="")
+            self.assertIn(".bashrc", msg)
+
+    def test_unwritable_rc_file_does_not_crash(self):
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write("# read-only test\n")
+        try:
+            os.chmod(rc_path, 0o400)
+            res_install = terminals.install_hook(shell="bash")
+            self.assertIsInstance(res_install, str)
+            res_uninstall = terminals.uninstall_hook(shell="bash")
+            self.assertIsInstance(res_uninstall, str)
+            res_status = terminals.hook_status(shell="bash")
+            self.assertIsInstance(res_status, str)
+        finally:
+            os.chmod(rc_path, 0o600)
+
+    def test_no_token_leakage(self):
+        secret = "secret_auth_token_9999"
+        res = terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890", token=secret)
+        self.assertNotIn(secret, res)
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        with open(rc_path, "r", encoding="utf-8") as f:
+            self.assertNotIn(secret, f.read())
+        script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
+        with open(script_path, "r", encoding="utf-8") as f:
+            self.assertNotIn(secret, f.read())
+
+    def test_bash_sourcing_roundtrip(self):
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        env = dict(os.environ, HOME=self.temp_home)
+        res = subprocess.run(
+            ["bash", "-c", f"source {rc_path}; true; echo done"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(res.returncode, 0, f"stderr: {res.stderr}")
+        self.assertIn("done", res.stdout)
+
+    def test_bash_sourcing_with_preexisting_trap(self):
+        rc_path = os.path.join(self.temp_home, ".bashrc")
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write("trap 'echo existing_trap' DEBUG\n")
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        env = dict(os.environ, HOME=self.temp_home)
+        res = subprocess.run(
+            ["bash", "-c", f"source {rc_path}; true; echo done"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(res.returncode, 0, f"stderr: {res.stderr}")
+        self.assertIn("done", res.stdout)
+
+    def test_zsh_sourcing_roundtrip(self):
+        if not shutil.which("zsh"):
+            self.skipTest("zsh not installed on test machine")
+        terminals.install_hook(shell="zsh", server_url="http://127.0.0.1:7890")
+        rc_path = os.path.join(self.temp_home, ".zshrc")
+        env = dict(os.environ, HOME=self.temp_home)
+        res = subprocess.run(
+            ["zsh", "-c", f"source {rc_path}; true; echo done"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(res.returncode, 0, f"stderr: {res.stderr}")
+        self.assertIn("done", res.stdout)
+
+    def test_terminal_hook_script_roundtrip(self):
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
+        env = dict(os.environ, HOME=self.temp_home)
+        # Test optin
+        res1 = subprocess.run(
+            ["python3", script_path, "optin", "tid-1", self.temp_home],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(res1.returncode, 0)
+
+        # Test event
+        res2 = subprocess.run(
+            ["python3", script_path, "event", "tid-1", "ls -la", "0", "100.0", "101.5", self.temp_home],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(res2.returncode, 0)
 
 
 if __name__ == "__main__":

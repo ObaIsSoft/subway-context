@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from typing import Any, Dict, List, Optional
@@ -334,3 +335,191 @@ def prune_terminal(base_dir: str, terminal_id: str) -> None:
     if pruned != commands:
         rec["commands"] = pruned
         _write_json_atomic(path, rec)
+
+
+def _hook_shell_and_rc(shell: str):
+    """Returns (shell_name, rc_path) or (None, error_message)."""
+    name = (shell or "").strip().lower()
+    if not name:
+        name = os.path.basename(os.environ.get("SHELL", ""))
+    if name not in ("zsh", "bash"):
+        return None, f"Unsupported or undetected shell '{name or '?'}': pass shell='zsh' or shell='bash' explicitly."
+    rc_path = os.path.join(os.path.expanduser("~"), ".zshrc" if name == "zsh" else ".bashrc")
+    return name, rc_path
+
+
+_HOOK_SCRIPT = '''#!/usr/bin/env python3
+import sys, os, json, urllib.request
+
+def _hud():
+    base = os.path.join(os.path.expanduser("~"), ".subway-context")
+    port = 7890
+    try:
+        with open(os.path.join(base, "hud.json")) as f:
+            port = int(json.load(f).get("port") or 7890)
+    except Exception:
+        pass
+    token = ""
+    try:
+        with open(os.path.join(base, "hud_token")) as f:
+            token = f.read().strip()
+    except Exception:
+        pass
+    return port, token
+
+def _post(path, body):
+    port, token = _hud()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%s%s" % (port, path),
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Subway-Token": token},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+def main():
+    args = sys.argv[1:]
+    kind = args[0] if args else ""
+    if kind == "optin" and len(args) >= 3:
+        tid, folder = args[1], args[2]
+        _post("/api/terminal_opt_in", {
+            "terminal_id": tid, "name": "shell", "window_id": "",
+            "folder": folder, "share_enabled": True, "allow_commands": False,
+            "shell_integration": True,
+        })
+    elif kind == "event" and len(args) >= 6:
+        tid, command, code, start, end, folder = args[1:7]
+        _post("/api/terminal_event", {
+            "terminal_id": tid, "command": command,
+            "exit_code": (int(code) if code not in ("", "None") else None),
+            "start_ts": float(start), "end_ts": float(end), "output": "",
+            "caller_id": "shell", "name": "shell", "window_id": "", "folder": folder,
+        })
+
+if __name__ == "__main__":
+    main()
+'''
+
+_ZSH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
+  export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
+  python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 &
+  _subway_preexec() {
+    SUBWAY_CMD_START=$EPOCHREALTIME
+    SUBWAY_CMD="$1"
+  }
+  _subway_precmd() {
+    local code=$?
+    if [ -n "$SUBWAY_CMD" ]; then
+      python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$EPOCHREALTIME" "$PWD" >/dev/null 2>&1 &
+      unset SUBWAY_CMD
+    fi
+    return $code
+  }
+  preexec_functions+=(_subway_preexec)
+  precmd_functions+=(_subway_precmd)
+fi'''
+
+_BASH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
+  export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
+  python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 &
+  _subway_prev_debug_cmd=""
+  if trap -p DEBUG | grep -q .; then
+    _subway_prev_debug_cmd=$(trap -p DEBUG | sed -E "s/^trap -- '(.*)' DEBUG$/\\\\1/")
+  fi
+  _subway_preexec() {
+    if [ -n "$_subway_prev_debug_cmd" ]; then eval "$_subway_prev_debug_cmd"; fi
+    SUBWAY_CMD="$BASH_COMMAND"
+    SUBWAY_CMD_START=$(date +%s.%N)
+  }
+  trap '_subway_preexec' DEBUG
+  _subway_precmd() {
+    local code=$?
+    if [ -n "$SUBWAY_CMD" ]; then
+      python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$(date +%s.%N)" "$PWD" >/dev/null 2>&1 &
+      unset SUBWAY_CMD
+    fi
+    return $code
+  }
+  PROMPT_COMMAND="_subway_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+fi'''
+
+_HOOK_BLOCK_RE = re.compile(re.escape(HOOK_BEGIN_MARKER) + r".*?" + re.escape(HOOK_END_MARKER) + r"\n?", re.DOTALL)
+_HOOK_SCRIPT_NAME = "terminal_hook.py"
+
+
+def install_hook(shell: str = "", server_url: str = "", token: str = "") -> str:
+    name, rc_path = _hook_shell_and_rc(shell)
+    if name is None:
+        return rc_path  # it's the error message in this branch
+    try:
+        if not os.path.exists(rc_path):
+            open(rc_path, "a", encoding="utf-8").close()
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        return f"Could not read {rc_path}: {e}"
+    backup_path = rc_path + ".subway-bak"
+    if not os.path.exists(backup_path):
+        try:
+            shutil.copy2(rc_path, backup_path)
+        except OSError as e:
+            return f"Could not back up {rc_path}: {e}"
+    content = _HOOK_BLOCK_RE.sub("", content)
+    block = _ZSH_BLOCK if name == "zsh" else _BASH_BLOCK
+    new_content = content.rstrip("\n") + "\n\n" + HOOK_BEGIN_MARKER + "\n" + block + "\n" + HOOK_END_MARKER + "\n"
+    try:
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        subway_dir = os.path.join(os.path.expanduser("~"), ".subway-context")
+        os.makedirs(subway_dir, exist_ok=True)
+        with open(os.path.join(subway_dir, _HOOK_SCRIPT_NAME), "w", encoding="utf-8") as f:
+            f.write(_HOOK_SCRIPT)
+    except OSError as e:
+        return f"Could not write {rc_path}: {e}"
+    return (f"Installed the {name} hook in {rc_path} (backed up the original to {backup_path}). "
+            f"Open a new {name} session, or run `source {rc_path}`, for it to take effect. "
+            f"It will report to whatever HUD is running on {server_url} at the time each command finishes.")
+
+
+def uninstall_hook(shell: str = "") -> str:
+    name, rc_path = _hook_shell_and_rc(shell)
+    if name is None:
+        return rc_path
+    if not os.path.exists(rc_path):
+        return f"No hook found: {rc_path} does not exist."
+    try:
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        return f"Could not read {rc_path}: {e}"
+    if HOOK_BEGIN_MARKER not in content:
+        return f"No subway-context hook installed in {rc_path}."
+    new_content = _HOOK_BLOCK_RE.sub("", content)
+    try:
+        with open(rc_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError as e:
+        return f"Could not write {rc_path}: {e}"
+    script_path = os.path.join(os.path.expanduser("~"), ".subway-context", _HOOK_SCRIPT_NAME)
+    with contextlib.suppress(OSError):
+        if os.path.exists(script_path):
+            os.remove(script_path)
+    return f"Uninstalled the {name} hook from {rc_path}."
+
+
+def hook_status(shell: str = "") -> str:
+    name, rc_path = _hook_shell_and_rc(shell)
+    if name is None:
+        return rc_path
+    if not os.path.exists(rc_path):
+        return f"Not installed ({rc_path} does not exist)."
+    try:
+        with open(rc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        return f"Could not read {rc_path}: {e}"
+    return f"Installed in {rc_path}." if HOOK_BEGIN_MARKER in content else f"Not installed in {rc_path}."
+

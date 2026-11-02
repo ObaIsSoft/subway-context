@@ -1097,7 +1097,7 @@ async function openTerminalDetail(t) {
   }
 }
 
-export function terminalsPage(d, rows, onRefresh, error = "") {
+export function terminalsPage(d, rows, onRefresh, error = "", loading = false, stale = false) {
   const list = rows || [];
   const bodyRows = list.map((t) => h("div", {
     class: "row", tabindex: "0", role: "button",
@@ -1114,10 +1114,12 @@ export function terminalsPage(d, rows, onRefresh, error = "") {
   return h("section", { class: "card" },
     h("div", { class: "card-head" },
       h("div", {}, h("h2", { class: "card-title" }, "Terminals"),
+        stale && !error ? h("span", { class: "tag" }, "stale") : null,
         h("div", { class: "card-sub" }, "Commands run in terminals your user has shared. Nothing is captured until they opt in.")),
       h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
     error ? h("div", { class: "err" }, `Could not refresh terminals: ${error}`) : null,
-    h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" }, "No terminals have been shared yet.")));
+    h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" },
+      loading ? "Loading…" : "No terminals have been shared yet.")));
 }
 
 /* Ledger */

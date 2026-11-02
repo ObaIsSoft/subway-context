@@ -88,6 +88,7 @@ function render() {
   const views = {
     overview: () => overview(d), usage: () => usagePage(d), workers: () => workersPage(d),
     threads: () => threadsPage(d, threads.chats, () => loadThreads(true), threads.error),
+    terminals: () => terminalsPage(d, terminalsState.rows, () => loadTerminals(true), terminalsState.error, terminalsState.loading, terminalsState.loadedAt > 0 && !terminalsState.error && (Date.now() - terminalsState.loadedAt > 20000)),
     models: () => modelsPage(d),
     leases: () => leasesPage(d), ledger: () => ledgerPage(d, switchTrack),
     help: () => helpPage(),
