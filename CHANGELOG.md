@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.2 - 2026-11-02
+
+- **HUD status is fast**: `/api/status` answers from the last snapshot (per project) and refreshes in the background once it is 10 seconds old or after any change made from the HUD. Only the first request after a restart waits for a full read. Routing, budgets and workers still read live data.
+- **No more broken-pipe traces**: a browser that reloads or closes mid-response is not an error, so the HUD no longer prints a traceback for it.
+
 ## 1.3.1 - 2026-11-02
 
 > [!IMPORTANT]

@@ -65,7 +65,7 @@ try:
 except ImportError:  # Windows: state stays atomic per write, but not serialized across processes.
     fcntl = None  # type: ignore[assignment]
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("SUBWAY_CLAUDE_DIR", os.path.join(HOME, ".claude"))
 CLAUDE_JSON = os.environ.get("SUBWAY_CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
