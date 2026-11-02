@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import shutil
 import tempfile
@@ -112,6 +113,170 @@ class TestCopilotWorkers(unittest.TestCase):
                 copilot_prov = next((p for p in provs if p["id"] == "copilot"), None)
                 if copilot_prov:
                     self.assertFalse(copilot_prov["client"]["dispatchable"])
+
+
+class TestCopilotPermissionFallback(unittest.TestCase):
+    class Process:
+        def __init__(self, stdout=b"", returncode=0):
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(stdout)
+            self.stderr = io.BytesIO()
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = self.temp.name
+        paths = {
+            "HOME": root,
+            "SUBWAY_DIR": os.path.join(root, ".subway-context"),
+            "WORKERS_DIR": os.path.join(root, ".subway-context", "workers"),
+            "TRACKS_DIR": os.path.join(root, ".subway-context", "tracks"),
+            "LOCKS_FILE": os.path.join(root, ".subway-context", "locks.json"),
+            "QUOTAS_FILE": os.path.join(root, ".subway-context", "quotas.json"),
+            "CLAUDE_DIR": os.path.join(root, ".claude"),
+            "CLAUDE_JSON": os.path.join(root, ".claude.json"),
+            "AGY_DIR": os.path.join(root, ".gemini", "antigravity"),
+            "OPENCODE_DIR": os.path.join(root, ".local", "share", "opencode"),
+            "OPENCODE_AGENTS_DIR": os.path.join(root, ".config", "opencode", "agents"),
+        }
+        for name, value in paths.items():
+            p = patch.object(server, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        env_patch = patch.dict(os.environ, {
+            "HOME": root,
+            "SUBWAY_DIR": paths["SUBWAY_DIR"],
+            "SUBWAY_CLAUDE_DIR": paths["CLAUDE_DIR"],
+            "SUBWAY_CLAUDE_JSON": paths["CLAUDE_JSON"],
+            "SUBWAY_AGY_DIR": paths["AGY_DIR"],
+            "SUBWAY_OPENCODE_DIR": paths["OPENCODE_DIR"],
+            "SUBWAY_OPENCODE_AGENTS_DIR": paths["OPENCODE_AGENTS_DIR"],
+            "SUBWAY_NO_NOTIFY": "1",
+        })
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        server._ensure_subway_dir()
+        server._copilot_raw.clear()
+        server._copilot_models.clear()
+        server._model_catalog.clear()
+        server._hud_cache.clear()
+        self.addCleanup(server._copilot_raw.clear)
+        self.addCleanup(server._copilot_models.clear)
+        self.addCleanup(server._model_catalog.clear)
+        self.addCleanup(server._hud_cache.clear)
+
+    def _worker(self, isolate=False, max_tokens=0):
+        wid = "worker_a1b2c3"
+        project = os.path.join(self.temp.name, "project")
+        os.makedirs(project, exist_ok=True)
+        worktree = os.path.join(server.SUBWAY_DIR, "worktrees", wid) if isolate else ""
+        if worktree:
+            os.makedirs(worktree, exist_ok=True)
+        cmd = server._worker_command(
+            "copilot", "/mock/copilot", "auto", "low", False,
+            ["files:read", "files:write", "terminal:safe"], "ask", "do task", None, "",
+            worker_id=wid, workdir=worktree or project, isolate=isolate,
+        )
+        meta = {
+            "id": wid, "role": "Tester", "provider": "copilot", "model": "auto",
+            "effort": "low", "mode": "standard", "permission_mode": "ask",
+            "capabilities": ["files:read", "files:write", "terminal:safe"],
+            "skip_permissions": False, "budget": {"max_tokens": max_tokens},
+            "track": "main", "project_dir": project, "worktree": worktree or None,
+            "isolate": isolate, "launched_by": "launcher-test", "cmd": cmd,
+            "status": "running", "timeout_seconds": 0, "usage": {"input": 0, "output": 0},
+            "prompt": "do task", "log_file": server._log_file(wid), "pid": 4321,
+        }
+        server._save_worker(meta)
+        return meta
+
+    def _run_supervisor(self, meta, processes):
+        def safe_result(_proc, _out, run, _quota_handler):
+            run["response"] = "safe-mode result"
+
+        with patch.object(server.subprocess, "Popen", side_effect=processes), \
+             patch.object(server, "_pump_copilot", side_effect=safe_result), \
+             patch.object(server, "_record_worker_stat"), \
+             patch.object(server, "_settle_worker_result"), \
+             patch.object(server, "_collect_worktree", return_value="No files changed."), \
+             patch.object(server, "_run_triggers"), \
+             patch.object(server, "start_approved_workers"), \
+             patch.object(server, "notify_desktop_event"), \
+             patch.object(server.signal, "signal"):
+            server.supervise_worker(meta["id"])
+
+    def test_acp_start_failure_falls_back_to_safe_commands_and_notifies(self):
+        for isolate in (False, True):
+            with self.subTest(isolate=isolate):
+                meta = self._worker(isolate=isolate, max_tokens=4000)
+                fallback_proc = self.Process()
+                self._run_supervisor(meta, [OSError("ACP unavailable"), fallback_proc])
+
+                saved = server._load_worker(meta["id"])
+                note = "Copilot ACP unavailable; running with safe-command auto-approval"
+                self.assertEqual(saved["start_note"], note)
+                self.assertIn(note, server.t_worker_status(meta["id"]))
+                self.assertIn(note, server.worker_listing())
+                inbox = os.path.join(server.SUBWAY_DIR, "inbox", "launcher-test.jsonl")
+                with open(inbox, encoding="utf-8") as f:
+                    self.assertIn(note, f.read())
+                self.assertNotIn("--acp", saved["cmd"])
+                self.assertIn("-p", saved["cmd"])
+                self.assertIn("--allow-tool=shell(ls:*)", saved["cmd"])
+                expected_write = os.path.join(server.SUBWAY_DIR, "worktrees", meta["id"]) if isolate else meta["project_dir"]
+                self.assertIn(f"--allow-tool=write({os.path.realpath(expected_write)})", saved["cmd"])
+                self.assertNotIn("--max-ai-credits", saved["cmd"])
+
+    def test_acp_handshake_failure_falls_back_and_success_does_not_add_note(self):
+        init_reply = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode()
+        failed_session = json.dumps({"jsonrpc": "2.0", "id": 2, "error": {"code": -1, "message": "ACP unsupported"}}).encode()
+        broken_acp = self.Process(stdout=b"\n".join((init_reply, failed_session)) + b"\n", returncode=None)
+        safe_proc = self.Process()
+        meta = self._worker()
+        self._run_supervisor(meta, [broken_acp, safe_proc])
+        self.assertIn("start_note", server._load_worker(meta["id"]))
+
+        session_reply = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "copilot-session"}}).encode()
+        prompt_reply = json.dumps({"jsonrpc": "2.0", "id": 3, "result": {"response": "ACP result"}}).encode()
+        working_acp = self.Process(stdout=b"\n".join((init_reply, session_reply, prompt_reply)) + b"\n", returncode=None)
+        meta_ok = self._worker()
+        self._run_supervisor(meta_ok, [working_acp])
+        self.assertNotIn("start_note", server._load_worker(meta_ok["id"]))
+
+    def test_copilot_usd_cap_maps_to_credits_but_token_cap_does_not(self):
+        route = {"picks": [{"provider": "copilot", "model": "auto"}], "private": False, "reason": "test route"}
+        mocks = [
+            patch.object(server, "find_claude_binary", return_value="/mock/claude"),
+            patch.object(server, "find_opencode_binary", return_value="/mock/opencode"),
+            patch.object(server, "find_agy_binary", return_value="/mock/agy"),
+            patch.object(server, "find_copilot_binary", return_value="/mock/copilot"),
+            patch.object(server, "route_task", return_value=route),
+            patch.object(server, "check_budget_preflight", return_value=(True, "Budget approved.")),
+            patch.object(server, "t_broadcast_track"),
+            patch.object(server, "notify_if_still_waiting"),
+            patch.object(server, "start_approved_workers"),
+            patch.object(server, "_self_id", return_value="launcher-test"),
+        ]
+        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4], mocks[5], mocks[6], mocks[7], mocks[8], mocks[9]:
+            server.t_spin_worker("Capped", "do capped task", provider="copilot", model="auto", max_budget_usd=1.25)
+            server.t_spin_worker("Token capped", "do token task", provider="copilot", model="auto", max_tokens=5000)
+        workers = {w["role"]: w for w in server._all_workers()}
+        self.assertIn("--max-ai-credits", workers["Capped"]["cmd"])
+        credit_index = workers["Capped"]["cmd"].index("--max-ai-credits")
+        self.assertEqual(workers["Capped"]["cmd"][credit_index + 1], "125")
+        self.assertNotIn("--max-ai-credits", workers["Token capped"]["cmd"])
 
 
 class TestCopilotIntegration(unittest.TestCase):

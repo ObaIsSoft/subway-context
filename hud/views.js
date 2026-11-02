@@ -475,6 +475,7 @@ function workerRow(w, past) {
     h("div", {}, h("div", { class: "row-title" }, w.role || "Worker"),
       h("div", { class: "row-sub" }, h("span", { class: "mono" }, w.id), w.project_dir ? ` · ${w.project_dir}` : ""),
       textEl,
+      w.start_note ? h("div", { class: "row-sub" }, `Start note: ${w.start_note}`) : null,
       w.status_reason ? h("div", { class: "row-sub" }, `Reason: ${w.status_reason}`) : null,
       verifyLineEl,
       h("div", {}, logToggleBtn),
@@ -540,7 +541,7 @@ function openDelegate(d) {
   } } },
     field("Role", role), field("Agent", provider), field("Permissions", permission), field("Model (optional)", model), field("Effort", effort),
     field("Folder (optional)", folder), field("Timeout, minutes (0 for none)", timeout), field("Most of the 5-hour limit to use, points", cap5), field("Most of the weekly limit to use, points", capWk),
-    field("Spend cap, USD (Claude only)", usd), field("Token cap (Antigravity only)", maxTokens), field("Task", prompt, true),
+    field("Spend cap, USD (Claude or Copilot)", usd), field("Token cap (Antigravity only)", maxTokens), field("Task", prompt, true),
     h("label", { class: "check field full" }, keepPrivate, h("span", {}, "Keep this task on this machine")),
     h("label", { class: "check field full" }, god, h("span", {}, "God mode: maximum effort with permission prompts off. Only for a task you trust completely.")),
     verdict, h("div", { class: "btns field full" }, h("button", { class: "btn primary", type: "submit" }, "Queue for approval")));
