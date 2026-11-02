@@ -1515,3 +1515,44 @@ class TestPrecompactSegment(unittest.TestCase):
         with mock.patch.object(server, "t_broadcast_track", side_effect=lambda **k: sent.append(k["message"])):
             server.hook_precompact({"trigger": "auto", "transcript_path": tp, "session_id": "abc"})
         self.assertIn("segment=1", sent[1])
+
+
+class TestHudCache(unittest.TestCase):
+    def setUp(self):
+        server._hud_cache.clear()
+
+    def tearDown(self):
+        server._hud_cache.clear()
+
+    def test_cached_per_project_and_refreshed_in_background(self):
+        from unittest.mock import patch
+        calls = []
+
+        def fake(project=""):
+            calls.append(project)
+            return {"project": project, "fetched_at": time.time()}
+        with patch.object(server, "_compile_hud_data", side_effect=fake):
+            self.assertEqual(server.get_hud_data("a")["project"], "a")
+            self.assertEqual(server.get_hud_data("b")["project"], "b")
+            self.assertEqual(server.get_hud_data("a")["project"], "a")
+            self.assertEqual(calls, ["a", "b"])
+            server.mark_hud_cache_stale()
+            self.assertEqual(server.get_hud_data("a")["project"], "a")  # Served at once, refresh started.
+            for _ in range(50):
+                if calls.count("a") == 2:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(calls.count("a"), 2)
+
+    def test_send_json_ignores_closed_connection(self):
+        handler = server.SubwayHUDHandler.__new__(server.SubwayHUDHandler)
+        handler.send_response = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler._security_headers = lambda *a, **k: None
+        handler.end_headers = lambda: None
+
+        class Broken:
+            def write(self, _):
+                raise BrokenPipeError()
+        handler.wfile = Broken()
+        handler.send_json({"ok": True})  # Must not raise.
