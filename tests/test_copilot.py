@@ -1,5 +1,8 @@
 import json
 import os
+import shutil
+import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -81,3 +84,80 @@ class TestCopilotWorkers(unittest.TestCase):
                 copilot_prov = next((p for p in provs if p["id"] == "copilot"), None)
                 if copilot_prov:
                     self.assertFalse(copilot_prov["client"]["dispatchable"])
+
+
+class TestCopilotIntegration(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "copilot_run.jsonl")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_copilot_cli_usage_missing_folder(self):
+        missing_dir = os.path.join(self.temp_dir, "nonexistent")
+        res = server._copilot_cli_usage(missing_dir)
+        self.assertIsNone(res)
+
+    def test_copilot_cli_usage_from_fixture(self):
+        sess_dir = os.path.join(self.temp_dir, "session-1")
+        os.makedirs(sess_dir, exist_ok=True)
+        dest_events = os.path.join(sess_dir, "events.jsonl")
+
+        now = time.time()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+        with open(self.fixture_path, "r", encoding="utf-8") as f_in, open(dest_events, "w", encoding="utf-8") as f_out:
+            for line in f_in:
+                if "session.usage_checkpoint" in line:
+                    ev = json.loads(line)
+                    ev["timestamp"] = now_iso
+                    f_out.write(json.dumps(ev) + "\n")
+                else:
+                    f_out.write(line)
+
+        os.utime(dest_events, (now, now))
+
+        res = server._copilot_cli_usage(self.temp_dir)
+        self.assertIsNotNone(res)
+        self.assertIn("hourly", res)
+        self.assertEqual(len(res["hourly"]), 24)
+        self.assertIn("5h", res)
+        self.assertIn("7d", res)
+        self.assertIn("credits", res)
+        self.assertIn("5h", res["credits"])
+        self.assertIn("7d", res["credits"])
+        self.assertGreater(res["credits"]["5h"], 0)
+        self.assertGreater(res["5h"]["input"], 0)
+        self.assertGreater(sum(res["hourly"]), 0)
+
+    def test_copilot_view_carries_tokens(self):
+        client = {"id": "copilot", "installed": True, "dispatchable": True}
+        fake_tokens = {
+            "5h": {"input": 100, "output": 20, "cache_read": 0},
+            "7d": {"input": 100, "output": 20, "cache_read": 0},
+            "hourly": [0] * 23 + [120],
+            "credits": {"5h": 0.05, "7d": 0.05},
+            "per_model": {"gpt-6-luna": 120},
+        }
+        with patch.object(server, "_copilot_cli_usage", return_value=fake_tokens):
+            view = server._copilot_view(client, refresh=True)
+            self.assertIsNotNone(view.get("tokens"))
+            self.assertEqual(view["tokens"], fake_tokens)
+            self.assertIn("Tokens from Copilot CLI sessions on this Mac", view.get("source", ""))
+
+    def test_preflight_and_spawn_accept_copilot(self):
+        ok, msg = server.check_budget_preflight(model="auto", provider="copilot")
+        self.assertTrue(ok)
+
+        with patch.object(server, "find_copilot_binary", return_value="/mock/copilot"):
+            res = server.t_spin_worker(
+                role="Unit Tester",
+                prompt="echo hello",
+                provider="copilot",
+                model="auto",
+            )
+            self.assertIn("worker_", res)
+
+
+if __name__ == "__main__":
+    unittest.main()

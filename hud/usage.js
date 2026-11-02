@@ -1,5 +1,5 @@
 /* LLM usage: rings, provider cards, and the spend chart. Every value comes from the API. */
-import { h, s, tokens, pct, ticking } from "./lib.js";
+import { h, s, tokens, pct, ticking, providerColour } from "./lib.js";
 
 const STATE = { live: ["Live", "ok"], stale: ["Stale", "bad"], unavailable: ["No data", "bad"], detected: ["Installed", ""] };
 
@@ -124,10 +124,7 @@ export function spendChart(providers) {
   const max = Math.max(...series.flatMap((p) => p.tokens.hourly)) || 1;
   const x = (i) => L + (i / 23) * (W - L - 8);
   const y = (v) => T + (1 - v / max) * (H - T - B);
-  const providerColour = (id) =>
-    id === "claude" ? "var(--series-claude)" :
-    id === "antigravity" ? "var(--series-antigravity)" :
-    id === "opencode" ? "var(--series-opencode)" : "var(--gold)";
+  // providerColour imported from lib.js
   const grid = [0, 0.5, 1].map((f) => [
     s("line", { class: "chart-grid", x1: L, x2: W - 8, y1: y(max * f), y2: y(max * f) }),
     s("text", { class: "chart-axis", x: L - 6, y: y(max * f) + 3, "text-anchor": "end" }, tokens(Math.round(max * f))),

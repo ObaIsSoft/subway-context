@@ -2772,7 +2772,7 @@ def load_custom_providers() -> List[Dict[str, Any]]:
     raw = _load_json("providers.json").get("providers")
     if not isinstance(raw, list):
         return []
-    builtins = {"auto", "claude", "antigravity", "opencode", "local", "god",
+    builtins = {"auto", "claude", "antigravity", "opencode", "local", "god", "copilot",
                 "claude-code", "opencode2", "agy", "ollama"}
     providers = []
     seen = set()
@@ -3649,6 +3649,8 @@ def _provider_5h_tokens(provider: str) -> int:
             data = _fetch_agy_tokens()
         elif norm == "opencode":
             data = _fetch_opencode_usage()
+        elif norm == "copilot":
+            data = _copilot_cli_usage()
         if data and isinstance(data, dict):
             h5 = data.get("5h") or {}
             if isinstance(h5, dict):
@@ -7832,6 +7834,100 @@ def _agy_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
 
 
 @ttl_cached(120.0)
+def _copilot_cli_usage(base_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    session_dir = base_dir if base_dir is not None else os.path.expanduser("~/.copilot/session-state")
+    if not os.path.isdir(session_dir):
+        return None
+    now = time.time()
+    events: List[Tuple[float, int, int, int]] = []
+    credit_events: List[Tuple[float, float]] = []
+    per_model: Dict[str, int] = {}
+    file_paths: List[str] = []
+    try:
+        for entry in os.scandir(session_dir):
+            if entry.is_dir(follow_symlinks=False):
+                p = os.path.join(entry.path, "events.jsonl")
+                if os.path.isfile(p):
+                    file_paths.append(p)
+    except OSError:
+        pass
+
+    for p in file_paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_mtime < now - SEVEN_D:
+            continue
+        cps: List[Dict[str, Any]] = []
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "session.usage_checkpoint" in line:
+                        try:
+                            ev = json.loads(line)
+                            if ev.get("type") == "session.usage_checkpoint":
+                                cps.append(ev)
+                        except Exception:
+                            pass
+        except OSError:
+            continue
+        if not cps:
+            continue
+
+        def _get_ts(cp: Dict[str, Any]) -> float:
+            v = _parse_ts(cp.get("timestamp"))
+            return v if v is not None else 0.0
+
+        cps.sort(key=_get_ts)
+        prev_inp, prev_out, prev_cache, prev_aiu = 0, 0, 0, 0.0
+        prev_model_metrics: Dict[str, int] = {}
+        for cp in cps:
+            ts = _get_ts(cp)
+            data = cp.get("data") or {}
+            snap = data.get("accountingSnapshot") or {}
+            td = snap.get("tokenDetails") or {}
+            inp = int((td.get("input") or {}).get("tokenCount") or 0)
+            out = int((td.get("output") or {}).get("tokenCount") or 0)
+            cache = int((td.get("cache_read") or {}).get("tokenCount") or 0)
+            nano_aiu = float(data.get("totalNanoAiu") or 0.0)
+
+            delta_inp = max(0, inp - prev_inp)
+            delta_out = max(0, out - prev_out)
+            delta_cache = max(0, cache - prev_cache)
+            delta_aiu = max(0.0, nano_aiu - prev_aiu)
+            prev_inp, prev_out, prev_cache, prev_aiu = inp, out, cache, nano_aiu
+
+            events.append((ts, delta_inp, delta_out, delta_cache))
+            credit_events.append((ts, delta_aiu / 1e9))
+
+            for m_name, m_info in (snap.get("modelMetrics") or {}).items():
+                m_usage = (m_info.get("usage") if isinstance(m_info, dict) else {}) or {}
+                m_inp = int(m_usage.get("inputTokens") or 0)
+                m_out = int(m_usage.get("outputTokens") or 0)
+                m_used = m_inp + m_out
+                prev_m = prev_model_metrics.get(m_name, 0)
+                delta_m = max(0, m_used - prev_m)
+                prev_model_metrics[m_name] = m_used
+                if ts >= now - SEVEN_D:
+                    per_model[m_name] = per_model.get(m_name, 0) + delta_m
+
+    res = _window_totals(events, now)
+    credits = {"5h": 0.0, "7d": 0.0}
+    for ts, cred in credit_events:
+        if ts >= now - FIVE_H:
+            credits["5h"] += cred
+        if ts >= now - SEVEN_D:
+            credits["7d"] += cred
+    credits["5h"] = round(credits["5h"], 4)
+    credits["7d"] = round(credits["7d"], 4)
+    res["credits"] = credits
+    res["per_model"] = per_model
+    res["tokens"] = res
+    return res
+
+
+@ttl_cached(120.0)
 def _copilot_raw() -> Optional[Dict[str, Any]]:
     try:
         res = subprocess.run(
@@ -7847,14 +7943,18 @@ def _copilot_raw() -> Optional[Dict[str, Any]]:
 def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     raw = _copilot_raw()
     models = _copilot_models()
+    tokens = _copilot_cli_usage()
+    source_label = "Tokens from Copilot CLI sessions on this Mac; VS Code chat use is counted only in the chat allowance."
     no_models_note = "Open Copilot Chat in VS Code once to list its models."
     if not raw or not isinstance(raw, dict):
         base_note = "Doesn't expose usage locally, and Subway can't dispatch workers to it yet."
         note = f"{base_note} {no_models_note}" if not models else base_note
         client["dispatchable"] = False
         return {
-            "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
-            "pools": [], "tokens": None, "error": None, "models": models,
+            "plan": "", "state": "live" if tokens else "detected", "source": source_label,
+            "fetched_at": time.time() if tokens else None, "latency_ms": None,
+            "pools": [], "tokens": tokens, "credits": tokens.get("credits") if tokens else None,
+            "per_model": tokens.get("per_model") if tokens else {}, "error": None, "models": models,
             "note": note
         }
 
@@ -7897,9 +7997,10 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         pools.append({"key": snap_key, "name": pool_name, "windows": [window]})
 
     return {
-        "plan": plan, "state": "live", "source": "GitHub Copilot API via gh",
+        "plan": plan, "state": "live", "source": source_label,
         "fetched_at": time.time(), "latency_ms": None,
-        "pools": pools, "tokens": None, "other_sessions": _other_sessions("copilot"),
+        "pools": pools, "tokens": tokens, "credits": tokens.get("credits") if tokens else None,
+        "per_model": tokens.get("per_model") if tokens else {}, "other_sessions": _other_sessions("copilot"),
         "error": None, "models": models, "note": no_models_note if not models else ""
     }
 
@@ -8027,7 +8128,7 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
              "kimi": "Kimi", "copilot": "GitHub Copilot"}
     views: Dict[str, Callable[[Dict[str, Any], bool], Dict[str, Any]]] = {
         "claude": _claude_view, "antigravity": _agy_view, "opencode": _opencode_view, "local": _local_view,
-        "kimi": _kimi_view}
+        "kimi": _kimi_view, "copilot": _copilot_view}
     manual = _load_json("quotas.json").get("manual") or {}
 
     custom_providers = load_custom_providers()
@@ -8914,6 +9015,10 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/status":
             _viewer_seen = time.time()
             self.send_json(get_hud_data(project=query.get("project", [""])[0]))
+            return
+
+        if path == "/api/models":
+            self.send_json({"models": model_catalog()})
             return
 
         if path == "/api/worker_log":

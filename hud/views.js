@@ -730,13 +730,22 @@ export function modelsPage(d) {
         }
       }
 
-      const isOpenCode = (m.provider || "").toLowerCase() === "opencode";
+      const provId = (m.provider || "").toLowerCase();
+      const modelProvider = (d.quotas && d.quotas.providers ? d.quotas.providers : []).find(
+        (p) => (p.id || "").toLowerCase() === provId || (p.name || "").toLowerCase() === provId
+      );
       if (m.free === true) {
         tags.push(h("span", { class: "tag" }, "Free tier"));
       }
+      if (m.price_band) {
+        tags.push(h("span", { class: "tag" }, m.price_band));
+      }
+      if (m.auto || m.default) {
+        tags.push(h("span", { class: "tag" }, "Auto"));
+      }
 
-      if (isOpenCode && opencodeProvider) {
-        const limitedMap = (opencodeProvider && opencodeProvider.limited) || {};
+      if (modelProvider) {
+        const limitedMap = modelProvider.limited || {};
         let lim = limitedMap[m.model];
         if (!lim && m.model) {
           const mLow = m.model.toLowerCase();
@@ -759,7 +768,7 @@ export function modelsPage(d) {
           tags.push(h("span", { class: "tag" }, "No limit reported"));
         }
 
-        const perModelMap = (opencodeProvider && opencodeProvider.per_model) || {};
+        const perModelMap = modelProvider.per_model || {};
         let usedTokens = perModelMap[m.model];
         if (usedTokens === undefined && m.model) {
           const mLow = m.model.toLowerCase();
