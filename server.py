@@ -2509,16 +2509,100 @@ def _is_read_only_prompt(prompt: str) -> bool:
     return "read-only" in text or "do not edit any file" in text
 
 
-def _settle_isolated_result(result: Dict[str, Any], prompt: str, wt_note: str, reply: str) -> None:
-    """A read-only run that changes nothing is done, not a failure. Editing runs still need a diff."""
-    if result.get("status") != "completed" or wt_note != "No files changed.":
-        return
+def _worker_expected_to_edit(meta: Dict[str, Any]) -> bool:
+    role = str(meta.get("role") or "").lower()
+    if re.search(r"\b(?:review|reviewer|research|researcher|read[- ]?only)\b", role):
+        return False
+    prompt = str(meta.get("prompt") or "")
     if _is_read_only_prompt(prompt):
-        result["reason"] = (reply or "").strip()
+        return False
+    capabilities = meta.get("capabilities") or []
+    # files:write is the clearest edit signal; god mode also enables unrestricted tools.
+    if ("files:write" not in capabilities and "terminal:full" not in capabilities
+            and meta.get("mode") != "god" and meta.get("permission_mode") != "auto_approve"):
+        return False
+    return bool(re.search(
+        r"\b(?:add|change|create|implement|update|modify|edit|fix|refactor|remove|delete|rename|write|replace|introduce|extend|migrate|convert|build)\b",
+        prompt,
+        re.IGNORECASE,
+    ))
+
+
+def _git_change_fingerprint(project_dir: str) -> Optional[str]:
+    """Fingerprint tracked and untracked git changes relative to the worker's start state."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        cwd=project_dir, capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+
+    digest = hashlib.sha256(status.stdout)
+    for args in (["git", "diff", "--binary", "--"], ["git", "diff", "--cached", "--binary", "--"]):
+        diff = subprocess.run(args, cwd=project_dir, capture_output=True, check=True)
+        digest.update(diff.stdout)
+    for entry in status.stdout.split(b"\0"):
+        if not entry.startswith(b"?? "):
+            continue
+        path = os.path.join(project_dir, os.fsdecode(entry[3:]))
+        if os.path.islink(path):
+            digest.update(os.fsencode(os.readlink(path)))
+        elif os.path.isfile(path):
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_status_entries(status: bytes) -> List[Tuple[str, str]]:
+    entries = []
+    records = status.split(b"\0")
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            continue
+        code = os.fsdecode(record[:2])
+        entries.append((code, os.fsdecode(record[3:])))
+        if "R" in code or "C" in code:
+            if i < len(records) and records[i]:
+                entries.append((code, os.fsdecode(records[i])))
+                i += 1
+    return entries
+
+
+def _git_dirty_paths(project_dir: str) -> Optional[List[str]]:
+    root = subprocess.run(
+        ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if root.returncode:
+        if "not a git repository" in root.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(root.returncode, root.args, root.stdout, root.stderr)
+    status = subprocess.run(
+        ["git", "-C", root.stdout.strip(), "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+    return [path for _, path in _git_status_entries(status.stdout)][:500]
+
+
+def _settle_worker_result(result: Dict[str, Any], meta: Dict[str, Any], no_changes: bool, reply: str) -> None:
+    if result.get("status") != "completed" or not no_changes:
         return
-    if "Edit " in prompt or "edit" in prompt:
-        result["status"] = "failed"
-        result["reason"] = "Reported work, but no files changed."
+    summary = (reply or "").strip() or str(result.get("reason") or "").strip()
+    if not _worker_expected_to_edit(meta):
+        result["reason"] = summary
+        return
+    result["status"] = "failed"
+    result["reason"] = f"No changes made. {summary}".strip()
 
 
 def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
@@ -2530,7 +2614,7 @@ def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
     reason = str(result.get("reason") or meta.get("report") or "")
     if status == "budget_stopped" or "budget" in reason.lower():
         return "budget_stopped"
-    if "no files changed" in reason.lower() or reason == "Reported work, but no files changed.":
+    if "no files changed" in reason.lower() or "no changes made" in reason.lower():
         return "no_change"
     if status == "completed" or "patch applied" in reason.lower():
         return "landed"
@@ -4508,6 +4592,88 @@ def _reviewer_task_text(prompt: str, limit: int = 6000) -> str:
     return text[:limit].rstrip()
 
 
+_REVIEW_DIFF_LIMIT = 60000
+
+
+def _capture_in_place_review_diff(meta: Dict[str, Any]) -> None:
+    """Save an in-place worker's git changes as reviewer context, not as an applicable patch."""
+    project_dir = str(meta.get("project_dir") or "")
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diff_text = f"No diff is available: could not inspect the project git repository: {one_line(str(exc), 200)}"
+    else:
+        if root_result.returncode:
+            diff_text = "No diff is available: the project folder is not a git repository."
+        else:
+            root = root_result.stdout.strip()
+            try:
+                status_result = subprocess.run(
+                    ["git", "-C", root, "status", "--porcelain=1", "-z", "--untracked-files=all"],
+                    capture_output=True, timeout=60,
+                )
+                if status_result.returncode:
+                    diff_text = ("No diff is available: could not capture git changes. "
+                                 + one_line(status_result.stderr, 200))
+                else:
+                    status_entries = _git_status_entries(status_result.stdout)
+                    dirty_before = set(meta.get("git_dirty_before") or [])
+                    changed = [(code, path) for code, path in status_entries if path not in dirty_before]
+                    preexisting = [(code, path) for code, path in status_entries if path in dirty_before]
+                    pieces = []
+                    for index, (title, entries) in enumerate((
+                            ("Changed by this worker", changed),
+                            ("Already modified before this worker started (may include this worker's edits)", preexisting))):
+                        if index:
+                            pieces.append("")
+                        pieces.append(title)
+                        if index:
+                            pieces.append("The second group may contain other people's work.")
+                        paths = list(dict.fromkeys(path for _, path in entries))
+                        if not paths:
+                            pieces.append("(none)")
+                            continue
+                        pieces.extend(f"{code} {path}" for code, path in entries)
+                        tracked_paths = [path for code, path in entries if not code.startswith("??")]
+                        pathspecs = [f":(literal){path}" for path in dict.fromkeys(tracked_paths)]
+                        if pathspecs:
+                            for label, args in (
+                                ("Git diff", ["git", "-C", root, "diff", "--no-ext-diff", "--"] + pathspecs),
+                                ("Git staged diff", ["git", "-C", root, "diff", "--cached", "--no-ext-diff", "--"] + pathspecs),
+                            ):
+                                result = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=60)
+                                if result.returncode:
+                                    raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+                                if result.stdout.strip():
+                                    pieces.append(f"{label}:\n{result.stdout.rstrip()}")
+                        for code, rel_path in entries:
+                            if not code.startswith("??"):
+                                continue
+                            file_path = os.path.realpath(os.path.join(root, rel_path))
+                            if os.path.commonpath((root, file_path)) != root or not os.path.isfile(file_path):
+                                continue
+                            with open(file_path, "rb") as f:
+                                content = f.read(_REVIEW_DIFF_LIMIT + 1).decode("utf-8", "replace")
+                            pieces.append(f"Untracked file {rel_path}:\n{content}")
+                    diff_text = "\n\n".join(piece for piece in pieces if piece.strip())
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                diff_text = f"No diff is available: could not capture git changes: {one_line(str(exc), 200)}"
+
+    trimmed_note = "\n\n[Review diff trimmed to 60000 characters.]"
+    if len(diff_text) > _REVIEW_DIFF_LIMIT:
+        diff_text = diff_text[:_REVIEW_DIFF_LIMIT - len(trimmed_note)] + trimmed_note
+    review_diff_path = os.path.join(WORKERS_DIR, f"{meta['id']}.review_diff")
+    try:
+        with open(review_diff_path, "w", encoding="utf-8") as f:
+            f.write(diff_text)
+        meta["review_diff_path"] = review_diff_path
+    except OSError as exc:
+        meta["review_diff_note"] = f"No diff is available: could not save reviewer diff: {one_line(str(exc), 200)}"
+
+
 def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
     """Parse and validate worker follow-up steps. Bad input is refused before anything is queued."""
     if raw in (None, "", []):
@@ -5242,6 +5408,17 @@ def _launch_worker(worker_id: str) -> str:
                     _save_worker(meta)
                     return f"Error: couldn't create a worktree: {exc}"
                 meta["isolate"] = False  # Not a git folder, so there's nothing to copy: it works in place.
+        if not meta.get("isolate") and _worker_expected_to_edit(meta):
+            try:
+                git_state = _git_change_fingerprint(meta.get("project_dir") or HOME)
+                git_dirty_before = _git_dirty_paths(meta.get("project_dir") or HOME)
+            except (OSError, subprocess.SubprocessError) as exc:
+                meta["status"] = "pending_approval"
+                _save_worker(meta)
+                return f"Error: couldn't record starting git state: {exc}"
+            if git_state is not None:
+                meta["git_state_before"] = git_state
+                meta["git_dirty_before"] = git_dirty_before or []
         _save_worker(meta)
 
     try:
@@ -6015,11 +6192,14 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         want = step.get("include") or "patch"
         patch_text = ""
         if want in ("patch", "both"):
-            patch_file = meta.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
+            patch_file = (meta.get("patch_path") or meta.get("review_diff_path")
+                          or os.path.join(WORKERS_DIR, f"{worker_id}.patch"))
             with contextlib.suppress(OSError):
                 with open(patch_file, "r", encoding="utf-8", errors="replace") as f:
-                    patch_text = f.read(40000)
+                    patch_text = f.read(_REVIEW_DIFF_LIMIT)
         report_text = str(result.get("reason") or meta.get("report") or "").strip()
+        if not patch_text and meta.get("review_diff_note"):
+            patch_text = str(meta["review_diff_note"])
         if want in ("patch", "both") and not patch_text:
             patch_text = report_text[:40000]
         pieces = []
@@ -6421,14 +6601,24 @@ def supervise_worker(worker_id: str) -> int:
                 _save_worker(fresh)
         except (OSError, subprocess.SubprocessError) as exc:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
-    if result.get("status") == "completed" and fresh.get("isolate"):
-        prompt = fresh.get("prompt") or ""
-        _settle_isolated_result(result, prompt, wt_note, str(run.get("response") or ""))
+    no_changes = bool(fresh.get("isolate") and wt_note == "No files changed.")
+    if result.get("status") == "completed" and fresh.get("git_state_before"):
+        try:
+            no_changes = _git_change_fingerprint(fresh.get("project_dir") or HOME) == fresh["git_state_before"]
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["status"] = "failed"
+            result["reason"] = f"Could not verify worker changes: {exc}"
+    if result.get("status") == "completed" and (fresh.get("isolate") or fresh.get("git_state_before")):
+        _settle_worker_result(result, fresh, no_changes, str(run.get("response") or ""))
         if result.get("status") == "completed":
             patch_file = fresh.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
-            if os.path.exists(patch_file):
+            if fresh.get("isolate") and os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
                     verify_worker(worker_id)
+    if (result.get("status") == "completed" and not fresh.get("isolate")
+            and any(step.get("verdict") for step in fresh.get("then") or [])):
+        _capture_in_place_review_diff(fresh)
+        _save_worker(fresh)
     with contextlib.suppress(Exception):
         result["response"] = str(run.get("response") or "")
     _write_json_atomic(_exit_file(worker_id), result)
