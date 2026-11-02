@@ -77,23 +77,36 @@ class TestHUDFast(test_subway.SubwayTestCase):
         old_data = {"version": "cached", "fetched_at": time.time() - 25.0}
         server._hud_cache[""] = {"data": old_data, "at": time.time() - 25.0, "stale": False, "busy": False}
 
-        refresh_called = threading.Event()
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+        read_returned = threading.Event()
+        results = []
 
         def slow_compile(*args, **kwargs):
-            refresh_called.set()
-            time.sleep(0.05)
+            refresh_started.set()
+            release_refresh.wait(timeout=2.0)
             return {"version": "new", "fetched_at": time.time()}
 
         with mock.patch.object(server, "_compile_hud_data", side_effect=slow_compile) as mock_comp:
-            t0 = time.time()
-            res1 = server.get_hud_data()
-            res2 = server.get_hud_data()
-            dur = time.time() - t0
-            self.assertLess(dur, 0.05)
-            self.assertIs(res1, old_data)
-            self.assertIs(res2, old_data)
-            self.assertTrue(refresh_called.wait(timeout=2.0))
-            time.sleep(0.1)
+            def read_cached_data():
+                results.extend((server.get_hud_data(), server.get_hud_data()))
+                read_returned.set()
+
+            reader = threading.Thread(target=read_cached_data)
+            reader.start()
+            try:
+                self.assertTrue(refresh_started.wait(timeout=1.0))
+                self.assertTrue(read_returned.wait(timeout=0.5))
+                self.assertEqual(results, [old_data, old_data])
+            finally:
+                release_refresh.set()
+                reader.join(timeout=1.0)
+            self.assertFalse(reader.is_alive())
+
+            deadline = time.time() + 1.0
+            while time.time() < deadline and server._hud_cache[""]["data"].get("version") != "new":
+                time.sleep(0.01)
+            self.assertEqual(server._hud_cache[""]["data"].get("version"), "new")
             self.assertEqual(mock_comp.call_count, 1)
 
     def test_post_marks_cache_stale(self):

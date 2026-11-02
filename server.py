@@ -2076,9 +2076,14 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
     forced = os.environ.get("SUBWAY_STATION_ID")
     if forced:
         return {"source": "manual", "id": forced, "tab_name": None, "synthetic": True}
+    worker_id = os.environ.get("SUBWAY_WORKER_ID")
+    if worker_id:
+        return {"source": "worker", "id": worker_id, "tab_name": None, "synthetic": True}
     agy_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
     if agy_conv:
         return {"source": "antigravity", "id": agy_conv, "tab_name": None}
+    if os.environ.get("SUBWAY_NO_NOTIFY"):
+        return None
 
     opens: Dict[int, Dict[str, Any]] = {}
     for p in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
@@ -2154,7 +2159,17 @@ def detect_self() -> Optional[Dict[str, Any]]:
     """Identify the agent window this server belongs to, across every supported client."""
     global _self_cache
     now = time.time()
-    if now - _self_cache[0] > _SELF_TTL:
+    forced = os.environ.get("SUBWAY_STATION_ID")
+    worker = os.environ.get("SUBWAY_WORKER_ID")
+    if forced and (_self_cache[1] is None or _self_cache[1].get("id") != forced):
+        _self_cache = (now, _detect_self_uncached())
+    elif not forced and _self_cache[1] and _self_cache[1].get("source") == "manual":
+        _self_cache = (now, _detect_self_uncached())
+    elif worker and (_self_cache[1] is None or _self_cache[1].get("id") != worker):
+        _self_cache = (now, _detect_self_uncached())
+    elif not worker and _self_cache[1] and _self_cache[1].get("source") == "worker":
+        _self_cache = (now, _detect_self_uncached())
+    elif now - _self_cache[0] > _SELF_TTL:
         _self_cache = (now, _detect_self_uncached())
     return _self_cache[1]
 
@@ -2165,8 +2180,73 @@ def _self_id() -> str:
     return me["id"] if me else f"host-{os.getpid()}"
 
 
+_orig_self_id = _self_id
+
+
 def _short_id(station: str) -> str:
     return station[:8] if re.match(r"^[0-9a-f]{8}-", station) else station
+
+
+def _detected_chat() -> Optional[Dict[str, Any]]:
+    """Return the detected calling chat, or None if Subway cannot detect the caller at all."""
+    if _self_id is not _orig_self_id:
+        try:
+            sid = _self_id()
+            if sid and not sid.startswith(f"host-{os.getpid()}"):
+                return {"source": "test", "id": sid, "tab_name": None}
+        except Exception:
+            pass
+    me = detect_self()
+    if me:
+        return me
+    try:
+        sid = _self_id()
+        if sid and not sid.startswith(f"host-{os.getpid()}"):
+            return {"source": "test", "id": sid, "tab_name": None}
+    except Exception:
+        pass
+    return None
+
+
+def _id_matches(supplied: Optional[str], target: Optional[str]) -> bool:
+    """Check if a supplied caller/station ID matches the target detected ID."""
+    if not supplied or not target:
+        return False
+    s = str(supplied).strip().lower()
+    t = str(target).strip().lower()
+    if s == t:
+        return True
+    if _short_id(s) == _short_id(t):
+        return True
+    if len(s) >= 8 and len(t) >= 8:
+        if s.startswith(t) or t.startswith(s):
+            return True
+    try:
+        aliases = load_aliases()
+        clean = s.lstrip("@")
+        if clean in aliases:
+            resolved = aliases[clean].lower()
+            if resolved == t or _short_id(resolved) == _short_id(t):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_authorized_worker(worker_id: str, caller_id: str) -> Tuple[bool, Optional[str]]:
+    """Returns (is_authorized, launcher_id) if worker_id is allowed for caller_id."""
+    if not worker_id:
+        return False, None
+    w = _load_worker(worker_id)
+    launcher = w.get("launched_by") if w else None
+    if _id_matches(worker_id, caller_id):
+        return True, launcher
+    if launcher and _id_matches(caller_id, launcher):
+        return True, launcher
+    if re.match(r"^worker_[0-9a-f]{6}$", worker_id):
+        if os.environ.get("SUBWAY_WORKER_ID") == worker_id:
+            return True, launcher
+    return False, None
 
 
 # --------------------------------------------------------------------------
@@ -2334,10 +2414,17 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
 
 def t_tag_chat(alias: str, chat_id: str = "") -> str:
     """Assign a memorable sticky alias to a chat. If chat_id is omitted, tags the current active session."""
-    target_id = chat_id
-    if not target_id:
-        me = detect_self()
-        target_id = me["id"] if me and not me.get("synthetic") else "latest"
+    det = _detected_chat()
+    if det is not None:
+        det_id = det["id"]
+        if chat_id and not _id_matches(chat_id, det_id):
+            return f"Error: caller is '{det_id}', cannot tag chat '{chat_id}'."
+        target_id = chat_id or (det_id if not det.get("synthetic") else "latest")
+    else:
+        target_id = chat_id
+        if not target_id:
+            me = detect_self()
+            target_id = me["id"] if me and not me.get("synthetic") else "latest"
     c = resolve(target_id)
     save_alias(alias, c["id"])
     return f"Station alias '@{alias.lower().lstrip('@')}' now points to {c['source'].upper()} `{c['id'][:8]}` ({c.get('title')})."
@@ -2423,17 +2510,40 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
 
 
 def t_send_note(to: str, text: str, from_chat: str = "", share_chat: str = "") -> str:
+    det = _detected_chat()
+    parent = None
+    is_unverified = False
+    if det is not None:
+        det_id = det["id"]
+        if from_chat:
+            if not _id_matches(from_chat, det_id):
+                return f"Error: caller is '{det_id}', cannot send note as '{from_chat}'."
+            sender = from_chat
+        else:
+            sender = _short_id(det_id)
+        if not parent:
+            w = _load_worker(det_id)
+            if w and w.get("launched_by"):
+                parent = w.get("launched_by")
+    else:
+        sender = from_chat or _self_id()
+        is_unverified = True
+
     target = resolve(to, strict=True)
     shared = None
     if share_chat:
         shared = resolve(share_chat, strict=True)
-    sender = from_chat or _self_id()
+
     rec = {
         "ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "from": sender, "text": text,
         "shared_chat": ({"id": shared["id"], "source": shared["source"], "title": shared.get("title")}
                         if shared else None),
     }
+    if parent:
+        rec["parent"] = parent
+    if is_unverified:
+        rec["unverified"] = True
     _ensure_subway_dir()
     inbox_path = os.path.join(SUBWAY_DIR, "inbox", f"{target['id']}.jsonl")
     with _state_lock("inbox"):
@@ -2479,7 +2589,8 @@ def t_check_notes(my_chat_id: str = "", keep: bool = False) -> str:
     if corrupt:
         out.append(f"> {corrupt} unreadable line(s) were skipped.")
     for r in recs:
-        out.append(f"\n## From {_short_id(str(r.get('from', '?')))} at {r.get('ts')}\n{r.get('text', '')}")
+        unv_note = " [unverified]" if r.get("unverified") else ""
+        out.append(f"\n## From {_short_id(str(r.get('from', '?')))} at {r.get('ts')}{unv_note}\n{r.get('text', '')}")
         sc = r.get("shared_chat")
         if sc:
             out.append(f"Transit link: {sc['source'].upper()} `{sc['id']}` ({sc.get('title')}). "
@@ -2676,8 +2787,24 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
     if not filepath:
         return "Error: filepath is required."
     path = _canon_path(filepath, project_dir)
-    me_id = _self_id()
-    holder = holder or _short_id(me_id)
+
+    det = _detected_chat()
+    is_unverified = False
+    if det is not None:
+        det_id = det["id"]
+        if holder:
+            if not _id_matches(holder, det_id):
+                return f"Error: caller is '{det_id}', cannot claim file as '{holder}'."
+            else:
+                me_id = det_id
+        else:
+            holder = _short_id(det_id)
+            me_id = det_id
+    else:
+        me_id = _self_id()
+        holder = holder or _short_id(me_id)
+        is_unverified = True
+
     role = (role or "implementer").lower()
 
     try:
@@ -2687,6 +2814,8 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
 
     head = _git_head(path)
     override = ""
+    worker = _load_worker(me_id)
+    parent = worker.get("launched_by") if worker else None
     with _state_lock("locks"):
         now = time.time()
         data = load_locks()
@@ -2727,14 +2856,24 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
             "role": role,
             "status": "LEASED",
         }
+        if parent:
+            locks[path]["parent"] = parent
+        if is_unverified:
+            locks[path]["unverified"] = True
         data["authors"][path] = {"holder": holder, "holder_id": me_id}
+        if parent:
+            data["authors"][path]["parent"] = parent
+        if is_unverified:
+            data["authors"][path]["unverified"] = True
         save_locks(data)
 
     if override:
-        t_broadcast_track(override, track="main", files=[path], station_id=holder)
+        _broadcast_track_internal(override, track="main", files=[path], station_id=holder,
+                                  parent=parent, is_unverified=is_unverified)
     exp_iso = _dt.datetime.fromtimestamp(expires_at).astimezone().strftime("%H:%M:%S")
     base_note = f" (baseline: {baseline})" if baseline else ""
-    return (f"[LEASE ACQUIRED] '{path}' claimed by {holder} (role: {role}){base_note} until {exp_iso} ({duration}s). "
+    unv_note = " [unverified]" if is_unverified else ""
+    return (f"[LEASE ACQUIRED] '{path}' claimed by {holder}{unv_note} (role: {role}){base_note} until {exp_iso} ({duration}s). "
             f"Purpose: {purpose or 'Active modification'}.")
 
 
@@ -2744,16 +2883,34 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
     if not filepath:
         return "Error: filepath is required."
     path = _canon_path(filepath, project_dir)
-    me_id = _self_id()
-    reviewer = reviewer or _short_id(me_id)
+
+    det = _detected_chat()
+    is_unverified = False
+    if det is not None:
+        det_id = det["id"]
+        if reviewer:
+            if not _id_matches(reviewer, det_id):
+                return f"Error: caller is '{det_id}', cannot sign off as '{reviewer}'."
+            else:
+                me_id = det_id
+        else:
+            reviewer = _short_id(det_id)
+            me_id = det_id
+    else:
+        me_id = _self_id()
+        reviewer = reviewer or _short_id(me_id)
+        is_unverified = True
+
     is_approved = verdict.strip().lower() in ("approved", "accept", "pass", "good")
     status_str = "APPROVED" if is_approved else "NEEDS_WORK"
     commit_sha = _git_head(path) or "uncommitted"
+    worker = _load_worker(me_id)
+    parent = worker.get("launched_by") if worker else None
 
     with _state_lock("locks"):
         data = load_locks()
         author = data["authors"].get(path) or data["locks"].get(path) or {}
-        if is_approved and (me_id == author.get("holder_id") or reviewer == author.get("holder")):
+        if is_approved and (_id_matches(me_id, author.get("holder_id")) or _id_matches(reviewer, author.get("holder"))):
             return (f"[SIGNOFF REFUSED] '{path}' was last claimed by {author.get('holder')}. "
                     f"Approval has to come from a different agent than the one that changed the file.")
         data["signoffs"][path] = {
@@ -2765,14 +2922,20 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
             "timestamp": time.time(),
             "time_iso": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if parent:
+            data["signoffs"][path]["parent"] = parent
+        if is_unverified:
+            data["signoffs"][path]["unverified"] = True
         save_locks(data)
 
     final_notes = data["signoffs"][path]["notes"]
-    t_broadcast_track(f"[SIGNOFF: {status_str}] '{path}' evaluated by {reviewer} at commit {commit_sha}. Notes: {final_notes}",
-                      track="main", files=[path], decisions=[f"Sign-off {status_str} by {reviewer}"])
+    _broadcast_track_internal(f"[SIGNOFF: {status_str}] '{path}' evaluated by {reviewer} at commit {commit_sha}. Notes: {final_notes}",
+                              track="main", files=[path], decisions=[f"Sign-off {status_str} by {reviewer}"],
+                              station_id=reviewer, parent=parent, is_unverified=is_unverified)
+    unv_note = " [unverified]" if is_unverified else ""
     if is_approved:
-        return f"[SIGNOFF: APPROVED] '{path}' marked approved by {reviewer} (commit: {commit_sha}). Regression Shield active."
-    return f"[SIGNOFF: NEEDS_WORK] '{path}' flagged for rework by {reviewer}. Notes: {final_notes}"
+        return f"[SIGNOFF: APPROVED] '{path}' marked approved by {reviewer}{unv_note} (commit: {commit_sha}). Regression Shield active."
+    return f"[SIGNOFF: NEEDS_WORK] '{path}' flagged for rework by {reviewer}{unv_note}. Notes: {final_notes}"
 
 
 def t_release_file(filepath: str, holder: str = "", project_dir: str = "", force: bool = False) -> str:
@@ -2780,18 +2943,49 @@ def t_release_file(filepath: str, holder: str = "", project_dir: str = "", force
     if not filepath:
         return "Error: filepath is required."
     path = _canon_path(filepath, project_dir)
-    me_id = _self_id()
-    holder = holder or _short_id(me_id)
     with _state_lock("locks"):
         data = load_locks()
         current = data["locks"].get(path)
         if not current:
             return f"File '{path}' was not currently leased."
-        if not force and current.get("holder") != holder and current.get("holder_id") != me_id:
-            return f"Warning: '{path}' is held by {current.get('holder')}, not {holder}. Lease not released."
+
+        lock_holder = current.get("holder", "")
+        lock_holder_id = current.get("holder_id", "")
+
+        det = _detected_chat()
+        if det is not None:
+            det_id = det["id"]
+            owns_lock = _id_matches(det_id, lock_holder_id) or _id_matches(det_id, lock_holder)
+            worker_id = lock_holder_id if WORKER_ID_RE.match(lock_holder_id or "") else lock_holder
+            worker = _load_worker(worker_id) if WORKER_ID_RE.match(worker_id or "") else None
+            if worker:
+                worker = _update_worker_status(worker)
+            worker_ended = bool(worker and worker.get("status") and
+                                worker.get("status") not in ACTIVE_WORKER_STATES)
+            launcher_cleanup = bool(worker_ended and _id_matches(worker.get("launched_by"), det_id))
+
+            if holder and not _id_matches(holder, det_id):
+                requested_worker = bool(launcher_cleanup and _id_matches(holder, worker_id))
+                if not requested_worker:
+                    return f"Error: caller is '{det_id}', cannot release as '{holder}'."
+            if not owns_lock and launcher_cleanup:
+                owns_lock = True
+
+            if not owns_lock:
+                return f"Error: file '{path}' is held by '{lock_holder}', caller '{det_id}' cannot release another chat's lock."
+            released_for = worker_id if launcher_cleanup and not _id_matches(det_id, worker_id) else ""
+        else:
+            me_id = _self_id()
+            caller_holder = holder or _short_id(me_id)
+            if current.get("holder_id") and not _id_matches(caller_holder, current.get("holder_id")):
+                return f"Error: file '{path}' is held by '{lock_holder}'. Lease not released."
+            if not force and current.get("holder") != caller_holder and current.get("holder_id") != me_id:
+                return f"Warning: '{path}' is held by {current.get('holder')}, not {caller_holder}. Lease not released."
+
         del data["locks"][path]
         save_locks(data)
-    return f"[RELEASED] '{path}' is now free for modification by any agent."
+    release_note = f" released by {det_id} for ended worker {released_for}" if det is not None and released_for else ""
+    return f"[RELEASED] '{path}' is now free for modification by any agent.{release_note}"
 
 
 def t_list_locks() -> str:
@@ -2804,11 +2998,14 @@ def t_list_locks() -> str:
     lines = ["# Active Workspace File Leases (Workspace Guard)", ""]
     for path, info in sorted(locks.items(), key=lambda x: x[1].get("expires_at", 0)):
         rem = max(0, int(info.get("expires_at", 0) - now))
-        lines.append(f"- `[LOCKED] {path}` — held by **{info.get('holder')}** "
+        unv = " [unverified]" if info.get("unverified") else ""
+        lines.append(f"- `[LOCKED] {path}` — held by **{info.get('holder')}**{unv} "
                      f"(role: {info.get('role')}, {rem}s remaining) :: {info.get('purpose')}")
     for path, s in sorted(signoffs.items()):
         drift = " :: file changed since sign-off" if s.get("content_sha") and _file_sha(path) != s["content_sha"] else ""
-        lines.append(f"- `[{s.get('verdict')}] {path}` — by **{s.get('reviewer')}** (commit: {s.get('commit_sha')}){drift}")
+        unv = " [unverified]" if s.get("unverified") else ""
+        lines.append(f"- `[{s.get('verdict')}] {path}` — by **{s.get('reviewer')}**{unv} (commit: {s.get('commit_sha')}){drift}")
+    return "\n".join(lines)
     return "\n".join(lines)
 
 
@@ -2916,7 +3113,17 @@ def _track_file(track: str) -> str:
 def t_join_track(track: str = "main", station_id: str = "") -> str:
     """Subscribe a station to a shared context track and retrieve current track state."""
     clean_track = _clean_track(track)
-    station_id = station_id or _short_id(_self_id())
+    det = _detected_chat()
+    if det is not None:
+        det_id = det["id"]
+        if station_id and not _id_matches(station_id, det_id):
+            is_w, _ = _is_authorized_worker(station_id, det_id)
+            if not is_w:
+                return f"Error: caller is '{det_id}', cannot join track as '{station_id}'."
+        station_id = station_id or _short_id(det_id)
+    else:
+        station_id = station_id or _short_id(_self_id())
+
     sub_file = os.path.join(TRACKS_DIR, f"{clean_track}.subscribers.json")
     _ensure_subway_dir()
     with _state_lock("tracks"):
@@ -2933,16 +3140,16 @@ def t_join_track(track: str = "main", station_id: str = "") -> str:
             f"Active subscribers: {len(subs)}.\n\n{history}")
 
 
-def t_broadcast_track(message: str, track: str = "main", files: Optional[List[str]] = None,
-                      decisions: Optional[List[str]] = None, station_id: str = "",
-                      session_id: str = "") -> str:
-    """Broadcast a decision, commitment, or status update to a shared multi-agent track."""
+def _broadcast_track_internal(message: str, track: str = "main", files: Optional[List[str]] = None,
+                              decisions: Optional[List[str]] = None, station_id: str = "",
+                              session_id: str = "", parent: Optional[str] = None,
+                              is_unverified: bool = False) -> str:
+    """Internal helper to write an entry to a track."""
     if not message:
         return "Error: message is required."
     clean_track = _clean_track(track)
     if clean_track == _ALERTS_TRACK:
         return f"Error: '{_ALERTS_TRACK}' is reserved for the destructive-action audit log."
-    station_id = station_id or _short_id(_self_id())
 
     # A heuristic over what agents report, for the audit log. It can't see commands nobody mentions.
     is_destructive = bool(DESTRUCTIVE_RE.search(message))
@@ -2952,13 +3159,18 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
         "id": uuid.uuid4().hex[:8],
         "timestamp": time.time(),
         "iso": _dt.datetime.now().astimezone().strftime("%H:%M:%S"),
-        "station_id": station_id,
-        "session_id": session_id or station_id,
+        "station_id": station_id or _short_id(_self_id()),
+        "session_id": session_id or station_id or _short_id(_self_id()),
         "message": full_message,
         "is_destructive": is_destructive,
         "files": files or [],
         "decisions": decisions or [],
     }
+    if parent:
+        rec["parent"] = parent
+    if is_unverified:
+        rec["unverified"] = True
+
     with open(_track_file(clean_track), "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
     if is_destructive:
@@ -2967,8 +3179,53 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
                 af.write(json.dumps(rec) + "\n")
 
     file_note = f" (files: {', '.join(files)})" if files else ""
-    sess_note = f" [session:{session_id}]" if session_id and session_id != station_id else ""
-    return f"[BROADCAST] Posted to track '{clean_track}' by `{station_id}`{sess_note}: {full_message}{file_note}"
+    sess_id = rec["session_id"]
+    stat_id = rec["station_id"]
+    sess_note = f" [session:{sess_id}]" if sess_id and sess_id != stat_id else ""
+    parent_note = f" (parent: {parent})" if parent else ""
+    unv_note = " [unverified]" if is_unverified else ""
+    return f"[BROADCAST] Posted to track '{clean_track}' by `{stat_id}`{sess_note}{parent_note}{unv_note}: {full_message}{file_note}"
+
+
+def t_broadcast_track(message: str, track: str = "main", files: Optional[List[str]] = None,
+                      decisions: Optional[List[str]] = None, station_id: str = "",
+                      session_id: str = "") -> str:
+    """Broadcast a decision, commitment, or status update to a shared multi-agent track."""
+    if not message:
+        return "Error: message is required."
+    clean_track = _clean_track(track)
+    if clean_track == _ALERTS_TRACK:
+        return f"Error: '{_ALERTS_TRACK}' is reserved for the destructive-action audit log."
+
+    parent = None
+    is_unverified = False
+
+    det = _detected_chat()
+    if det is not None:
+        det_id = det["id"]
+        if station_id and not _id_matches(station_id, det_id):
+            return f"Error: caller is '{det_id}', cannot broadcast as '{station_id}'."
+        if session_id and not _id_matches(session_id, det_id):
+            return f"Error: caller is '{det_id}', cannot broadcast as '{session_id}'."
+
+        if not station_id:
+            station_id = _short_id(det_id)
+        if not session_id:
+            session_id = det_id
+        if not parent:
+            w = _load_worker(det_id)
+            if w and w.get("launched_by"):
+                parent = w.get("launched_by")
+    else:
+        station_id = station_id or session_id or _short_id(_self_id())
+        session_id = session_id or station_id
+        is_unverified = True
+
+    return _broadcast_track_internal(
+        message=message, track=track, files=files, decisions=decisions,
+        station_id=station_id, session_id=session_id, parent=parent,
+        is_unverified=is_unverified
+    )
 
 
 def read_track_entries(track: str = "main", limit: int = 50, since_timestamp: float = 0.0) -> List[Dict[str, Any]]:
@@ -3003,7 +3260,9 @@ def t_read_track(track: str = "main", limit: int = 15, since_timestamp: float = 
         st = e.get("station_id", "unknown")
         sess = e.get("session_id")
         sess_str = f" [session:{sess}]" if sess and sess != st else ""
-        lines.append(f"- **[{iso}] `{st}`**{sess_str}: {e.get('message', '')}")
+        parent_str = f" (parent: {e.get('parent')})" if e.get("parent") else ""
+        unv_str = " [unverified]" if e.get("unverified") else ""
+        lines.append(f"- **[{iso}] `{st}`**{sess_str}{parent_str}{unv_str}: {e.get('message', '')}")
         fl = e.get("files")
         if fl:
             lines.append(f"  - *Files touched/claimed*: {', '.join(f'`{f}`' for f in fl)}")
@@ -5537,8 +5796,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             break
         first_failure = first_failure or budget_msg
     if not ok:
-        t_broadcast_track(f"[BUDGET GUARD HALT] Worker '{role}' ({model or provider}) blocked: {first_failure}",
-                          track=track, station_id="budget-guard")
+        _broadcast_track_internal(f"[BUDGET GUARD HALT] Worker '{role}' ({model or provider}) blocked: {first_failure}",
+                                  track=track, station_id="budget-guard")
         return first_failure
 
     thread_id = ""
@@ -5650,7 +5909,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
 
     god_warning = ("[WARNING: GOD MODE] This worker runs with permission prompts off and maximum effort.\n"
                    if is_god_mode else "")
-    t_broadcast_track(
+    _broadcast_track_internal(
         f"[PENDING APPROVAL] Worker `{worker_id}` queued ({role}, {selected_provider.upper()} "
         f"model:{target_model} effort:{chosen_effort}). User authorization required.",
         track=track, station_id="guard")
@@ -6128,7 +6387,7 @@ def _launch_worker(worker_id: str) -> str:
     meta.update({"status": "running", "pid": proc.pid, "report": "",
                  "started_at": _dt.datetime.now().astimezone().isoformat()})
     _save_worker(meta)
-    t_broadcast_track(
+    _broadcast_track_internal(
         f"[WORKER APPROVED & LAUNCHED] Worker `{worker_id}` [{meta.get('provider', '').upper()}] "
         f"(PID {proc.pid}) started for role: '{meta.get('role')}'",
         track=meta.get("track", "main"), station_id=worker_id)
@@ -6357,8 +6616,8 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
                     f.write(json.dumps({"ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                                         "from": meta["id"], "shared_chat": None,
                                         "text": f"Permission needed ({rid}): {tool}: {detail}"}) + "\n")
-    t_broadcast_track(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
-                      track=meta.get("track", "main"), station_id=meta["id"])
+    _broadcast_track_internal(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
+                              track=meta.get("track", "main"), station_id=meta["id"])
     notify_if_still_waiting(f"permission_request|{meta['id']}|{rid}", f"Permission needed ({meta['id']}): {tool}",
                             lambda: rid in {r["id"] for r in _pending_permissions()}, route="workers")
     return rid
@@ -6394,8 +6653,8 @@ def _answer_permission(rid: str, decision: str, answered_by: str) -> str:
             return f"Permission request `{rid}` was already answered ({rec.get('decision')})."
         rec.update({"status": "answered", "decision": decision, "answered_by": answered_by, "answered_at": time.time()})
         _write_json_atomic(_perm_file(rid), rec)
-    t_broadcast_track(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {one_line(rec['detail'], 160)} "
-                      f"(by {answered_by})", track="main", station_id="guard")
+    _broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {one_line(rec['detail'], 160)} "
+                              f"(by {answered_by})", track="main", station_id="guard")
     return f"[{decision.upper()}] `{rid}`: {rec['tool']}: {one_line(rec['detail'], 160)}"
 
 
@@ -6925,8 +7184,8 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
                 _save_worker(parent)
     if is_reviewer and verdict != "none":
         word = "APPROVE" if verdict == "approve" else "REJECT"
-        t_broadcast_track(f"Review of {worker_id} by {reviewer_model}: {word}: {verdict_reason}".rstrip(),
-                          track=meta.get("track", "main"), station_id=worker_id)
+        _broadcast_track_internal(f"Review of {worker_id} by {reviewer_model}: {word}: {verdict_reason}".rstrip(),
+                                  track=meta.get("track", "main"), station_id=worker_id)
     for step in steps:
         when = step.get("when") or "completed"
         if when == "always":
@@ -7012,8 +7271,8 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
             parent = _load_worker(worker_id) or meta
             parent.setdefault("triggered", []).append(child_id)
             _save_worker(parent)
-        t_broadcast_track(f"{worker_id} finished; started {child_id} ({step.get('role')})",
-                          track=meta.get("track", "main"), station_id=worker_id)
+        _broadcast_track_internal(f"{worker_id} finished; started {child_id} ({step.get('role')})",
+                                  track=meta.get("track", "main"), station_id=worker_id)
         with contextlib.suppress(Exception):
             _launch_worker(child_id)
 
@@ -7542,6 +7801,8 @@ def supervise_worker(worker_id: str) -> int:
                 if is_acp and not meta.get("skip_permissions"):
                     env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
                 env["SUBWAY_WORKER"] = "1"
+                env["SUBWAY_WORKER_ID"] = meta["id"]
+                env["SUBWAY_STATION_ID"] = meta["id"]
                 proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 current["proc"] = proc
@@ -7910,7 +8171,7 @@ def t_spin_batch(role: str, prompt: str, input_glob: str, output_file: str, mode
         "merge_prompt": merge_prompt,
     }
     _save_worker(meta)
-    t_broadcast_track(f"[PENDING APPROVAL] Batch `{worker_id}` queued ({role}, {len(files)} files, model {chosen}).", track=track, station_id="guard")
+    _broadcast_track_internal(f"[PENDING APPROVAL] Batch `{worker_id}` queued ({role}, {len(files)} files, model {chosen}).", track=track, station_id="guard")
     return (f"[APPROVAL REQUIRED] Batch `{worker_id}` is queued in PENDING APPROVAL state.\n"
             f"- Files: {len(files)}\n- Model: **{chosen}** ({msg})\n- Results: `{out_path}`\n\n"
             f"Only your user can launch this. It resumes where it stopped if it's interrupted. They can approve it in the Live HUD, "
@@ -8489,8 +8750,8 @@ def t_stop_worker(worker_id: str, reason: str = "") -> str:
                            capture_output=True, timeout=5)
         else:
             os.kill(int(meta["pid"]), signal.SIGTERM)  # The supervisor forwards it and records the result.
-    t_broadcast_track(f"[WORKER STOPPED] Worker `{worker_id}` stop requested. Reason: {meta['stop_reason']}",
-                      track=meta.get("track", "main"), station_id="guard")
+    _broadcast_track_internal(f"[WORKER STOPPED] Worker `{worker_id}` stop requested. Reason: {meta['stop_reason']}",
+                              track=meta.get("track", "main"), station_id="guard")
     return f"[STOPPING] Worker `{worker_id}` was told to stop."
 
 
@@ -8509,8 +8770,8 @@ def t_reject_worker(worker_id: str, reason: str = "") -> str:
         meta["status"] = "rejected"
         meta["rejection_reason"] = reason or "Cancelled by user"
         _save_worker(meta)
-    t_broadcast_track(f"[WORKER REJECTED] Worker `{worker_id}` rejected. Reason: {meta['rejection_reason']}",
-                      track=meta.get("track", "main"), station_id="guard")
+    _broadcast_track_internal(f"[WORKER REJECTED] Worker `{worker_id}` rejected. Reason: {meta['rejection_reason']}",
+                              track=meta.get("track", "main"), station_id="guard")
     return f"[REJECTED] Worker `{worker_id}` was rejected and cancelled."
 
 
@@ -8732,7 +8993,7 @@ def t_escalate_worker(worker_id: str, new_effort: str = "max", new_mode: str = "
     esc_msg = f"[ESCALATE_COMPLEXITY] Worker `{worker_id}` ({role}) escalated from {prev_effort}/{prev_mode} to {new_effort}/{new_mode}."
     if reason:
         esc_msg += f" Reason: {reason}"
-    t_broadcast_track(esc_msg, track=track, station_id="coordinator")
+    _broadcast_track_internal(esc_msg, track=track, station_id="coordinator")
 
     successor_prompt = (
         f"ESCALATION SUCCESSOR for task '{role}'.\n"
@@ -10702,7 +10963,8 @@ def t_hud_status(project: str = "") -> str:
         lines.append("  (No files locked.)")
     for p, info in locks.items():
         rem = max(0, int(info.get("expires_at", 0) - now))
-        lines.append(f"  [LOCKED] {p} <- {info.get('holder')} ({info.get('role')}, {rem}s left) :: {info.get('purpose', '')}")
+        unv = " [unverified]" if info.get("unverified") else ""
+        lines.append(f"  [LOCKED] {p} <- {info.get('holder')}{unv} ({info.get('role')}, {rem}s left) :: {info.get('purpose', '')}")
 
     lines.extend([subsep, "[AUTONOMOUS WORKER SWARM - ACTIVE]"])
     if not workers:
@@ -10718,8 +10980,11 @@ def t_hud_status(project: str = "") -> str:
         lines.append("  (No active tracks. Join or broadcast with join_track() / broadcast_track().)")
     for tname, tinfo in tracks.items():
         last = tinfo.get("last_entry") or {}
+        st = last.get('station_id', 'none')
+        unv = " [unverified]" if last.get("unverified") else ""
+        parent = f" (parent: {last.get('parent')})" if last.get("parent") else ""
         lines.append(f"  [TRACK] '{tname}': {tinfo.get('count', 0)} events. "
-                     f"Latest from `{last.get('station_id', 'none')}`: {last.get('message', 'No dispatches yet')}")
+                     f"Latest from `{st}`{parent}{unv}: {last.get('message', 'No dispatches yet')}")
 
     probe = _hud_probe(HUD_PORT)
     if probe and probe.get("version") == VERSION:
@@ -11210,11 +11475,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/release":
             res = t_release_file(filepath=str(payload.get("filepath", "")), holder="hud-user", force=True)
         elif path == "/api/broadcast":
-            res = t_broadcast_track(
+            res = _broadcast_track_internal(
                 message=str(payload.get("message", "")), track=str(payload.get("track", "main")),
                 files=[str(f) for f in payload.get("files") or []],
                 decisions=[str(d) for d in payload.get("decisions") or []],
-                station_id=str(payload.get("station_id") or "web-hud"), session_id=str(payload.get("session_id", "")))
+                station_id="user (HUD)")
         elif path == "/api/approve_worker":
             res = _launch_worker(str(payload.get("id", "")))  # The HUD token proves this is the user.
         elif path == "/api/reject_worker":

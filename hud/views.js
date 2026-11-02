@@ -1051,7 +1051,8 @@ export function renderLedgerEntries(entriesList) {
     },
   },
     h("div", { class: "entry-head" }, h("span", { class: "mono" }, e.iso || ""), h("b", {}, e.station_id || "unknown"),
-      e.session_id && e.session_id !== e.station_id ? h("span", { class: "tag" }, e.session_id) : null),
+      e.session_id && e.session_id !== e.station_id ? h("span", { class: "tag" }, e.session_id) : null,
+      e.unverified ? h("span", { class: "tag bad" }, "unverified") : null),
     h("div", {}, e.message || ""),
     (e.files || []).length ? h("div", { class: "row-sub" }, `Files: ${e.files.join(", ")}`) : null,
     (e.decisions || []).length ? h("div", { class: "row-sub" }, `Decision: ${e.decisions.join("; ")}`) : null));
@@ -1061,6 +1062,7 @@ function openLedgerDetail(e) {
   const content = h("div", { class: "dialog-body" },
     h("div", { class: "tags" },
       e.is_destructive ? h("span", { class: "tag bad" }, "destructive") : null,
+      e.unverified ? h("span", { class: "tag bad" }, "unverified") : null,
       e.id ? h("span", { class: "tag mono" }, `id: ${e.id}`) : null,
       e.station_id ? h("span", { class: "tag" }, `station: ${e.station_id}`) : null,
       e.session_id ? h("span", { class: "tag" }, `session: ${e.session_id}`) : null,
