@@ -957,8 +957,6 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertIn("no alternative model", updated.get("report", ""))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestActivitySignalHelpers(unittest.TestCase):
@@ -990,3 +988,27 @@ class TestActivitySignalHelpers(unittest.TestCase):
             second = server._worker_folder_activity({"project_dir": folder})
             self.assertEqual(first[0], "git")
             self.assertNotEqual(first, second)
+
+
+class SubworkerActivityTests(unittest.TestCase):
+    def test_lead_waiting_on_subworker_counts_as_active(self):
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(server, "WORKERS_DIR", tmp):
+            lead = {"id": "worker_lead1", "provider": "claude"}
+            self.assertEqual(server._active_subworkers("worker_lead1"), [])
+            for wid, status, parent in (("worker_sub1", "running", "worker_lead1"),
+                                        ("worker_sub2", "completed", "worker_lead1"),
+                                        ("worker_other", "running", "worker_x")):
+                with open(os.path.join(tmp, f"{wid}.json"), "w") as f:
+                    _json.dump({"id": wid, "status": status, "launched_by": parent}, f)
+            with open(os.path.join(tmp, "worker_bad.json"), "w") as f:
+                f.write("{corrupt")
+            self.assertEqual(server._active_subworkers("worker_lead1"), ["worker_sub1"])
+            self.assertEqual(server._active_subworkers(""), [])
+            with mock.patch.object(server, "_worker_folder_activity", return_value=None), \
+                    mock.patch.object(server, "_process_cpu_time", return_value=None):
+                signals = server._collect_worker_activity_signals(lead, None, 0)
+            self.assertEqual(signals["subworkers"][0], ("worker_sub1",))
+
+if __name__ == "__main__":
+    unittest.main()

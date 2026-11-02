@@ -7771,7 +7771,31 @@ def _collect_worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at
     cpu_time = _process_cpu_time(proc)
     if cpu_time is not None:
         signals["cpu"] = cpu_time
+    waiting_on = _active_subworkers(str(meta.get("id") or ""))
+    if waiting_on:
+        # A lead waiting on its own sub-workers is busy, even when it prints nothing.
+        signals["subworkers"] = (tuple(waiting_on), time.time())
     return signals
+
+
+_SUBWORKER_ACTIVE_STATES = ("pending", "pending_approval", "launching", "running", "stopping")
+
+
+def _active_subworkers(worker_id: str) -> List[str]:
+    """Ids of queued or running workers that this worker started."""
+    if not worker_id:
+        return []
+    active = []
+    for fp in glob.glob(os.path.join(WORKERS_DIR, "worker_*.json")):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                child = json.load(f)
+        except (ValueError, OSError):
+            continue
+        if (isinstance(child, dict) and child.get("launched_by") == worker_id and child.get("id") != worker_id
+                and child.get("status") in _SUBWORKER_ACTIVE_STATES):
+            active.append(str(child.get("id")))
+    return sorted(active)
 
 
 def _update_worker_activity(
