@@ -1,12 +1,13 @@
 /* Shell, routing and polling. */
 import { api, duration, get, h, icon, listen, set, subscribe, tickAll, toast, tokens } from "./lib.js";
-import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, usagePage, workersPage } from "./views.js";
+import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, threads, threadsPage, usagePage, workersPage } from "./views.js";
 import { helpPage } from "./help.js";
 
 const POLL_MS = 1000;
 const FEED_MS = 3000;
 const PAGES = {
   overview: { label: "Overview", sub: "What needs you, and what's running" },
+  threads: { label: "Threads", sub: "Chats across connected coding agents" },
   usage: { label: "Usage", sub: "Limits and tokens, as reported by each tool" },
   workers: { label: "Workers", sub: "Delegated agents and their permissions" },
   models: { label: "Models", sub: "How each model is ranked, and where that came from" },
@@ -79,10 +80,12 @@ function render() {
   heading.textContent = PAGES[page].label;
   subheading.textContent = PAGES[page].sub;
   if (!d && page !== "help") return;
+  if (page === "threads") loadThreads();
   if (focusInside()) return; // Never wipe out what someone is typing.
   const open = [...pageBody.querySelectorAll("details[open] summary")].map((x) => x.closest(".card")?.querySelector(".provider-name")?.textContent);
   const views = {
     overview: () => overview(d), usage: () => usagePage(d), workers: () => workersPage(d),
+    threads: () => threadsPage(threads.chats, () => loadThreads(true), threads.error),
     models: () => modelsPage(d),
     leases: () => leasesPage(d), ledger: () => ledgerPage(d, switchTrack),
     help: () => helpPage(),
@@ -102,6 +105,23 @@ async function loadFeed() {
     ledger.entries = d.entries || [];
     set("feed", ledger.entries);
   } catch (e) { /* The connection state already shows this. */ }
+}
+
+async function loadThreads(force = false) {
+  if (threads.loading || (!force && Date.now() - threads.loadedAt < 30000)) return;
+  threads.loading = true;
+  try {
+    const data = await api("/api/threads?limit=200");
+    threads.chats = data.chats || [];
+    threads.loadedAt = Date.now();
+    threads.error = "";
+  } catch (e) {
+    threads.error = String(e);
+    threads.loadedAt = Date.now();
+  } finally {
+    threads.loading = false;
+    if (currentPage() === "threads") render();
+  }
 }
 
 function switchTrack(name) {
@@ -254,6 +274,7 @@ window.addEventListener("hashchange", () => {
   lastWorkersSliceJson = null;
   render();
   if (currentPage() === "ledger") loadFeed();
+  if (currentPage() === "threads") loadThreads();
 });
 document.addEventListener("subway:rerender", () => { render(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
