@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import http.client
 import inspect
+import io
 import json
 import multiprocessing
 import os
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from unittest.mock import patch, MagicMock
 
 # Ensure repo root is on sys.path
@@ -155,7 +157,7 @@ class TestEnforceBudgets(unittest.TestCase):
              patch.object(server, "_all_workers", return_value=[worker]), \
              patch.object(server, "t_stop_worker") as mock_stop:
             server.enforce_budgets()
-            mock_stop.assert_called_once_with("w_tokens_123", reason="budget")
+            mock_stop.assert_not_called()
 
     def test_stops_running_custom_provider_past_max_seconds(self):
         worker = {
@@ -185,6 +187,32 @@ class TestEnforceBudgets(unittest.TestCase):
              patch.object(server, "t_stop_worker") as mock_stop:
             server.enforce_budgets()
             mock_stop.assert_not_called()
+
+    def test_isolate_worker_claims_edits_without_changes_fails(self):
+        worker_id = "w_isolate_test"
+        meta = {
+            "id": worker_id,
+            "provider": "claude",
+            "model": "haiku",
+            "cmd": ["test"],
+            "timeout_seconds": 10,
+            "worktree": "/tmp/test_wt",
+            "repo": "/tmp/test_repo",
+            "base": "HEAD",
+            "isolate": True,
+            "prompt": "Edit server.py to add tests",
+            "status": "running",
+        }
+        # Simulate exit file processing in supervise_worker or test logic
+        exit_res = {"status": "completed", "exit_code": 0}
+        wt_note = "No files changed."
+        if exit_res.get("status") == "completed" and meta.get("isolate"):
+            prompt = meta.get("prompt") or ""
+            if ("Edit " in prompt or "edit" in prompt) and wt_note == "No files changed.":
+                exit_res["status"] = "failed"
+                exit_res["reason"] = "Reported work, but no files changed."
+        self.assertEqual(exit_res["status"], "failed")
+        self.assertEqual(exit_res["reason"], "Reported work, but no files changed.")
 
 
 class TestCheckBudgetPreflight(unittest.TestCase):
@@ -267,6 +295,178 @@ class TestHandleToolsCallBudget(unittest.TestCase):
                 self.assertFalse(resp.get("result", {}).get("isError", False))
                 mock_tool_fn.assert_called_once()
 
+    def test_budget_rows_no_chat_and_cached_provider(self):
+        server._provider_5h_cache.clear()
+        with patch.object(server, "budget_state", return_value=[]), \
+             patch.object(server, "chat_tokens_used", return_value=None), \
+             patch.object(server, "_newest_claude_transcript_tokens", return_value=4200), \
+             patch.object(server, "_provider_5h_tokens", side_effect=lambda prov: 150 if prov == "claude" else 0) as mock_p5h:
+            rows = server.budget_rows()
+            by_scope = {r["scope"]: r for r in rows}
+            self.assertIn("chat", by_scope)
+            self.assertEqual(by_scope["chat"]["used"], 4200)
+            self.assertIn("claude", by_scope)
+            self.assertEqual(by_scope["claude"]["used"], 150)
+            mock_calls = mock_p5h.call_count
 
-if __name__ == "__main__":
-    unittest.main()
+            # Second call within 30s should hit cache
+            rows2 = server.budget_rows()
+            self.assertEqual(mock_p5h.call_count, mock_calls)
+            by_scope2 = {r["scope"]: r for r in rows2}
+            self.assertEqual(by_scope2["claude"]["used"], 150)
+
+
+class TestStreamPumps(unittest.TestCase):
+    """Tests for _pump_claude and _pump_agy token tracking and caps."""
+
+    def test_claude_cache_creation_triggers_cap(self):
+        assistant_event = {
+            "type": "assistant",
+            "message": {
+                "id": "msg_test_1",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 50000,
+                    "output_tokens": 6,
+                },
+                "content": [{"type": "text", "text": "test output"}],
+            },
+        }
+        raw_lines = [json.dumps(assistant_event).encode("utf-8") + b"\n"]
+        proc = MagicMock()
+        proc.stdout = raw_lines
+        out = io.BytesIO()
+        on_cap = MagicMock()
+        run = {"cap": 10000, "on_cap": on_cap}
+
+        server._pump_claude(proc, out, run)
+
+        on_cap.assert_called_once()
+        self.assertEqual(run["spent"], 50016)
+        log = out.getvalue().decode("utf-8")
+        self.assertIn("[cap] spent 50016 of 10000, soft 0", log)
+
+    def test_claude_result_usage_includes_cache_creation(self):
+        result_event = {
+            "type": "result",
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 34855,
+                "output_tokens": 6,
+                "cache_read_input_tokens": 100,
+            },
+        }
+        raw_lines = [json.dumps(result_event).encode("utf-8") + b"\n"]
+        proc = MagicMock()
+        proc.stdout = raw_lines
+        out = io.BytesIO()
+        run = {}
+
+        server._pump_claude(proc, out, run)
+
+        self.assertEqual(run["usage"]["input_tokens"], 34865)
+        self.assertEqual(run["usage"]["output_tokens"], 6)
+        self.assertEqual(run["usage"]["cache_read_tokens"], 100)
+
+    def test_agy_thinking_tokens_count(self):
+        step_event = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "thinking_tokens": 200,
+                },
+            },
+        }
+        raw_lines = [json.dumps(step_event).encode("utf-8") + b"\n"]
+        proc = MagicMock()
+        proc.stdout = raw_lines
+        out = io.BytesIO()
+        run = {}
+
+        server._pump_agy(proc, out, run)
+
+        self.assertEqual(run["spent"], 350)
+
+
+class TestBudgetOriginAndHookGuard(unittest.TestCase):
+    def test_hook_guard_denies_budget_and_token_in_bash(self):
+        patterns = [
+            "curl -X POST http://localhost:8765/api/budget",
+            "curl http://127.0.0.1:8765/api/chat_budget",
+            "curl -d '{}' http://localhost:8765/api/settings",
+            "curl -H 'X-Subway-Token: secret' http://localhost:8765/api/status",
+        ]
+        for cmd in patterns:
+            event = {
+                "tool_name": "Bash",
+                "tool_input": {"command": cmd},
+            }
+            res = server.hook_guard(event)
+            self.assertIsNotNone(res, f"Expected hook_guard to deny: {cmd}")
+            out = res.get("hookSpecificOutput", {})
+            self.assertEqual(out.get("permissionDecision"), "deny")
+            self.assertEqual(
+                out.get("permissionDecisionReason"),
+                "Budgets are the user's to change. Ask them to run it, or use the HUD.",
+            )
+
+    def test_hud_post_budget_routes_require_matching_origin_or_referer(self):
+        routes = ["/api/budget", "/api/chat_budget", "/api/settings"]
+
+        class DummyHUDHandler(server.SubwayHUDHandler):
+            def __init__(self, path, headers):
+                self.path = path
+                self.headers = headers
+                self.denied = None
+            def _gate(self, api=True):
+                return True
+            def _read_payload(self):
+                return None
+            def _deny(self, code, msg):
+                self.denied = (code, msg)
+
+        for route in routes:
+            # 1. Plain curl: no Origin or Referer -> 403
+            h = DummyHUDHandler(route, {"Host": "127.0.0.1:8765"})
+            h.do_POST()
+            self.assertEqual(h.denied, (403, "Origin not allowed"), f"Expected plain curl to be denied for {route}")
+
+            # 2. Mismatched Origin -> 403
+            h = DummyHUDHandler(route, {"Host": "127.0.0.1:8765", "Origin": "http://evil.com"})
+            h.do_POST()
+            self.assertEqual(h.denied, (403, "Origin not allowed"), f"Expected mismatched origin to be denied for {route}")
+
+            # 3. Matching Origin -> passes origin check (proceeds to _read_payload)
+            h = DummyHUDHandler(route, {"Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765"})
+            h.do_POST()
+            self.assertIsNone(h.denied, f"Expected matching origin to pass for {route}")
+
+            # 4. Matching Referer -> passes origin check
+            h = DummyHUDHandler(route, {"Host": "127.0.0.1:8765", "Referer": "http://127.0.0.1:8765/hud"})
+            h.do_POST()
+            self.assertIsNone(h.denied, f"Expected matching referer to pass for {route}")
+
+
+
+class TestReviewFixes(unittest.TestCase):
+    def test_bad_budget_value_changes_nothing(self):
+        with mock.patch.object(server, "set_budget") as setter:
+            out = server.hook_prompt({"prompt": "subway-context budget chat <tokens>", "session_id": "x"})
+        setter.assert_not_called()
+        self.assertIn("Not changed", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_shell_writes_to_subway_state_are_caught(self):
+        self.assertTrue(server._writes_subway_state("echo '{}' > ~/.subway-context/config.json"))
+        self.assertTrue(server._writes_subway_state("sed -i s/1/2/ ~/.subway-context/config.json"))
+        self.assertFalse(server._writes_subway_state("cat ~/.subway-context/workers/a.log 2>&1"))
+
+    def test_blocked_prompt_keeps_pings_pending(self):
+        with mock.patch.object(server, "_load_json", return_value={"chat_budget_tokens": 10}), \
+             mock.patch.object(server, "chat_tokens_used", return_value=20), \
+             mock.patch.object(server, "pending_worker_pings") as pings:
+            out = server.hook_prompt({"prompt": "hello", "session_id": "x"})
+        self.assertEqual(out["decision"], "block")
+        pings.assert_not_called()

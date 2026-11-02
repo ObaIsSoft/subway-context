@@ -152,3 +152,18 @@ Workers should spend tokens editing, not searching. One round spent 3.83M input 
 - Don't use workers for experiments that wait on permissions: run those directly.
 - The initiator plans and reviews. At [LOW LIMIT], stop implementing and hand off.
 - Verify patches yourself: compile, tests, and a real browser check.
+
+### Lessons from real runs
+
+- A thin brief is the costliest option. Saving Claude tokens on a spec wasted 157K of worker tokens. Give workers the exact code and the exact edit, so they never have to hunt.
+- The initiator measures and specifies; workers type. A short direct probe has beaten worker guesses again and again, including wrong theories of our own. Prove a cause before fixing it.
+- Experiments and live tests that need permission go in a script run by the initiator, or in one command the user can approve. Workers can't run most commands.
+- Check what a router will pick before launching. Never launch `auto` blind: it once sent three workers to Opus.
+- Check a worker's report against the tree. Workers report success with no files changed, and reviewers raise false alarms: verify each finding in the code.
+- Count everything that costs: thinking tokens and cache creation, not just input and output. Each call resends the whole context, so a cap must allow for the next call.
+- Wrap up at two thirds of a cap, and never start a call that would pass it. Make edits early, so a stop loses little.
+- Never print large outputs into the chat. Trim every command, and never echo a worker's prompt.
+- Free OpenCode models suit reviews and text. Don't rely on them for code edits until they've proven it.
+- Don't rely on a test harness's silence: a hook or guard can stop a whole command, so confirm it ran.
+- A killed Antigravity turn sends no total, and the resumed turn's total then includes it. Trust the live per-step count over a final total when they disagree.
+

@@ -124,26 +124,29 @@ export function spendChart(providers) {
   const max = Math.max(...series.flatMap((p) => p.tokens.hourly)) || 1;
   const x = (i) => L + (i / 23) * (W - L - 8);
   const y = (v) => T + (1 - v / max) * (H - T - B);
-  const colours = ["var(--gold)", "var(--series-2)", "var(--series-3)"];
+  const providerColour = (id) =>
+    id === "claude" ? "var(--series-claude)" :
+    id === "antigravity" ? "var(--series-antigravity)" :
+    id === "opencode" ? "var(--series-opencode)" : "var(--gold)";
   const grid = [0, 0.5, 1].map((f) => [
     s("line", { class: "chart-grid", x1: L, x2: W - 8, y1: y(max * f), y2: y(max * f) }),
     s("text", { class: "chart-axis", x: L - 6, y: y(max * f) + 3, "text-anchor": "end" }, tokens(Math.round(max * f))),
   ]);
   const ticks = [[0, "24h ago"], [11.5, "12h ago"], [23, "now"]].map(([i, label]) =>
     s("text", { class: "chart-axis", x: x(i), y: H - 6, "text-anchor": i === 0 ? "start" : i === 23 ? "end" : "middle" }, label));
-  const lines = series.map((p, n) => {
+  const lines = series.map((p) => {
     const pts = p.tokens.hourly.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
-    const colour = colours[n % colours.length];
+    const colour = providerColour(p.id);
     return [
-      n === 0 ? s("polygon", { points: `${L},${y(0)} ${pts.join(" ")} ${W - 8},${y(0)}`, fill: colour, opacity: "0.12" }) : null,
+      s("polygon", { points: `${L},${y(0)} ${pts.join(" ")} ${W - 8},${y(0)}`, fill: colour, opacity: "0.12" }),
       s("polyline", { points: pts.join(" "), fill: "none", stroke: colour, "stroke-width": 2, "stroke-linejoin": "round" }),
     ];
   });
   const summary = series.map((p) => `${p.name} ${tokens(p.tokens.hourly.reduce((a, b) => a + b, 0))}`).join(", ");
   return [
     s("svg", { class: "chart", viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `New tokens per hour over 24 hours: ${summary}` }, grid, ticks, lines),
-    h("div", { class: "chart-legend" }, series.map((p, n) => h("span", { class: "legend-key" },
-      h("span", { class: `swatch${["", " two", " three"][n % 3]}` }), p.name, " ",
+    h("div", { class: "chart-legend" }, series.map((p) => h("span", { class: "legend-key" },
+      h("span", { class: "swatch", style: `background: ${providerColour(p.id)}` }), p.name, " ",
       h("b", {}, tokens(p.tokens.hourly.reduce((a, b) => a + b, 0)))))),
   ];
 }

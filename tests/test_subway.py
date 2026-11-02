@@ -480,7 +480,7 @@ class TestWorkers(SubwayTestCase):
             "project_dir": self.test_dir,
             "log_file": log_file,
             "status": "running",
-            "pid": 99999,
+            "pid": os.getpid(),
         }
         server._save_worker(meta)
 
@@ -504,7 +504,7 @@ class TestWorkers(SubwayTestCase):
             "project_dir": self.test_dir,
             "log_file": log_file,
             "status": "running",
-            "pid": 99999,
+            "pid": os.getpid(),
         }
         server._save_worker(meta)
 
@@ -893,6 +893,43 @@ class TestMCPAndPermissions(SubwayTestCase):
         content_text = handle_res["result"]["content"][0]["text"]
         self.assertIn("[PERMISSION NEEDED]", content_text)
         self.assertIn(rid2, content_text)
+
+    def test_worker_ping_appears_once_only(self):
+        launcher = "launcher-station-ping-test"
+        orig_self_id = server._self_id
+        server._self_id = lambda: launcher
+        try:
+            worker_id = "worker_fa1234"
+            meta = {
+                "id": worker_id,
+                "role": "Ping Tester",
+                "provider": "claude",
+                "status": "completed",
+                "reason": "finished cleanly",
+                "launched_by": launcher,
+            }
+            server._save_worker(meta)
+
+            res1 = server.handle({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}}
+            })
+            text1 = res1["result"]["content"][0]["text"]
+            expected = f"[WORKER] {worker_id} (Ping Tester) completed: finished cleanly"
+            self.assertIn(expected, text1)
+
+            res2 = server.handle({
+                "jsonrpc": "2.0",
+                "id": 102,
+                "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}}
+            })
+            text2 = res2["result"]["content"][0]["text"]
+            self.assertNotIn(expected, text2)
+        finally:
+            server._self_id = orig_self_id
 
     def test_elicitation_auto_closing_and_chat_reply(self):
         launcher = "launcher-station-elicit"
@@ -1324,6 +1361,7 @@ class TestLocalAndRouting(SubwayTestCase):
             "project_dir": self.test_dir,
             "log_file": server._log_file(worker_id),
             "status": "running",
+            "pid": os.getpid(),
             "prompt": "test_allow",
             "timeout_seconds": 10,
         }
@@ -1354,6 +1392,7 @@ class TestLocalAndRouting(SubwayTestCase):
             "project_dir": self.test_dir,
             "log_file": server._log_file(worker_id),
             "status": "running",
+            "pid": os.getpid(),
             "prompt": "test_deny",
             "timeout_seconds": 10,
         }
@@ -1395,6 +1434,7 @@ class TestLocalAndRouting(SubwayTestCase):
             "log_file": server._log_file(worker_id),
             "budget": {"max_tokens": 500},
             "status": "running",
+            "pid": os.getpid(),
             "prompt": "test_cap",
             "timeout_seconds": 10,
         }
@@ -1408,3 +1448,33 @@ class TestLocalAndRouting(SubwayTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHistoryApi(SubwayTestCase):
+    def test_history_paging(self):
+        os.makedirs(server.WORKERS_DIR, exist_ok=True)
+        for i in range(15):
+            wid = f"worker_{i:06d}"
+            wfile = server._worker_file(wid)
+            with open(wfile, "w", encoding="utf-8") as f:
+                json.dump({"id": wid, "status": "completed", "completed_at": f"2026-01-01T00:{i:02d}:00"}, f)
+
+        token = server.hud_token()
+        httpd = server.start_hud_server(port=0, daemon=True)
+        self.assertIsNotNone(httpd)
+        port = httpd.server_address[1]
+
+        def get_hist(offset, limit):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/history?offset={offset}&limit={limit}")
+            req.add_header("X-Subway-Token", token)
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        res = get_hist(0, 10)
+        self.assertEqual(res["total"], 15)
+        self.assertEqual(len(res["entries"]), 10)
+
+        res2 = get_hist(10, 10)
+        self.assertEqual(res2["total"], 15)
+        self.assertEqual(len(res2["entries"]), 5)
+

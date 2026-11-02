@@ -2007,6 +2007,12 @@ def t_list_locks() -> str:
     return "\n".join(lines)
 
 
+def _writes_subway_state(command: str) -> bool:
+    """Best effort: a shell can write a file in too many ways to catch them all, so this stops the plain ones."""
+    return bool(re.search(r">\s*\S*(\.subway-context|config\.json)|\btee\b.*\.subway-context|"
+                          r"\bsed\s+-i.*\.subway-context|\b(mv|cp|rm)\b.*\.subway-context", command))
+
+
 def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Claude Code PreToolUse hook: deny an edit to a file another agent holds a lease on, or stop if chat budget reached."""
     cfg = _load_json("config.json")
@@ -2019,14 +2025,18 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD.",
+                "permissionDecisionReason": f"Budget reached: {used:,} of {limit:,} tokens. Ask the user to raise it.",
             }}
 
     tool_name = event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
+    if _writes_subway_state(str(tool_input.get("command") or "")):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": "Budgets are the user's to change. Ask them to run it, or use the HUD."}}
     cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
     if (tool_name == "Bash" or cmd is not None) and isinstance(cmd, str):
-        if re.search(r"(subway-context|server\.py)\s+budget\s+\S+\s+\d", cmd):
+        if (re.search(r"(subway-context|server\.py)\s+budget\s+\S+\s+\d", cmd)
+                or any(k in cmd for k in ("/api/budget", "/api/chat_budget", "/api/settings", "X-Subway-Token"))):
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
@@ -2912,6 +2922,8 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
                     permission_mode: str, prompt: str, max_budget_usd: Optional[float],
                     thread_id: str, worker_id: str = "") -> List[str]:
     """Translate a worker spec into the real flags of each agent CLI."""
+    if provider == "antigravity" and effort == "max":
+        effort = "high"  # Antigravity models stop at high, and refuse max outright.
     skip_permissions = god or permission_mode == "auto_approve" or "terminal:full" in caps
     safe = permission_mode == "auto_safe"
     text = _safe_prompt(prompt)
@@ -3180,14 +3192,79 @@ def budget_state() -> List[Dict[str, Any]]:
         })
     return res
 
+_provider_5h_cache: Dict[str, Tuple[float, int]] = {}
+
+def _cached_provider_5h_tokens(scope: str) -> int:
+    now = time.time()
+    hit = _provider_5h_cache.get(scope)
+    if hit and (now - hit[0]) < 30:
+        return hit[1]
+    val = _provider_5h_tokens(scope)
+    _provider_5h_cache[scope] = (now, val)
+    return val
+
+def _newest_claude_transcript_tokens() -> int:
+    try:
+        patterns = [
+            os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl"),
+            os.path.join(CLAUDE_DIR, "projects", "**", "*.jsonl"),
+            os.path.expanduser("~/.claude/projects/*/*.jsonl"),
+            os.path.expanduser("~/.claude/projects/**/*.jsonl"),
+        ]
+        files = []
+        for pat in patterns:
+            files.extend([p for p in glob.glob(pat, recursive=True) if os.path.isfile(p)])
+        if not files:
+            return 0
+        newest = max(set(files), key=os.path.getmtime)
+        total = 0
+        for ts, inp, out, cache_read in _parse_claude_usage(newest):
+            total += inp + out
+        if total == 0:
+            with open(newest, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ent = json.loads(line)
+                        u = ent.get("usage") if isinstance(ent.get("usage"), dict) else ent
+                        total += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+                    except Exception:
+                        pass
+        return total
+    except Exception:
+        return 0
+
 def budget_rows() -> List[Dict[str, Any]]:
     """budget_state plus an empty row for each scope with no budget, so the HUD can set the first one."""
     rows = budget_state()
+    chat_used = chat_tokens_used()
+    chat_detected = chat_used is not None
+    if not chat_detected:
+        newest_tokens = _newest_claude_transcript_tokens()
+        for r in rows:
+            if r.get("scope") == "chat":
+                r["used"] = newest_tokens or 0
+                if r.get("limit", 0) > 0:
+                    r["pct"] = round((r["used"] / r["limit"]) * 100, 1)
+                    r["status"] = "reached" if r["used"] >= r["limit"] else "warning" if r["used"] >= 0.8 * r["limit"] else "ok"
+
     have = {r["scope"] for r in rows}
     scopes = ["chat", "claude", "antigravity", "opencode", "local"]
     with contextlib.suppress(Exception):
         scopes += [str(c.get("id")) for c in load_custom_providers() if isinstance(c, dict) and c.get("id")]
-    return rows + [{"scope": x, "used": 0, "limit": 0, "pct": 0.0, "status": "ok"} for x in scopes if x not in have]
+
+    extra = []
+    for x in scopes:
+        if x in have:
+            continue
+        if x == "chat":
+            used = chat_used if chat_detected else _newest_claude_transcript_tokens()
+        else:
+            used = _cached_provider_5h_tokens(x)
+        extra.append({"scope": x, "used": used or 0, "limit": 0, "pct": 0.0, "status": "ok"})
+    return rows + extra
 
 
 def budget_ping_notice(scope: str, used: int, limit: int) -> str:
@@ -3223,13 +3300,6 @@ def enforce_budgets() -> None:
                     t_stop_worker(w["id"], reason="budget")
                     continue
             w_budget = w.get("budget") or {}
-            max_tok = int(w_budget.get("max_tokens") or 0)
-            if max_tok > 0:
-                usage = w.get("usage") or {}
-                used_tok = int(usage.get("input") or 0) + int(usage.get("output") or 0)
-                if used_tok >= max_tok:
-                    t_stop_worker(w["id"], reason="budget")
-                    continue
             max_sec = int(w_budget.get("max_seconds") or 0)
             if max_sec > 0 and (prov in custom_ids or prov not in ("claude", "antigravity", "opencode", "local")):
                 st = 0
@@ -3277,10 +3347,14 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
                   capabilities: Optional[List[str]] = None,
                   budget_session_pct: Optional[float] = None, budget_weekly_pct: Optional[float] = None,
                   max_budget_usd: Optional[float] = None, thread: str = "", private: bool = False,
-                  max_tokens: int = 0, max_seconds: int = 0, swarm_id: str = "", isolate: bool = False, route_reason: str = "") -> str:
+                  max_tokens: int = 0, max_seconds: int = 0, swarm_id: str = "", isolate: bool = False, route_reason: str = "",
+                  priority: str = "normal") -> str:
     """Queue a worker for user approval. Agents can request workers, but only the user can launch them."""
     if not role or not prompt:
         return "Error: role and prompt are required."
+    priority = (priority or "normal").lower()
+    if priority not in ("urgent", "normal", "low"):
+        return f"Error: unknown priority '{priority}'. Must be 'urgent', 'normal', or 'low'."
     _ensure_subway_dir()
 
     cwd = os.path.realpath(os.path.expanduser(project_dir)) if project_dir else os.getcwd()
@@ -3420,6 +3494,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "launched_by": _self_id(),
         "swarm_id": swarm_id,
         "isolate": bool(isolate),
+        "priority": priority,
         "route": route_reason or (route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}."),
         "usage": {"input": 0, "output": 0, "cache_read": 0},
         "status": "pending_approval",
@@ -3476,7 +3551,7 @@ def capacity() -> Dict[str, int]:
 def _capacity_block(meta: Dict[str, Any]) -> str:
     running = [w for w in _all_workers() if w.get("status") in ("running", "launching", "stopping")]
     cap = capacity()
-    if meta.get("mode") == "god":  # God mode has no worker count: only free memory can hold it back.
+    if str(meta.get("mode") or "").lower() == "god":  # God mode has no worker count: only free memory can hold it back.
         return f"[CAPACITY] Only {cap['available'] / GB:.1f} GB of memory is free. It stays queued." if cap["available"] < WORKER_RAM else ""
     if len(running) >= cap["machine"]:
         return f"[CAPACITY] {len(running)} workers are running, and this machine's limit is {cap['machine']}. It stays queued."
@@ -3717,8 +3792,20 @@ def t_watch_workers(wait_seconds: int = 50) -> str:
     while time.time() < deadline:
         pending = _pending_permissions()
         if pending:
+            urgent_p = [p for p in pending if (_load_worker(p["worker_id"]) or {}).get("priority") == "urgent"]
+            if urgent_p:
+                running = [w["id"] for w in _all_workers() if w["id"] != urgent_p[0]["worker_id"] and w.get("status") in ACTIVE_WORKER_STATES]
+                extra = f"\nStill running: {', '.join(running)}." if running else ""
+                return f"{permission_text(pending)}{extra}"
             return permission_text(pending)
-        for w in _all_workers():
+        all_w = _all_workers()
+        for w in all_w:
+            if before.get(w["id"]) in ACTIVE_WORKER_STATES and w.get("status") not in ACTIVE_WORKER_STATES:
+                if w.get("priority") == "urgent":
+                    running = [o["id"] for o in all_w if o["id"] != w["id"] and o.get("status") in ACTIVE_WORKER_STATES]
+                    extra = f" Still running: {', '.join(running)}." if running else ""
+                    return f"Worker `{w['id']}` ({w.get('role')}) ended: {w.get('status')}, exit {w.get('exit_code')}.{extra}"
+        for w in all_w:
             if before.get(w["id"]) in ACTIVE_WORKER_STATES and w.get("status") not in ACTIVE_WORKER_STATES:
                 return f"Worker `{w['id']}` ({w.get('role')}) ended: {w.get('status')}, exit {w.get('exit_code')}."
         time.sleep(1.0)
@@ -3825,11 +3912,16 @@ def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             usage = msg.get("usage") or {}
             # One message arrives as several events with growing usage, so only count what's new.
             seen = run.setdefault("seen_messages", {})
-            step_cost = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
-            new_cost = max(0, step_cost - seen.get(msg.get("id"), 0))
-            seen[msg.get("id")] = max(step_cost, seen.get(msg.get("id"), 0))
+            step_cost = int(usage.get("input_tokens") or 0) + int(usage.get("cache_creation_input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+            msg_id = msg.get("id") or f"no-id-{len(seen)}"  # Messages with no id can't be repeats of each other.
+            new_cost = max(0, step_cost - seen.get(msg_id, 0))
+            seen[msg_id] = max(step_cost, seen.get(msg_id, 0))
             run["spent"] = run.get("spent", 0) + new_cost
-            run["last_step"] = step_cost or run.get("last_step", 0)
+            # The next call resends the context, so that's its likely cost. Thinking and output vary too much to predict from.
+            context = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "output_tokens"))
+            run["last_step"] = context or run.get("last_step", 0)
+            if run.get("cap"):
+                write(f"[cap] spent {run['spent']} of {run['cap']}, soft {run.get('soft', 0)}")
             _check_cap(run)
             for block in msg.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -3839,8 +3931,9 @@ def _pump_claude(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
             run["response"] = ev.get("result") or ""
             usage = ev.get("usage") or {}
             run["usage"] = {
-                "input_tokens": int(usage.get("input_tokens") or 0),
+                "input_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("cache_creation_input_tokens") or 0),
                 "output_tokens": int(usage.get("output_tokens") or 0),
+                "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
             }
             if run["response"]:
                 write(str(run["response"]))
@@ -3870,9 +3963,12 @@ def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
         elif kind == "step_update":
             st = ev.get("step_update") or {}
             used = st.get("usage") or {}
-            step_cost = int(used.get("input_tokens") or 0) + int(used.get("output_tokens") or 0)
+            step_cost = int(used.get("input_tokens") or 0) + int(used.get("output_tokens") or 0) + int(used.get("thinking_tokens") or 0)
             run["spent"] = run.get("spent", 0) + step_cost
-            run["last_step"] = step_cost or run.get("last_step", 0)
+            # The next call resends the context, so that's its likely cost. Thinking varies too much to predict from.
+            run["last_step"] = int(used.get("input_tokens") or 0) + int(used.get("output_tokens") or 0) or run.get("last_step", 0)
+            if run.get("cap"):
+                write(f"[cap] spent {run['spent']} of {run['cap']}, soft {run.get('soft', 0)}")
             _check_cap(run)
             params = (st.get("tool_info") or {}).get("parameters") or {}
             detail = params.get("CommandLine") or params.get("TargetFile") or params.get("Path") or json.dumps(params)[:200]
@@ -3994,6 +4090,7 @@ def supervise_worker(worker_id: str) -> int:
     wrapped_up = False
     turn_cap = 0
     final_reason = ""
+    asked_denied = set()
     if meta.get("kind") == "batch":
         result = run_batch(meta, stopped, deadline, save_progress)
         _write_json_atomic(_exit_file(worker_id), result)
@@ -4010,6 +4107,7 @@ def supervise_worker(worker_id: str) -> int:
                 env = dict(os.environ, PWD=workdir)
                 if is_acp and not meta.get("skip_permissions"):
                     env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
+                env["SUBWAY_WORKER"] = "1"
                 proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
                                         stdout=subprocess.PIPE if (is_agy or is_claude or is_acp) else out, stderr=subprocess.STDOUT)
                 current["proc"] = proc
@@ -4042,11 +4140,24 @@ def supervise_worker(worker_id: str) -> int:
                 if pump:
                     pump.join(timeout=5)
                     if run.get("usage"):
-                        _add_usage(meta, run["usage"])
+                        # A killed turn sends no total, so the next turn's total includes it. The live count shows which applies.
+                        final = sum(int(run["usage"].get(k) or 0) for k in ("input_tokens", "output_tokens", "thinking_tokens"))
+                        saved = sum(int(meta.get("usage", {}).get(k) or 0) for k in ("input", "output"))
+                        if saved and abs(final - run.get("spent", 0)) < abs(saved + final - run.get("spent", 0)):
+                            meta["usage"] = {"input": 0, "output": 0, "cache_read": 0}
+                        _add_usage(meta, run.pop("usage"))
                         save_progress(usage=meta["usage"], conversation=run.get("conversation"))
+                    usage = meta.setdefault("usage", {"input": 0, "output": 0, "cache_read": 0})
+                    if int(usage.get("input") or 0) + int(usage.get("output") or 0) < run.get("spent", 0):
+                        diff = run["spent"] - (int(usage.get("input") or 0) + int(usage.get("output") or 0))
+                        usage["input"] = int(usage.get("input") or 0) + diff
+                        save_progress(usage=usage)
 
                 if stopped["flag"]:
-                    why = stopped.get("budget")
+                    fresh_meta = _load_worker(worker_id) or meta
+                    stop_r = fresh_meta.get("stop_reason") or ""
+                    is_b = bool(stopped.get("budget") or (stop_r and "budget" in stop_r.lower()))
+                    why = stopped.get("budget") or (stop_r if is_b else None)
                     token_cap = int(budget.get("max_tokens") or 0)
                     # One call costs the whole context, so the save turn only runs if a call of that size still fits.
                     room = not token_cap or run.get("spent", 0) + run.get("last_step", 0) < token_cap
@@ -4065,14 +4176,15 @@ def supervise_worker(worker_id: str) -> int:
                                     "files, then report what's done and what isn't in under 10 lines.")
                         cmd = _agy_resume(cmd, run["conversation"], ask_wrap, []) if is_agy else _claude_resume(cmd, run["conversation"], ask_wrap)
                         continue
-                    result = {"status": "budget_stopped" if why else "stopped", "exit_code": code, "reason": why or final_reason or "Stopped on request."}
+                    result = {"status": "budget_stopped" if is_b else "stopped", "exit_code": code, "reason": why or stop_r or final_reason or "Stopped on request."}
                     break
                 if final_reason:  # It finished inside the budget after being told to wrap up.
                     result = {"status": "completed", "exit_code": code, "reason": final_reason}
                     break
                 denied = run.get("last_error")
-                if is_agy and code == 0 and denied and not run.get("response") and run.get("conversation"):
+                if is_agy and code == 0 and denied and run.get("conversation") and denied[1] not in asked_denied:
                     tool, detail = denied
+                    asked_denied.add(detail)
                     project = os.path.realpath(meta.get("project_dir") or HOME)
                     if tool in ("run_command", "command"):
                         once, rules = [f"command({detail})"], _agy_rules(detail)
@@ -4085,7 +4197,10 @@ def supervise_worker(worker_id: str) -> int:
                                                 stop=lambda: stopped["flag"])
                     save_progress(waiting_permission=None)
                     if stopped["flag"]:
-                        result = {"status": "stopped", "exit_code": code, "reason": "Stopped on request."}
+                        fresh_meta = _load_worker(worker_id) or meta
+                        stop_r = fresh_meta.get("stop_reason") or ""
+                        is_b = bool(stopped.get("budget") or (stop_r and "budget" in stop_r.lower()))
+                        result = {"status": "budget_stopped" if is_b else "stopped", "exit_code": code, "reason": stop_r or "Stopped on request."}
                         break
                     if decision == "deny":
                         cmd = _agy_resume(cmd, run["conversation"], f"The user denied this: {detail}. Don't retry it. "
@@ -4105,7 +4220,16 @@ def supervise_worker(worker_id: str) -> int:
                 if is_acp and run.get("finished"):
                     code = 0
                 if code != 0:
-                    result = {"status": "failed", "exit_code": code}
+                    fresh_meta = _load_worker(worker_id) or meta
+                    stop_r = fresh_meta.get("stop_reason") or ""
+                    if stop_r and "budget" in stop_r.lower():
+                        result = {"status": "budget_stopped", "exit_code": code, "reason": stop_r}
+                    elif stop_r:
+                        result = {"status": "stopped", "exit_code": code, "reason": stop_r}
+                    else:
+                        result = {"status": "failed", "exit_code": code}
+                elif is_acp and run.get("user_denied") and not run.get("response"):
+                    result = {"status": "stopped", "exit_code": 0, "reason": "You denied its request, so it stopped."}
                 elif (is_agy or is_acp) and not run.get("response"):
                     result = {"status": "failed", "exit_code": 0, "reason": "The agent finished without producing a result."}
                 else:
@@ -4116,11 +4240,18 @@ def supervise_worker(worker_id: str) -> int:
     if is_local and local_profile(memory_snapshot()["total"])["keep_alive"] == "0":
         _unload_local(meta["model"])  # On a small machine, memory goes back the moment the work ends.
     fresh = _load_worker(worker_id) or meta
+    wt_note = ""
     if fresh.get("worktree"):
         try:
-            result["reason"] = f"{result.get('reason') or ''} {_collect_worktree(fresh)}".strip()
+            wt_note = _collect_worktree(fresh)
+            result["reason"] = f"{result.get('reason') or ''} {wt_note}".strip()
         except (OSError, subprocess.SubprocessError) as exc:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
+    if result.get("status") == "completed" and fresh.get("isolate"):
+        prompt = fresh.get("prompt") or ""
+        if ("Edit " in prompt or "edit" in prompt) and wt_note == "No files changed.":
+            result["status"] = "failed"
+            result["reason"] = "Reported work, but no files changed."
     _write_json_atomic(_exit_file(worker_id), result)
     _update_worker_status(_load_worker(worker_id) or meta)
     with contextlib.suppress(Exception):
@@ -4555,9 +4686,17 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 detail = json.dumps(raw) if isinstance(raw, dict) else str(raw or title)
                 options = params.get("options") or []
 
-                rid = request_permission(meta, str(title), detail)
-                decision = await_permission(rid, stop=lambda: stopped["flag"])
+                kind = tool_call.get("kind")
+                places = [str(p.get("path") or "") for p in tool_call.get("locations") or [] if isinstance(p, dict)]
+                inside = all(os.path.realpath(p).startswith(os.path.realpath(workdir)) for p in places if p)
+                if meta.get("permission_mode") == "auto_safe" and kind in ("read", "search", "edit") and inside and (places or kind != "edit"):
+                    decision = "allow"  # The same as Antigravity's accept-edits: its own folder, nothing else.
+                else:
+                    rid = request_permission(meta, str(title), detail)
+                    decision = await_permission(rid, stop=lambda: stopped["flag"])
 
+                if decision not in ("allow", "allow_always"):
+                    run["user_denied"] = True
                 wanted_kind = "allow_once" if decision == "allow" else "allow_always" if decision == "allow_always" else "reject_once"
                 selected_opt = next((o for o in options if o.get("kind") == wanted_kind), None)
                 if selected_opt is None:
@@ -4808,10 +4947,13 @@ def estimate_workers(prompt: str) -> Dict[str, Any]:
 
 def t_spin_swarm(role: str, prompt: str, provider: str = "auto", track: str = "main", project_dir: str = "",
                  mode: str = "standard", subtasks: Optional[List[str]] = None, max_tokens_each: int = 0,
-                 permission_mode: str = "") -> str:
+                 permission_mode: str = "", priority: str = "normal") -> str:
     """Queue one worker per subtask. In god mode the caller splits the work, so nobody has to pick a number."""
     if not role or not prompt:
         return "Error: role and prompt are required."
+    priority = (priority or "normal").lower()
+    if priority not in ("urgent", "normal", "low"):
+        return f"Error: unknown priority '{priority}'. Must be 'urgent', 'normal', or 'low'."
     plan = estimate_workers(prompt)
     if not subtasks:
         if (mode or "").lower() == "god" and plan["count"] > 1:
@@ -4853,10 +4995,11 @@ def t_spin_swarm(role: str, prompt: str, provider: str = "auto", track: str = "m
             res = t_spin_worker(role=f"{role} {i}", prompt=text, provider=assigned_prov, model=assigned_model,
                                 track=track, project_dir=project_dir, mode=mode,
                                 permission_mode=permission_mode, max_tokens=max_tokens_each, swarm_id=swarm_id,
-                                isolate=True, route_reason=why)
+                                isolate=True, route_reason=why, priority=priority)
         else:
             res = t_spin_worker(role=f"{role} {i}", prompt=text, provider=provider, track=track, project_dir=project_dir, mode=mode,
-                                permission_mode=permission_mode, max_tokens=max_tokens_each, swarm_id=swarm_id, isolate=True)
+                                permission_mode=permission_mode, max_tokens=max_tokens_each, swarm_id=swarm_id, isolate=True,
+                                priority=priority)
         out.append(res.splitlines()[0])
     out.append("Each worker needs approval. Workers over the capacity limit stay queued until a slot opens.")
     return "\n".join(out)
@@ -6153,6 +6296,7 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
         "signoffs": lease_files,
         "workers": active,
         "history": history[:50],
+        "total_history": len(history),
         "permissions": _pending_permissions(),
         "settings": {"permission_mode": get_permission_mode(), "permission_modes": PERMISSION_MODES,
                      "capacity": capacity(), "models": model_catalog(), "benchmarks": benchmarks_meta,
@@ -6475,6 +6619,26 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"track": _clean_track(tname), "entries": read_track_entries(tname, 50)})
             return
 
+        if path == "/api/history":
+            try:
+                offset = max(0, int(query.get("offset", [0])[0]))
+            except (ValueError, TypeError):
+                offset = 0
+            try:
+                limit = min(200, max(1, int(query.get("limit", [100])[0])))
+            except (ValueError, TypeError):
+                limit = 100
+            records = _all_workers()
+            history = []
+            for w in records:
+                if w.get("status") not in ACTIVE_WORKER_STATES:
+                    w = dict(w)
+                    w.pop("cmd", None)
+                    history.append(w)
+            history.sort(key=lambda x: str(x.get("completed_at") or x.get("created_at") or ""), reverse=True)
+            self.send_json({"entries": history[offset:offset + limit], "total": len(history)})
+            return
+
         self._deny(404, "Not found")
 
     def _read_payload(self) -> Optional[Dict[str, Any]]:
@@ -6502,6 +6666,15 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if not self._gate(api=True):
             return
+        if path in ("/api/budget", "/api/chat_budget", "/api/settings"):
+            ref = self.headers.get("Origin") or self.headers.get("Referer") or ""
+            host = self.headers.get("Host") or ""
+            parsed = urllib.parse.urlparse(ref).netloc
+            if not parsed and "://" not in ref:
+                parsed = urllib.parse.urlparse("//" + ref).netloc
+            if not ref or not parsed or (host and parsed != host):
+                self._deny(403, "Origin not allowed")
+                return
         payload = self._read_payload()
         if payload is None:
             return
@@ -6733,6 +6906,7 @@ TOOLS = {
             "max_tokens": {"type": "integer", "description": "Stop the worker after this many tokens. Antigravity and OpenCode workers."},
             "max_seconds": {"type": "integer", "description": "Stop the worker after this many seconds. For providers that report no tokens, this is the cap."},
             "route_reason": {"type": "string", "description": "Why this worker got this provider, shown in the HUD."},
+            "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "default": "normal", "description": "Worker priority: urgent, normal, or low."},
             "track": {"type": "string", "default": "main", "description": "Shared context track name."},
             "project_dir": {"type": "string", "description": "Working directory (default: current workspace)."},
             "timeout_seconds": {"type": "integer", "default": DEFAULT_WORKER_TIMEOUT, "description": "Stop the worker after this long. 0 means no limit."},
@@ -6771,6 +6945,7 @@ TOOLS = {
             "project_dir": {"type": "string"}, "mode": {"type": "string", "enum": ["standard", "god"], "default": "standard"},
             "subtasks": {"type": "array", "items": {"type": "string"}, "description": "One non-overlapping part per worker."},
             "max_tokens_each": {"type": "integer", "default": 0}, "permission_mode": {"type": "string", "enum": ["ask", "auto_safe", "auto_approve"]},
+            "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "default": "normal", "description": "Worker priority: urgent, normal, or low."},
         }},
     }),
     "stop_worker": (t_stop_worker, {
@@ -6958,11 +7133,52 @@ def _handle_elicitation_reply(msg: Dict[str, Any]) -> None:
     rid = str(msg.get("id"))[len("elicit-"):]
     _closed.add(rid)
     result = msg.get("result") or {}
-    if result.get("action") == "accept":
-        _answer_permission(rid, str((result.get("content") or {}).get("decision") or "deny"), "chat")
-    elif result.get("action") == "decline":
-        _answer_permission(rid, "deny", "chat")
-    # Cancelled or unsupported: it stays pending, so the HUD or a tool call can still answer it.
+    decision = (result.get("content") or {}).get("decision")
+    if result.get("action") == "accept" and decision in ("allow", "allow_always", "deny"):
+        _answer_permission(rid, str(decision), "chat")
+    # Anything else stays pending. Some clients decline these prompts by themselves, with nobody having seen them.
+
+
+def pending_worker_pings(chat: str) -> List[str]:
+    """Workers launched by chat that finished, failed, or stopped and haven't been reported yet."""
+    lines: List[str] = []
+    if not chat:
+        return lines
+    with _state_lock("worker_pings"):
+        sent = _load_json("worker_pings.json")
+        updated = False
+        for w in _all_workers(include_archive=True):
+            if w.get("launched_by") != chat:
+                continue
+            if w.get("status") in ACTIVE_WORKER_STATES:
+                continue
+            wid = w.get("id")
+            if not wid or wid in sent:
+                continue
+            status = w.get("status") or "completed"
+            role = w.get("role") or "worker"
+            reason = w.get("reason") or w.get("report") or ""
+            reason_str = f": {reason}" if reason else ""
+            prefix = "[URGENT] " if w.get("priority") == "urgent" else ""
+            lines.append(f"{prefix}[WORKER] {wid} ({role}) {status}{reason_str}")
+            sent[wid] = time.time()
+            updated = True
+        if updated:
+            _save_json("worker_pings.json", sent)
+    return lines
+
+
+def _worker_ping_loop() -> None:
+    """Notify clients immediately when a launched worker finishes, fails, or stops."""
+    while True:
+        try:
+            cid = _self_id()
+            if cid:
+                for line in pending_worker_pings(cid):
+                    send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": line}})
+        except Exception:
+            pass
+        time.sleep(1.0)
 
 
 def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -7017,6 +7233,9 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                             "isError": True
                         }}
             text = TOOLS[name][0](**args)
+            pings = pending_worker_pings(_self_id())
+            for ping in pings:
+                text = f"{text}\n\n{ping}"
             waiting = _pending_permissions(station=_self_id())
             if waiting and name != "permission_requests":  # Requests reach the launching chat on its next tool call.
                 text = f"{text}\n\n{permission_text(waiting)}"
@@ -7079,27 +7298,72 @@ def run_hook_guard() -> int:
     return 0
 
 def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Claude Code UserPromptSubmit hook: warn or block when chat budget is reached or close."""
+    """Claude Code UserPromptSubmit hook: warn or block when chat budget is reached or close, and report worker events."""
+    if not os.environ.get("SUBWAY_WORKER"):
+        prompt_text = str(event.get("prompt") or "")
+        for line in prompt_text.splitlines():
+            line_str = line.strip()
+            m = re.match(r"^!?\s*subway-context\s+budget\s+(\S+)\s+(?:<([^>]+)>|(\S+))\s*$", line_str, re.IGNORECASE)
+            if m:
+                scope = m.group(1).lower().strip()
+                raw_tok = (m.group(2) or m.group(3)).strip().replace(",", "")
+                multiplier = 1
+                if raw_tok.lower().endswith("m"):
+                    multiplier = 1_000_000
+                    raw_num = raw_tok[:-1]
+                elif raw_tok.lower().endswith("k"):
+                    multiplier = 1_000
+                    raw_num = raw_tok[:-1]
+                else:
+                    raw_num = raw_tok
+                try:
+                    num = int(float(raw_num) * multiplier)
+                except ValueError:
+                    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext":
+                            f"[BUDGET] Not changed: '{raw_tok}' isn't a number of tokens. Tell the user to try, say, 3.5M."}}
+                set_budget(scope, num)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": f"[BUDGET] Set {scope} to {num} tokens, as you asked."
+                    }
+                }
+
+    sid = str(event.get("session_id") or "")
     cfg = _load_json("config.json")
     limit = cfg.get("chat_budget_tokens")
-    if not limit:
-        return None
-    limit = int(limit)
-    sid = event.get("session_id")
-    used = chat_tokens_used(sid)
-    if used is None:
-        return None
-    if used >= limit:
-        return {
-            "decision": "block",
-            "reason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
-        }
-    notice = budget_ping_notice("chat", used, limit)
-    if notice:
+    used = None
+    if limit:
+        limit = int(limit)
+        used = chat_tokens_used(sid)
+        if used is not None and used >= limit:
+            return {
+                "decision": "block",
+                "reason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+            }
+
+    # After the block check: a blocked prompt can't deliver pings, so they must stay pending.
+    pings = pending_worker_pings(sid) if sid else []
+    if not pings:
+        pings = pending_worker_pings(_self_id())
+    pings_text = "\n\n".join(pings) if pings else ""
+
+    if limit:
+        notice = budget_ping_notice("chat", used, limit)
+        if notice:
+            ctx = f"{notice}\n\n{pings_text}".strip() if pings_text else notice
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": ctx
+                }
+            }
+
+    if pings_text:
         return {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": notice
+                "additionalContext": pings_text
             }
         }
     return None
@@ -7257,6 +7521,7 @@ def main() -> None:
     if os.environ.get("SUBWAY_HUD_AUTOSTART") == "1":
         with contextlib.suppress(Exception):
             log(t_start_hud())
+    threading.Thread(target=_worker_ping_loop, daemon=True).start()
     log(f"v{VERSION} ready")
     for line in sys.stdin:
         line = line.strip()

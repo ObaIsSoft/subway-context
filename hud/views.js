@@ -377,9 +377,50 @@ function openDelegate(d) {
 }
 
 function openHistory(d) {
-  const rows = (d.history || []).map((w) => workerRow(w, true));
+  const container = h("div", { class: "rows" });
+  const loadMoreBtn = h("button", { class: "btn", type: "button", style: "margin-top: 8px; width: 100%; display: none;" }, "Load more");
   const archive = h("button", { class: "btn", type: "button", on: { click: async () => { await act("/api/clear_history", {}); dlg.close(); } } }, "Archive finished");
-  const dlg = modal("Worker history", h("div", { class: "rows" }, rows.length ? rows : h("div", { class: "empty" }, "No finished workers.")), archive);
+  const body = h("div", {}, container, loadMoreBtn);
+  const dlg = modal("Worker history", body, archive);
+
+  let offset = 0;
+  const limit = 100;
+  let allEntries = [];
+
+  async function fetchMore() {
+    loadMoreBtn.disabled = true;
+    loadMoreBtn.textContent = "Loading…";
+    try {
+      const res = await api(`/api/history?offset=${offset}&limit=${limit}`);
+      const entries = res.entries || [];
+      const total = res.total != null ? res.total : entries.length;
+      allEntries = allEntries.concat(entries);
+      offset += entries.length;
+
+      while (container.firstChild) container.removeChild(container.firstChild);
+      if (!allEntries.length) {
+        container.appendChild(h("div", { class: "empty" }, "No finished workers."));
+      } else {
+        for (const w of allEntries) {
+          container.appendChild(workerRow(w, true));
+        }
+      }
+
+      if (offset < total && entries.length > 0) {
+        loadMoreBtn.style.display = "";
+        loadMoreBtn.disabled = false;
+        loadMoreBtn.textContent = "Load more";
+      } else {
+        loadMoreBtn.style.display = "none";
+      }
+    } catch (e) {
+      loadMoreBtn.disabled = false;
+      loadMoreBtn.textContent = "Error loading history";
+    }
+  }
+
+  loadMoreBtn.addEventListener("click", fetchMore);
+  fetchMore();
 }
 
 let modelFilter = "All";
@@ -653,7 +694,7 @@ export function workersPage(d) {
           h("h2", { class: "card-title" }, "Active workers"),
           h("div", { class: "card-sub" }, sub)),
         h("div", { class: "btns" },
-          h("button", { class: "btn", type: "button", on: { click: () => openHistory(get("status")) } }, `History (${(d.history || []).length})`),
+          h("button", { class: "btn", type: "button", on: { click: () => openHistory(get("status")) } }, `History (${d.total_history != null ? d.total_history : (d.history || []).length})`),
           h("button", { class: "btn primary", type: "button", on: { click: () => openDelegate(get("status")) } }, "Delegate worker"))),
       h("div", { class: "rows" }, workers.length ? workers.map((w) => workerRow(w, false)) : h("div", { class: "empty" }, "No active workers."))),
   ];
