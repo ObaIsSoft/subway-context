@@ -81,7 +81,7 @@ class DesktopNotificationTests(unittest.TestCase):
                  mock.patch("sys.platform", "darwin"), \
                  mock.patch("shutil.which", return_value="/opt/homebrew/bin/terminal-notifier"), \
                  mock.patch("subprocess.run", side_effect=OSError("not executable")), \
-                 mock.patch.object(server.os.path, "expanduser", return_value=log_path):
+                 mock.patch.object(server, "SUBWAY_DIR", directory):
                 mechanism, error = server._send_desktop_notification("Test", "Message")
             self.assertEqual(mechanism, "terminal-notifier")
             self.assertIn("not executable", error)

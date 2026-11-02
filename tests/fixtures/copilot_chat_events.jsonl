@@ -1,0 +1,9 @@
+{"type":"session.start","timestamp":"2026-10-01T10:00:00Z","data":{"sessionId":"copilot-cli-sample","selectedModel":"gpt-synthetic","context":{"cwd":"/workspace/copilot-demo"}}}
+{"type":"user.message","timestamp":"2026-10-01T10:01:00Z","data":{"content":"Review the synthetic parser fixture.","messageId":"user-1"}}
+{"type":"assistant.message","timestamp":"2026-10-01T10:02:00Z","data":{"model":"gpt-synthetic","content":"DECISION: Keep the transcript adapter read-only.","reasoningText":"The existing source registry already handles resolution.","toolRequests":[]}}
+{"type":"tool.execution_start","timestamp":"2026-10-01T10:02:30Z","data":{"toolName":"read_file","toolTitle":"Read file","arguments":{"path":"fixture.py"}}}
+{"type":"session.compaction_complete","timestamp":"2026-10-01T10:03:00Z","data":{"summary":"Synthetic segment boundary."}}
+{"type":"user.message","timestamp":"2026-10-01T10:04:00Z","data":{"content":"Continue after the synthetic boundary.","messageId":"user-2"}}
+{"type":"assistant.message","timestamp":"2026-10-01T10:05:00Z","data":{"model":"gpt-synthetic","content":"The second synthetic segment is readable."}}
+{"type":"session.usage_checkpoint","timestamp":"2026-10-01T10:05:30Z","data":{"totalPremiumRequests":2,"accountingSnapshot":{"currentModel":"gpt-synthetic","tokenDetails":{"input":{"tokenCount":45},"output":{"tokenCount":9},"cache_read":{"tokenCount":3}}}}}
+{"type":"result","timestamp":"2026-10-01T10:06:00Z","sessionId":"copilot-cli-sample","exitCode":0,"result":"CLI result event remains readable."}

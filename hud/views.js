@@ -1001,6 +1001,35 @@ export function leasesPage(d) {
     h("div", { class: "rows" }, rows.length ? rows : h("div", { class: "empty" }, "No leases or sign-offs.")));
 }
 
+/* Copilot and other provider chat sessions, loaded from the read-only threads API. */
+export const threads = { chats: [], loadedAt: 0, loading: false, error: "" };
+
+export function threadsPage(chats, onRefresh, error = "") {
+  const rows = (chats || []).map((chat) => {
+    const updated = chat.updated
+      ? new Date(typeof chat.updated === "number" ? chat.updated * 1000 : chat.updated).toLocaleString()
+      : "";
+    const labels = [
+      chat.worker ? "Subway worker" : "",
+      ...(chat.aliases || []).map((alias) => `@${alias}`),
+      chat.model || "",
+      chat.tokens != null ? `${tokens(chat.tokens)} tokens` : "",
+    ].filter(Boolean);
+    return h("div", { class: "row" },
+      h("div", {},
+        h("b", {}, chat.title || "(untitled)"),
+        h("div", { class: "row-sub" }, `${chat.source || ""} · ${chat.project || "No workspace"}${updated ? ` · ${updated}` : ""}`)),
+      labels.length ? h("div", { class: "tags" }, labels.map((label) => h("span", { class: "tag" }, label))) : null);
+  });
+  return h("section", { class: "card" },
+    h("div", { class: "card-head" },
+      h("div", {}, h("h2", { class: "card-title" }, "Chat threads"),
+        h("div", { class: "card-sub" }, "Readable history is available on demand with read_chat; worker sessions are hidden by default.")),
+      h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
+    error ? h("div", { class: "err" }, `Could not refresh chat threads: ${error}`) : null,
+    h("div", { class: "rows" }, rows.length ? rows : h("div", { class: "empty" }, "No chat threads found.")));
+}
+
 /* Ledger */
 export const ledger = { track: "main", entries: [] };
 
