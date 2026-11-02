@@ -1626,6 +1626,16 @@ class TestHudCache(unittest.TestCase):
 
 
 class TestLedgerIdentity(SubwayTestCase):
+    def setUp(self):
+        super().setUp()
+        with server._hud_cache_lock:
+            server._hud_cache.clear()
+
+    def tearDown(self):
+        with server._hud_cache_lock:
+            server._hud_cache.clear()
+        super().tearDown()
+
     def test_chat_a_posting_as_chat_b_is_refused(self):
         server._self_id = lambda: "chat-A"
         # broadcast_track refused
@@ -1711,7 +1721,8 @@ class TestLedgerIdentity(SubwayTestCase):
             self.assertIn("mystery-chat", read_res)
 
             # Check HUD text
-            hud_res = server.t_hud_status()
+            with mock.patch.object(server, "load_quotas", return_value={"providers": [], "sources": {}}):
+                hud_res = server.t_hud_status()
             self.assertIn("[unverified]", hud_res)
 
             # Check raw record in tracks/
