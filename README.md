@@ -204,7 +204,7 @@ Subway Context exposes 29 MCP tools divided across functional roles:
 - **`list_locks()`**: Surface active file leases, expiry countdowns, and sign-offs across all agents.
 
 ### 3. Worker Delegation & Supervision
-- **`spin_worker(role, prompt, provider, model, track, project_dir, timeout_seconds, effort, mode, permission_mode, capabilities, budget_session_pct, budget_weekly_pct, max_budget_usd, thread)`**: Queue an autonomous background worker. **Workers always require user approval before starting.**
+- **`spin_worker(role, prompt, provider, model, track, project_dir, timeout_seconds, effort, mode, permission_mode, capabilities, budget_session_pct, budget_weekly_pct, max_budget_usd, thread, then, review)`**: Queue an autonomous background worker. **Workers always require user approval before starting.**
 - **`approve_worker(worker_id, approval_code)`**: Launch a pending worker using the user-provided approval code.
 - **`reject_worker(worker_id, reason)`**: Reject a pending worker or cancel a running worker.
 - **`stop_worker(worker_id, reason)`**: Terminate a running worker's process.
@@ -212,6 +212,34 @@ Subway Context exposes 29 MCP tools divided across functional roles:
 - **`collect_reports(track, wait)`**: Collect completion summaries and log tails from workers on a track.
 - **`estimate_complexity(prompt, role)`**: Advisory evaluation recommending model tier, effort, and provider.
 - **`escalate_worker(worker_id, new_effort, new_mode, reason, successor_provider)`**: Replace a struggling worker with a higher-tier successor (queued for user approval).
+- **`on_worker_done(worker_id, then)`**: Attach follow-up steps to a worker that is running or queued, or fire them now if it has finished.
+
+#### Worker triggers
+
+A worker can start the next one when it finishes. The steps live in the worker's own record, so a chain keeps going even when no orchestrator is watching. `then` is a JSON list of steps: `role`, `prompt`, `provider`, `model`, `when` (`completed`, `failed`, `always`, `approved`, `rejected`), `include` (`patch`, `report`, `both`, `none`), `other_provider`, `max_tokens`, `verdict`, and `then` for the next link.
+
+Ask a different provider to review the patch automatically:
+
+```python
+spin_worker(role="Builder", prompt="Fix the parser", review="auto")
+```
+
+Chain build -> review -> docs, where docs runs only if the review approves:
+
+```python
+spin_worker(
+    role="Builder",
+    prompt="Build the feature",
+    then=json.dumps([{
+        "role": "Reviewer",
+        "prompt": "Review the patch.",
+        "when": "completed",
+        "verdict": True,
+        "other_provider": True,
+        "then": [{"role": "Docs", "prompt": "Update the README.", "when": "approved", "include": "both"}],
+    }]),
+)
+```
 
 ### 4. Permissions & Oversight
 - **`permission_requests(worker_id)`**: List worker permission requests waiting on user decision.

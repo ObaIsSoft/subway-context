@@ -4123,6 +4123,82 @@ def _extract_code_item(item: str, cwd: str) -> Optional[Tuple[str, int, int, str
         return None
 
 
+_TRIGGER_STEP_FIELDS = {"role", "prompt", "provider", "model", "when", "include", "other_provider", "max_tokens", "verdict", "then"}
+_TRIGGER_WHEN = ("completed", "failed", "always", "approved", "rejected")
+_TRIGGER_INCLUDE = ("patch", "report", "both", "none")
+_REVIEW_PROMPT = ("Read-only review. Do not edit any file and use no tools. Reply with the first line APPROVE or REJECT: <reason>, "
+                  "then at most 4 lines. Approve only if the patch does the task, nothing else, and would not break existing behaviour.")
+
+
+def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
+    """Parse and validate worker follow-up steps. Bad input is refused before anything is queued."""
+    if raw in (None, "", []):
+        return []
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError(f"{label} must be valid JSON.")
+    else:
+        data = raw
+    if not isinstance(data, list):
+        raise ValueError(f"{label} must be a JSON list of steps.")
+    out = []
+    for i, step in enumerate(data):
+        if not isinstance(step, dict):
+            raise ValueError(f"{label}[{i}] must be an object.")
+        unknown = sorted(set(step) - _TRIGGER_STEP_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown field(s) in {label}[{i}]: {', '.join(unknown)}.")
+        role = str(step.get("role") or "").strip()
+        prompt = str(step.get("prompt") or "").strip()
+        if not role or not prompt:
+            raise ValueError(f"{label}[{i}] needs both role and prompt.")
+        when = str(step.get("when") or "completed").lower()
+        if when not in _TRIGGER_WHEN:
+            raise ValueError(f"{label}[{i}] has unknown when '{when}'. Use {', '.join(_TRIGGER_WHEN)}.")
+        include = str(step.get("include") or "patch").lower()
+        if include not in _TRIGGER_INCLUDE:
+            raise ValueError(f"{label}[{i}] has unknown include '{include}'. Use {', '.join(_TRIGGER_INCLUDE)}.")
+        other_provider = step.get("other_provider", False)
+        verdict = step.get("verdict", False)
+        if not isinstance(other_provider, bool) or not isinstance(verdict, bool):
+            raise ValueError(f"{label}[{i}] other_provider and verdict must be true or false.")
+        max_tokens = step.get("max_tokens")
+        if max_tokens is not None:
+            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0:
+                raise ValueError(f"{label}[{i}] max_tokens must be a non-negative integer.")
+        out.append({
+            "role": role,
+            "prompt": prompt,
+            "provider": str(step.get("provider") or "auto").lower(),
+            "model": str(step.get("model") or ""),
+            "when": when,
+            "include": include,
+            "other_provider": other_provider,
+            "max_tokens": int(max_tokens or 0),
+            "verdict": verdict,
+            "then": _parse_trigger_steps(step.get("then"), f"{label}[{i}].then"),
+        })
+    return out
+
+
+def _review_trigger_step(review: str) -> Optional[Dict[str, Any]]:
+    review = (review or "").strip()
+    if not review:
+        return None
+    provider, model = "auto", ""
+    if review.lower() != "auto":
+        if "/" not in review:
+            raise ValueError("review must be '', 'auto', or 'provider/model'.")
+        provider, model = (part.strip() for part in review.split("/", 1))
+        if not provider or not model:
+            raise ValueError("review must be '', 'auto', or 'provider/model'.")
+    return {"role": "Reviewer", "prompt": _REVIEW_PROMPT, "provider": provider.lower(), "model": model,
+            "when": "completed", "include": "patch", "other_provider": True, "max_tokens": 0,
+            "verdict": True, "then": []}
+
+
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
                   project_dir: str = "", timeout_seconds: int = DEFAULT_WORKER_TIMEOUT, effort: str = "auto",
                   mode: str = "standard", model: str = "", permission_mode: str = "",
@@ -4130,10 +4206,18 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
                   budget_session_pct: Optional[float] = None, budget_weekly_pct: Optional[float] = None,
                   max_budget_usd: Optional[float] = None, thread: str = "", private: bool = False,
                   max_tokens: int = 0, max_seconds: int = 0, swarm_id: str = "", isolate: bool = False, route_reason: str = "",
-                  priority: str = "normal", code: Optional[List[str]] = None) -> str:
+                  priority: str = "normal", code: Optional[List[str]] = None,
+                  then: str = "", review: str = "") -> str:
     """Queue a worker for user approval. Agents can request workers, but only the user can launch them."""
     if not role or not prompt:
         return "Error: role and prompt are required."
+    try:
+        steps = _parse_trigger_steps(then)
+        review_step = _review_trigger_step(review)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if review_step:
+        steps.append(review_step)
     priority = (priority or "normal").lower()
     if priority not in ("urgent", "normal", "low"):
         return f"Error: unknown priority '{priority}'. Must be 'urgent', 'normal', or 'low'."
@@ -4302,6 +4386,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "priority": priority,
         "code_hashes": file_hashes,
         "route": route_reason or (route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}."),
+        "then": steps,
         "usage": {"input": 0, "output": 0, "cache_read": 0},
         "status": "pending_approval",
         "cmd": cmd,
@@ -5251,6 +5336,160 @@ def _pump_agy(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None:
                 write(run["response"])
 
 
+def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
+    """Start a worker's follow-up steps from its own record, so no orchestrator has to be watching."""
+    meta = _load_worker(worker_id)
+    if not meta:
+        return
+    status = str(result.get("status") or meta.get("status") or "")
+    response = str(result.get("response") or meta.get("response") or meta.get("report") or "")
+    verdict, verdict_reason = "none", ""
+    is_reviewer = meta.get("verdict") is True or bool(meta.get("is_reviewer"))
+    if is_reviewer:
+        first = next((line.strip() for line in response.splitlines() if line.strip()), "")
+        match = re.match(r"^(APPROVE|REJECT)\b[:\s\-]*(.*)$", first, re.IGNORECASE)
+        if match:
+            verdict = "approve" if match.group(1).upper() == "APPROVE" else "reject"
+            verdict_reason = match.group(2).strip()
+    reviewer_model = meta.get("model") or meta.get("provider") or "reviewer"
+    with _state_lock("workers"):
+        current = _load_worker(worker_id) or meta
+        steps = list(current.get("then") or [])
+        current["then"] = []
+        if is_reviewer:
+            current["verdict"] = verdict
+            current["verdict_reason"] = verdict_reason
+            current["verdict_model"] = reviewer_model
+        _save_worker(current)
+    meta = current
+    parent_id = meta.get("triggered_by") or ""
+    if is_reviewer and parent_id:
+        with _state_lock("workers"):
+            parent = _load_worker(parent_id)
+            if parent:
+                parent["verdict"] = verdict
+                parent["verdict_reason"] = verdict_reason
+                parent["verdict_model"] = reviewer_model
+                _save_worker(parent)
+    if is_reviewer and verdict != "none":
+        word = "APPROVE" if verdict == "approve" else "REJECT"
+        t_broadcast_track(f"Review of {worker_id} by {reviewer_model}: {word}: {verdict_reason}".rstrip(),
+                          track=meta.get("track", "main"), station_id=worker_id)
+    for step in steps:
+        when = step.get("when") or "completed"
+        if when == "always":
+            pass
+        elif when == "completed":
+            if status != "completed":
+                continue
+        elif when == "failed":
+            if status != "failed":
+                continue
+        elif when == "approved":
+            if verdict != "approve":
+                continue
+        elif when == "rejected":
+            if verdict != "reject":
+                continue
+        else:
+            continue
+        want = step.get("include") or "patch"
+        patch_text = ""
+        if want in ("patch", "both"):
+            patch_file = meta.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
+            with contextlib.suppress(OSError):
+                with open(patch_file, "r", encoding="utf-8", errors="replace") as f:
+                    patch_text = f.read(40000)
+        report_text = str(result.get("reason") or meta.get("report") or "").strip()
+        if want in ("patch", "both") and not patch_text:
+            patch_text = report_text[:40000]
+        pieces = []
+        if want in ("patch", "both") and patch_text:
+            pieces.append(patch_text)
+        if want in ("report", "both") and report_text:
+            pieces.append(report_text[:40000])
+        included = "\n\n".join(piece for piece in pieces if piece)
+        child_prompt = str(step.get("prompt") or "").rstrip()
+        child_prompt += f"\n\nPREVIOUS WORKER {worker_id} ({meta.get('role') or 'worker'}, {status}):\n{included}"
+        provider = str(step.get("provider") or "auto").lower()
+        model = str(step.get("model") or "")
+        if provider == "auto":
+            try:
+                route = route_task(child_prompt, str(step.get("role") or ""))
+            except Exception:
+                route = {}
+            picks = list(route.get("picks") or [])
+            if step.get("other_provider") and meta.get("provider"):
+                picks = [pick for pick in picks if pick.get("provider") != meta.get("provider")] or picks
+            if picks:
+                provider = picks[0].get("provider") or "auto"
+                if not model:
+                    model = picks[0].get("model") or ""
+        step_max_tokens = int(step.get("max_tokens") or 0)
+        if not step_max_tokens:
+            step_max_tokens = 160000 if provider == "claude" else 80000
+        try:
+            res = t_spin_worker(role=str(step["role"]), prompt=child_prompt, provider=provider, model=model,
+                                track=meta.get("track") or "main", project_dir=meta.get("project_dir") or "",
+                                max_tokens=step_max_tokens, isolate=True,
+                                then=json.dumps(step.get("then") or []))
+        except Exception:
+            continue
+        if res.startswith("Error:"):
+            continue
+        child_match = re.search(r"worker_[0-9a-f]{6}", res)
+        if not child_match:
+            continue
+        child_id = child_match.group(0)
+        child = _load_worker(child_id)
+        if child:
+            child["triggered_by"] = worker_id
+            child["verdict"] = bool(step.get("verdict"))
+            child["is_reviewer"] = bool(step.get("verdict"))
+            _save_worker(child)
+        with _state_lock("workers"):
+            parent = _load_worker(worker_id) or meta
+            parent.setdefault("triggered", []).append(child_id)
+            _save_worker(parent)
+        t_broadcast_track(f"{worker_id} finished; started {child_id} ({step.get('role')})",
+                          track=meta.get("track", "main"), station_id=worker_id)
+        with contextlib.suppress(Exception):
+            _launch_worker(child_id)
+
+
+def t_on_worker_done(worker_id: str, then: str = "") -> str:
+    """Attach follow-up steps to a worker already running, or fire them now if it has finished."""
+    meta = _load_worker(worker_id)
+    if not meta:
+        return f"Error: worker `{worker_id}` not found."
+    try:
+        steps = _parse_trigger_steps(then)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if not steps:
+        return "Error: then must contain at least one step."
+    active = ("pending_approval", "approved", "launching", "running", "stopping", "queued")
+    if meta.get("status") in active:
+        with _state_lock("workers"):
+            current = _load_worker(worker_id) or meta
+            current["then"] = list(current.get("then") or []) + steps
+            _save_worker(current)
+        return f"[TRIGGERS ADDED] Worker `{worker_id}` will start {len(steps)} step(s) when it finishes."
+    with _state_lock("workers"):
+        current = _load_worker(worker_id) or meta
+        current["then"] = list(current.get("then") or []) + steps
+        _save_worker(current)
+    result: Dict[str, Any] = {}
+    with contextlib.suppress(OSError, ValueError):
+        with open(_exit_file(worker_id), "r", encoding="utf-8") as f:
+            result = json.load(f)
+    if not result:
+        result = {"status": meta.get("status"), "exit_code": meta.get("exit_code"),
+                  "reason": meta.get("report") or "", "response": meta.get("report") or ""}
+    _run_triggers(worker_id, result)
+    return f"[TRIGGERS FIRED] Worker `{worker_id}` already finished; started its follow-up steps."
+
+
 def supervise_worker(worker_id: str) -> int:
     """Own one worker: enforce its timeout, relay permission requests, and record how it really ended."""
     meta = _load_worker(worker_id)
@@ -5522,8 +5761,12 @@ def supervise_worker(worker_id: str) -> int:
             if os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
                     verify_worker(worker_id)
+    with contextlib.suppress(Exception):
+        result["response"] = str(run.get("response") or "")
     _write_json_atomic(_exit_file(worker_id), result)
     _update_worker_status(_load_worker(worker_id) or meta)
+    with contextlib.suppress(Exception):
+        _run_triggers(worker_id, result)
     with contextlib.suppress(Exception):
         start_approved_workers()  # A slot just opened.
     return 0
@@ -8713,6 +8956,8 @@ TOOLS = {
             "budget_weekly_pct": {"type": "number", "description": "Most of the weekly limit this worker may use, in points. Checked before it starts, and it's stopped when reached."},
             "max_budget_usd": {"type": "number", "description": "Hard USD spend cap. Claude workers only."},
             "thread": {"type": "string", "description": "Continue an existing chat of that agent, by @alias or ID, instead of starting fresh."},
+            "then": {"type": "string", "description": "Optional JSON list of follow-up steps. Each step: role, prompt, provider, model, when, include, other_provider, max_tokens, verdict, then. The next worker starts when this one finishes."},
+            "review": {"type": "string", "description": "Preset follow-up: '' (none), 'auto', or 'provider/model'. Appends a read-only Reviewer step that replies APPROVE or REJECT."},
         }},
     }),
     "spin_batch": (t_spin_batch, {
@@ -8747,6 +8992,13 @@ TOOLS = {
         "inputSchema": {"type": "object", "required": ["worker_id"], "properties": {
             "worker_id": {"type": "string", "description": "Worker ID to stop."},
             "reason": {"type": "string", "description": "Why it's being stopped."},
+        }},
+    }),
+    "on_worker_done": (t_on_worker_done, {
+        "description": "Attach follow-up worker steps to a running or queued worker, or fire them at once if it already finished.",
+        "inputSchema": {"type": "object", "required": ["worker_id"], "properties": {
+            "worker_id": {"type": "string", "description": "Worker ID to attach the steps to."},
+            "then": {"type": "string", "description": "JSON list of follow-up steps, in the same form as spin_worker's then."},
         }},
     }),
     "permission_requests": (t_permission_requests, {

@@ -338,6 +338,12 @@ function workerTags(w) {
     tags.push(h("span", { class: `tag ${vCls}`, title: w.verify.line || "" }, w.verify.status));
   }
   if (w.partial_patch) tags.push(h("span", { class: "tag gold" }, "Partial patch kept"));
+  if (w.verdict === "approve" || w.verdict === "reject") {
+    tags.push(h("span", { class: `tag ${w.verdict === "approve" ? "ok" : "bad"}`, title: w.verdict_reason || "" },
+      `${w.verdict === "approve" ? "Approved" : "Rejected"} by ${w.verdict_model || w.model || "reviewer"}`));
+  }
+  if (w.triggered_by) tags.push(h("span", { class: "tag" }, `Started by ${w.triggered_by}`));
+  if (Array.isArray(w.triggered) && w.triggered.length) tags.push(h("span", { class: "tag" }, `Then: ${w.triggered.join(", ")}`));
   if (w.model && !["default", "inherit"].includes(w.model)) tags.push(h("span", { class: "tag" }, w.model));
   if (w.effort) tags.push(h("span", { class: "tag" }, `effort ${w.effort}`));
   if (w.skip_permissions) tags.push(h("span", { class: "tag bad" }, "Prompts off"));
