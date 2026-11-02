@@ -1306,6 +1306,145 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertTrue(usage["limit_hit"]["recent"])
         self.assertIn("Rate limit exceeded", usage["limit_hit"]["message"])
 
+    def test_opencode_ollama_error_or_retry_is_never_a_limit_hit(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, model TEXT, time_updated INTEGER)")
+            con.execute("CREATE TABLE session_message (type TEXT, time_created INTEGER, data TEXT)")
+            now_ms = int(time.time() * 1000)
+            retry_data = json.dumps({
+                "retry": {"error": {"type": "rate-limit", "message": "slow down"}, "at": now_ms + 1000},
+                "model": {"providerID": "ollama", "id": "llama3"},
+                "tokens": {"input": 5, "output": 5},
+            })
+            error_data = json.dumps({
+                "finish": "error",
+                "error": json.dumps({"status": 429, "message": "Rate limit exceeded"}),
+                "model": {"providerID": "ollama", "id": "llama3"},
+                "tokens": {"input": 5, "output": 5},
+            })
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, retry_data))
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, error_data))
+            con.commit()
+        finally:
+            con.close()
+
+        usage = server._fetch_opencode_usage()
+        self.assertIsNone(usage.get("limit_hit"))
+        self.assertNotIn("ollama/llama3", usage.get("limited") or {})
+
+    def test_opencode_finish_error_attributed_to_its_own_model(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, model TEXT, time_updated INTEGER)")
+            con.execute("CREATE TABLE session_message (type TEXT, time_created INTEGER, data TEXT)")
+            now_ms = int(time.time() * 1000)
+            error_data = json.dumps({
+                "finish": "error",
+                "error": json.dumps({"status": 429, "message": "Rate limit exceeded"}),
+                "model": {"providerID": "anthropic", "id": "claude-3.5-sonnet"},
+                "tokens": {"input": 10, "output": 20},
+            })
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, error_data))
+            con.commit()
+        finally:
+            con.close()
+
+        usage = server._fetch_opencode_usage()
+        key = "anthropic/claude-3.5-sonnet"
+        self.assertIn(key, usage.get("limited") or {})
+        self.assertEqual(usage["limited"][key]["retry_at"], 0)
+        self.assertEqual(usage["limit_hit"]["model"], key)
+
+    def test_opencode_view_never_names_a_model_that_didnt_hit_limit(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, model TEXT, time_updated INTEGER)")
+            con.execute("CREATE TABLE session_message (type TEXT, time_created INTEGER, data TEXT)")
+            now_ms = int(time.time() * 1000)
+            # The last-used model is local: it never hits a free limit, so it must never be named either.
+            con.execute("INSERT INTO session_v2 (id, model, time_updated) VALUES (?, ?, ?)",
+                        ("s1", json.dumps({"providerID": "ollama", "id": "llama3"}), now_ms))
+            error_data = json.dumps({
+                "finish": "error",
+                "error": json.dumps({"status": 429, "message": "Rate limit exceeded"}),
+                "model": {"providerID": "anthropic", "id": "claude-3.5-sonnet"},
+                "tokens": {"input": 10, "output": 20},
+            })
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, error_data))
+            con.commit()
+        finally:
+            con.close()
+
+        view = server._opencode_view({}, True)
+        self.assertIn("anthropic/claude-3.5-sonnet", view["note"])
+        self.assertNotIn("ollama", view["note"])
+        self.assertNotIn("llama3", view["note"])
+
+    def test_darwin_memory_uses_memorystatus_level_when_higher(self):
+        def fake_check_output(cmd, *a, **kw):
+            if cmd == ["sysctl", "-n", "hw.memsize"]:
+                return b"17179869184"
+            if cmd == ["vm_stat"]:
+                return ("Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+                        "Pages free:                              100.\n"
+                        "Pages inactive:                          50.\n"
+                        "Pages speculative:                       10.\n"
+                        "Pages purgeable:                         20.\n")
+            if cmd == ["sysctl", "-n", "kern.memorystatus_level"]:
+                return "80\n"
+            if cmd == ["sysctl", "-n", "vm.swapusage"]:
+                return "total = 2048.00M  used = 512.00M  free = 1536.00M\n"
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        total = 17179869184
+        page_based = (100 + 50 + 10 + 20) * 4096
+        level_based = total * 80 // 100
+        self.assertGreater(level_based, page_based)
+
+        server.memory_snapshot.clear()
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch("server.subprocess.check_output", side_effect=fake_check_output):
+            mem = server.memory_snapshot()
+        self.assertEqual(mem["total"], total)
+        self.assertEqual(mem["available"], level_based)
+        self.assertEqual(mem["swap_used"], int(512.00 * 1024 ** 2))
+
+    def test_darwin_memory_falls_back_to_page_counts_when_level_bad_or_missing(self):
+        vm_stat_out = ("Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+                       "Pages free:                              100.\n"
+                       "Pages inactive:                          50.\n"
+                       "Pages speculative:                       10.\n"
+                       "Pages purgeable:                         20.\n")
+        page_based = (100 + 50 + 10 + 20) * 4096
+
+        for level_behavior in ("command_missing", "non_numeric_output"):
+            def fake_check_output(cmd, *a, _behavior=level_behavior, **kw):
+                if cmd == ["sysctl", "-n", "hw.memsize"]:
+                    return b"17179869184"
+                if cmd == ["vm_stat"]:
+                    return vm_stat_out
+                if cmd == ["sysctl", "-n", "kern.memorystatus_level"]:
+                    if _behavior == "command_missing":
+                        raise FileNotFoundError("sysctl: unknown oid 'kern.memorystatus_level'")
+                    return "not a number\n"
+                if cmd == ["sysctl", "-n", "vm.swapusage"]:
+                    return "total = 2048.00M  used = 0.00M  free = 2048.00M\n"
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            server.memory_snapshot.clear()
+            with mock.patch.object(sys, "platform", "darwin"), \
+                    mock.patch("server.subprocess.check_output", side_effect=fake_check_output):
+                mem = server.memory_snapshot()
+            self.assertEqual(mem["available"], page_based, f"failed for level_behavior={level_behavior}")
+
     def test_private_work_never_reaches_the_cloud(self):
         self.assertEqual(server.route_task("Summarize this confidential contract")["order"], ["local"])
         self.assertEqual(server.route_task("Fix this", private=True)["order"], ["local"])

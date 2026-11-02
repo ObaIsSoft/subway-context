@@ -162,6 +162,15 @@ export function modal(title, body, headExtra) {
   const close = h("button", { class: "btn", type: "button", on: { click: () => dlg.close() } }, "Close");
   dlg.append(h("div", { class: "dialog-head" }, h("div", { class: "card-title wrap" }, title), h("div", { class: "btns" }, headExtra, close)),
     h("div", { class: "dialog-body" }, body));
+  // Close on a click on the backdrop: press and release both outside the dialog box, so a text
+  // selection that ends outside, or a click on the dialog's own padding, keeps it open.
+  const outside = (e) => {
+    const r = dlg.getBoundingClientRect();
+    return e.target === dlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom);
+  };
+  let pressedOutside = false;
+  dlg.addEventListener("pointerdown", (e) => { pressedOutside = outside(e); });
+  dlg.addEventListener("click", (e) => { if (pressedOutside && outside(e)) dlg.close(); pressedOutside = false; });
   dlg.addEventListener("close", () => dlg.remove());
   document.body.append(dlg);
   dlg.showModal();

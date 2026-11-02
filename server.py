@@ -4729,8 +4729,16 @@ PERMISSION_MODES = {
 _MODE_ALIASES = {"standard": "ask", "dangerously_skip": "auto_approve"}
 
 
-def get_permission_mode() -> str:
-    """The user's default for how spun agents get permissions. Oversight unless they chose otherwise."""
+def get_permission_mode(thread_id: str = "") -> str:
+    """The effective mode for a thread (a chat id or worker id): its own override if set, else the
+    universal default. Oversight unless the user chose otherwise."""
+    thread_id = str(thread_id or "").strip()
+    if thread_id:
+        override = _load_json("thread_settings.json").get(thread_id)
+        if isinstance(override, dict):
+            mode = override.get("permission_mode")
+            if mode in PERMISSION_MODES:
+                return mode
     mode = _load_json("config.json").get("permission_mode")
     return mode if mode in PERMISSION_MODES else "ask"
 

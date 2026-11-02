@@ -4,6 +4,11 @@
   "description": "Subway Context HUD integration for VS Code and Antigravity",
   "version": "0.1.0",
   "publisher": "subway",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ObaIsSoft/subway-context.git",
+    "directory": "vscode"
+  },
   "engines": {
     "vscode": "^1.74.0"
   },
