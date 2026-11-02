@@ -88,6 +88,29 @@ class DesktopNotificationTests(unittest.TestCase):
             with open(log_path, "r", encoding="utf-8") as f:
                 self.assertIn("[terminal-notifier]", f.read())
 
+    def test_terminal_notifier_uses_homebrew_path_when_missing_from_path(self):
+        notifier_path = "/opt/homebrew/bin/terminal-notifier"
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("sys.platform", "darwin"), \
+             mock.patch("shutil.which", return_value=None), \
+             mock.patch.object(server.os.path, "isfile", side_effect=lambda path: path == notifier_path), \
+             mock.patch.object(server.os, "access", return_value=True), \
+             mock.patch("subprocess.run") as run:
+            mechanism, error = server._send_desktop_notification("Test", "Message")
+        self.assertEqual((mechanism, error), ("terminal-notifier", None))
+        self.assertEqual(run.call_args.args[0][0], notifier_path)
+
+    def test_terminal_notifier_missing_uses_osascript(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("sys.platform", "darwin"), \
+             mock.patch("shutil.which", return_value=None), \
+             mock.patch.object(server.os.path, "isfile", return_value=False), \
+             mock.patch.object(server.os, "access", return_value=False), \
+             mock.patch("subprocess.run") as run:
+            mechanism, error = server._send_desktop_notification("Test", "Message")
+        self.assertEqual((mechanism, error), ("osascript", None))
+        self.assertEqual(run.call_args.args[0][:2], ["osascript", "-e"])
+
     def test_notify_test_cli_sends_and_reports_mechanism(self):
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with mock.patch.dict(os.environ, {}, clear=True), \
@@ -99,7 +122,7 @@ class DesktopNotificationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         run.assert_called_once()
         self.assertIn("#workers", run.call_args.args[0][-1])
-        self.assertIn("terminal-notifier", output.call_args.args[0])
+        self.assertIn("/opt/homebrew/bin/terminal-notifier", output.call_args.args[0])
 
 
 if __name__ == "__main__":

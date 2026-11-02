@@ -1039,10 +1039,10 @@ class DesktopNotificationTests(unittest.TestCase):
         def fake_run(cmd, *args, **kwargs):
             calls.append(cmd)
             res = mock.MagicMock()
-            if cmd == ["notify-send", "--help"]:
+            if cmd[0] == "/usr/bin/notify-send" and cmd[1:] == ["--help"]:
                 res.stdout = "Usage: notify-send [OPTION...] ... --action=... -w, --wait"
                 res.stderr = ""
-            elif len(cmd) > 1 and cmd[0] == "notify-send" and "--action=open=Open" in cmd:
+            elif len(cmd) > 1 and cmd[0] == "/usr/bin/notify-send" and "--action=open=Open" in cmd:
                 res.stdout = "open\n"
                 res.stderr = ""
             else:
@@ -1062,8 +1062,8 @@ class DesktopNotificationTests(unittest.TestCase):
              patch("threading.Thread", side_effect=fake_thread):
             server._send_desktop_notification("Job Done", "All tasks finished")
 
-        self.assertIn(["notify-send", "--help"], calls)
-        self.assertIn(["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", "Job Done", "All tasks finished"], calls)
+        self.assertIn(["/usr/bin/notify-send", "--help"], calls)
+        self.assertIn(["/usr/bin/notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", "Job Done", "All tasks finished"], calls)
         self.assertIn(["xdg-open", "http://127.0.0.1:7890/#workers"], calls)
 
     def test_linux_notify_without_action(self):
@@ -1082,8 +1082,8 @@ class DesktopNotificationTests(unittest.TestCase):
              patch("subprocess.run", side_effect=fake_run):
             server._send_desktop_notification("Job Done", "All tasks finished")
 
-        self.assertIn(["notify-send", "--help"], calls)
-        self.assertIn(["notify-send", "Job Done", "All tasks finished"], calls)
+        self.assertIn(["/usr/bin/notify-send", "--help"], calls)
+        self.assertIn(["/usr/bin/notify-send", "Job Done", "All tasks finished"], calls)
         self.assertNotIn(["xdg-open", "http://127.0.0.1:7890/#workers"], calls)
 
     def test_linux_notify_missing(self):
@@ -1132,6 +1132,7 @@ class DesktopNotificationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), \
              patch("sys.platform", "darwin"), \
              patch("shutil.which", return_value=None), \
+             patch.object(server.os.path, "isfile", return_value=False), \
              patch("subprocess.run") as mock_run:
             server._send_desktop_notification('Alert "1"', 'Msg with "quotes"')
             mock_run.assert_called_once()

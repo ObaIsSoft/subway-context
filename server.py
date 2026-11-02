@@ -5522,6 +5522,16 @@ def _run_notification_command(mechanism: str, command: List[str], timeout: Optio
     return None
 
 
+def _find_executable(name: str, fallback_paths: Tuple[str, ...] = ()) -> Optional[str]:
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    for path in fallback_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _send_desktop_notification(title: str, message: str, route: str = "workers") -> Tuple[str, Optional[str]]:
     """Send a desktop notification and report the mechanism and any non-fatal error."""
     if os.environ.get("SUBWAY_NO_NOTIFY"):  # Tests and sandboxes must never reach the real desktop.
@@ -5529,7 +5539,10 @@ def _send_desktop_notification(title: str, message: str, route: str = "workers")
     route = route if route in ("overview", "usage", "workers") else "workers"
     url = f"http://127.0.0.1:{_hud_port()}/#{route}"
     if sys.platform == "darwin":
-        notifier = shutil.which("terminal-notifier")
+        notifier = _find_executable(
+            "terminal-notifier",
+            ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"),
+        )
         if notifier:
             error = _run_notification_command(
                 "terminal-notifier",
@@ -5543,12 +5556,13 @@ def _send_desktop_notification(title: str, message: str, route: str = "workers")
         error = _run_notification_command("osascript", ["osascript", "-e", script], timeout=2)
         return "osascript", error
     if sys.platform.startswith("linux"):
-        if not shutil.which("notify-send"):
+        notifier = _find_executable("notify-send", ("/usr/bin/notify-send",))
+        if not notifier:
             error = "notify-send was not found"
             _log_notification_failure("notify-send", error)
             return "notify-send", error
         try:
-            proc = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=2)
+            proc = subprocess.run([notifier, "--help"], capture_output=True, text=True, timeout=2)
             has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
         except Exception as exc:
             _log_notification_failure("notify-send capability check", exc)
@@ -5557,7 +5571,7 @@ def _send_desktop_notification(title: str, message: str, route: str = "workers")
             def _linux_wait() -> None:
                 try:
                     res = subprocess.run(
-                        ["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
+                        [notifier, "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
                         capture_output=True, text=True,
                     )
                     return_code = getattr(res, "returncode", 0)
@@ -5570,7 +5584,7 @@ def _send_desktop_notification(title: str, message: str, route: str = "workers")
 
             threading.Thread(target=_linux_wait, daemon=True).start()
             return "notify-send", None
-        error = _run_notification_command("notify-send", ["notify-send", title, message], timeout=2)
+        error = _run_notification_command("notify-send", [notifier, title, message], timeout=2)
         return "notify-send", error
     if sys.platform.startswith("win"):
         xml_url = _escape_xml(url)
@@ -10747,7 +10761,18 @@ def run_cli(argv: List[str]) -> int:
         if error:
             print(f"Notification test failed using {mechanism}: {error}")
             return 1
-        print(f"Test notification sent using {mechanism}.")
+        if mechanism == "terminal-notifier":
+            path = _find_executable(
+                "terminal-notifier",
+                ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"),
+            )
+        elif mechanism == "notify-send":
+            path = _find_executable("notify-send", ("/usr/bin/notify-send",))
+        elif mechanism == "osascript":
+            path = _find_executable("osascript")
+        else:
+            path = None
+        print(f"Test notification sent using {mechanism} ({path or mechanism}).")
         return 0
     if arg in ("hud-autostart", "--hud-autostart"):
         if not rest or rest[0].lower() not in ("on", "off"):
