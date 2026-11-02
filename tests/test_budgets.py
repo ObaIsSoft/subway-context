@@ -179,12 +179,17 @@ class TestPerChatBudgets(unittest.TestCase):
         with patch.object(server, "_load_json", side_effect=lambda fn: {"chat_budget_default": 100} if fn == "config.json" else {}), \
              patch.object(server, "chat_tokens_used", return_value=150):
             res = server.hook_prompt({"session_id": "any-chat"})
-            self.assertIn("universal chat budget is reached", res.get("reason", "").lower())
+            reason = res.get("reason", "")
+            self.assertIn("universal chat budget is reached", reason.lower())
+            self.assertIn("subway-context budget chat <tokens>", reason)
+            self.assertNotIn("--chat", reason)
 
         with patch.object(server, "_load_json", side_effect=lambda fn: {"chat_budgets": {"sid1": 100}} if fn == "config.json" else {}), \
              patch.object(server, "chat_tokens_used", return_value=150):
             res2 = server.hook_prompt({"session_id": "sid1"})
-            self.assertIn("this chat's budget is reached", res2.get("reason", "").lower())
+            reason2 = res2.get("reason", "")
+            self.assertIn("this chat's budget is reached", reason2.lower())
+            self.assertIn("subway-context budget chat <tokens> --chat sid1", reason2)
 
 
 class TestHookPrompt(unittest.TestCase):
@@ -359,7 +364,29 @@ class TestHandleToolsCallBudget(unittest.TestCase):
             self.assertIsNotNone(resp)
             self.assertTrue(resp.get("result", {}).get("isError"))
             content = resp.get("result", {}).get("content", [])
-            self.assertTrue(any("budget is reached" in c.get("text", "").lower() for c in content))
+            texts = [c.get("text", "") for c in content]
+            self.assertTrue(any("budget is reached" in t.lower() for t in texts))
+            self.assertTrue(any("subway-context budget chat <tokens>" in t and "--chat" not in t for t in texts))
+
+    def test_blocked_tools_show_own_chat_flag(self):
+        cfg = {"chat_budgets": {"sidX": 1000}}
+        req = {
+            "jsonrpc": "2.0",
+            "id": "call-2",
+            "method": "tools/call",
+            "params": {
+                "name": "list_chats",
+                "arguments": {}
+            }
+        }
+        with patch.object(server, "_load_json", return_value=cfg), \
+             patch.object(server, "_self_id", return_value="sidX"), \
+             patch.object(server, "chat_tokens_used", return_value=1000), \
+             patch.object(server, "enforce_budgets"):
+            resp = server.handle(req)
+            content = resp.get("result", {}).get("content", [])
+            texts = [c.get("text", "") for c in content]
+            self.assertTrue(any("subway-context budget chat <tokens> --chat sidX" in t for t in texts))
 
     def test_exempt_tools_allowed_when_budget_reached(self):
         cfg = {"chat_budget_tokens": 1000}

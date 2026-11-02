@@ -4005,7 +4005,8 @@ def budget_rows() -> List[Dict[str, Any]]:
     return rows + extra
 
 
-def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] = None) -> str:
+def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] = None,
+                        chat_id: Optional[str] = None) -> str:
     if not limit or limit <= 0:
         return ""
     pct = (used / limit) * 100
@@ -4021,8 +4022,9 @@ def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] =
         sent[key] = now
         _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
     label = label or scope
+    cmd = f"subway-context budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
     return (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
-            f"Add more with: subway-context budget {scope} <tokens>, or in the HUD.")
+            f"Add more with: {cmd}, or in the HUD.")
 
 def enforce_budgets() -> None:
     try:
@@ -9377,7 +9379,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 if used is not None and used >= limit:
                     if name not in ("hud_status", "quota_status", "check_notes", "answer_permission"):
                         c_label = "This chat's budget" if c_scope == "chat" else "The universal chat budget"
-                        block_msg = f"{c_label} is reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+                        c_cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if c_scope == "chat" else "")
+                        block_msg = f"{c_label} is reached: {used:,} of {limit:,} tokens. Add more with: {c_cmd}, or in the HUD."
                         return {"jsonrpc": "2.0", "id": rid, "result": {
                             "content": [{"type": "text", "text": block_msg}],
                             "isError": True
@@ -9393,7 +9396,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 if limit:
                     used = chat_tokens_used(sid)
                     if used is not None:
-                        c_ping = budget_ping_notice("chat", used, limit, label=("this chat's" if c_scope == "chat" else "the universal chat"))
+                        c_ping = budget_ping_notice("chat", used, limit, label=("this chat's" if c_scope == "chat" else "the universal chat"),
+                                                     chat_id=sid if c_scope == "chat" else None)
                         if c_ping:
                             text = f"{text}\n\n{c_ping}"
                 budgets = cfg.get("budgets") or {}
@@ -9500,11 +9504,12 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         used = chat_tokens_used(sid)
         if used is not None and used >= limit:
             label = "This chat's budget" if scope == "chat" else "The universal chat budget"
+            cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" else "")
             notify_desktop_event(f"chat_budget_blocked|{sid}|{limit}", "Subway Context",
-                                 f"{label} is reached: {used:,} of {limit:,} tokens.")
+                                 f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD.")
             return {
                 "decision": "block",
-                "reason": f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+                "reason": f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD."
             }
 
     # After the block check: a blocked prompt can't deliver pings, so they must stay pending.
@@ -9515,7 +9520,8 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     notices = []
     if limit:
-        notice = budget_ping_notice("chat", used, limit, label=("this chat's" if scope == "chat" else "the universal chat"))
+        notice = budget_ping_notice("chat", used, limit, label=("this chat's" if scope == "chat" else "the universal chat"),
+                                     chat_id=sid if scope == "chat" else None)
         if notice:
             notices.append(notice)
 
