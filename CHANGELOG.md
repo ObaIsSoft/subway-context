@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.1 - 2026-11-02
+## 1.3.0 - 2026-11-02
 
 > [!IMPORTANT]
 > Fixes an unauthenticated budget route in 1.2.0. Users on 1.2.0 should upgrade immediately.
@@ -16,6 +16,21 @@
 - **Model sign-in**: Models that fail sign-in are skipped for 24 hours.
 - **HUD**: Budget rows with real usage, reset card cycles through providers, spend chart coloured per provider, worker history pages with Load more.
 - **Worktrees**: Removed after each worker. Windows is written but untested.
+- Fail-closed patch verifier.
+- Routing by each model's real results.
+- Models out of quota skipped.
+- Exact code briefs for workers.
+- Leases claimed on first edit.
+- Compaction warnings and readable history by segment.
+- Desktop alerts only for what is still waiting, click to open the HUD.
+- The HUD starts with Subway and opens in the editor on first use.
+- A Subway: Open HUD editor command.
+- Auto-approve never asks.
+- OpenCode workers continue when they stop early.
+- Copilot usage gauges.
+- Help page.
+- Recommended companion tools in the README.
+- Known gaps: Windows untested; no Kimi or OpenCode Go gauges; free OpenCode models unreliable for edits; a call already running can pass a token cap.
 
 ## 1.2.0 - 2026-11-02
 

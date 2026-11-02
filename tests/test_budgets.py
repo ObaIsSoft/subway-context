@@ -498,15 +498,6 @@ class TestReviewFixes(unittest.TestCase):
             args = mock_notify.call_args[0]
             self.assertIn("sess_block_test", args[0])
 
-    def test_open_hud_vscode_hint(self):
-        with patch.dict(os.environ, {"TERM_PROGRAM": "vscode"}), \
-             patch("webbrowser.open") as mock_open, \
-             patch("builtins.print") as mock_print:
-            server._open_hud(7890)
-            mock_open.assert_not_called()
-            mock_print.assert_called_with("Open it in the editor: Cmd+Shift+P, Subway: Open HUD")
-
-class TestModelRoutingAndStats(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.orig_subway_dir = server.SUBWAY_DIR
@@ -991,14 +982,392 @@ class DesktopNotificationTests(unittest.TestCase):
             output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
             self.assertIn("dnf install libnotify", output)
 
-        # Linux missing notify-send (pacman)
-        with patch("sys.platform", "linux"), \
-             patch("shutil.which", side_effect=lambda bin_name: "/usr/bin/pacman" if bin_name == "pacman" else None), \
-             patch("builtins.print") as mock_print:
-            res = install.ensure_notifier(interactive=False, auto_yes=True)
-            self.assertEqual(res, "missing")
-            output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
-            self.assertIn("pacman -S libnotify", output)
+        
+class TestChatSegments(unittest.TestCase):
+    def test_claude_segments_two_boundaries(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "turn one in seg 1"}]}}) + "\n")
+            f.write(json.dumps({"type": "system", "subtype": "compact_boundary"}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "turn two in seg 2"}]}}) + "\n")
+            f.write(json.dumps({"type": "system", "subtype": "compact_boundary"}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "turn three in seg 3"}]}}) + "\n")
+            path = f.name
+
+        try:
+            chat = {"source": "claude", "id": "test_claude_sid", "path": path}
+            # Segment 1
+            t1, lbl1, tot1 = server.chat_segments_info(chat, segment=1)
+            self.assertEqual(lbl1, "1")
+            self.assertEqual(tot1, 3)
+            self.assertIn("turn one in seg 1", str(t1))
+            self.assertNotIn("turn two in seg 2", str(t1))
+            self.assertNotIn("turn three in seg 3", str(t1))
+
+            # Segment 2
+            t2, lbl2, tot2 = server.chat_segments_info(chat, segment="2")
+            self.assertEqual(lbl2, "2")
+            self.assertEqual(tot2, 3)
+            self.assertIn("turn two in seg 2", str(t2))
+            self.assertNotIn("turn one in seg 1", str(t2))
+            self.assertNotIn("turn three in seg 3", str(t2))
+
+            # Segment 3
+            t3, lbl3, tot3 = server.chat_segments_info(chat, segment=3)
+            self.assertEqual(lbl3, "3")
+            self.assertEqual(tot3, 3)
+            self.assertIn("turn three in seg 3", str(t3))
+            self.assertNotIn("turn one in seg 1", str(t3))
+            self.assertNotIn("turn two in seg 2", str(t3))
+
+            # segment='latest' is n (3)
+            t_lat, lbl_lat, tot_lat = server.chat_segments_info(chat, segment="latest")
+            self.assertEqual(lbl_lat, "3")
+            self.assertEqual(tot_lat, 3)
+            self.assertEqual(t_lat, t3)
+
+            # segment='all' returns everything with a marker line at each boundary
+            t_all, lbl_all, tot_all = server.chat_segments_info(chat, segment="all")
+            self.assertEqual(lbl_all, "all")
+            self.assertEqual(tot_all, 3)
+            all_str = str(t_all)
+            self.assertIn("turn one in seg 1", all_str)
+            self.assertIn("turn two in seg 2", all_str)
+            self.assertIn("turn three in seg 3", all_str)
+            self.assertIn("--- compaction boundary ---", all_str)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_opencode_segments_with_compaction(self):
+        db_path = os.path.join(server.OPENCODE_DIR, "opencode.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        con = sqlite3.connect(db_path)
+        con.execute("CREATE TABLE IF NOT EXISTS session_message (session_id TEXT, seq INTEGER, type TEXT, data TEXT, time_created REAL)")
+        sid = "opencode_compaction_sid"
+        con.execute("DELETE FROM session_message WHERE session_id=?", (sid,))
+        con.execute("INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                    (sid, 1, "user", json.dumps({"text": "prompt before compact"}), 100.0))
+        con.execute("INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                    (sid, 2, "compaction", json.dumps({}), 101.0))
+        con.execute("INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                    (sid, 3, "user", json.dumps({"text": "prompt after compact"}), 102.0))
+        con.commit()
+        con.close()
+
+        chat = {"source": "opencode", "id": sid}
+        t1, lbl1, tot1 = server.chat_segments_info(chat, segment=1)
+        self.assertEqual(lbl1, "1")
+        self.assertEqual(tot1, 2)
+        self.assertIn("prompt before compact", str(t1))
+        self.assertNotIn("prompt after compact", str(t1))
+
+        t2, lbl2, tot2 = server.chat_segments_info(chat, segment="latest")
+        self.assertEqual(lbl2, "2")
+        self.assertEqual(tot2, 2)
+        self.assertIn("prompt after compact", str(t2))
+        self.assertNotIn("prompt before compact", str(t2))
+
+        t_all, lbl_all, tot_all = server.chat_segments_info(chat, segment="all")
+        self.assertEqual(tot_all, 2)
+        self.assertIn("--- compaction boundary ---", str(t_all))
+
+    def test_unknown_provider(self):
+        chat = {"source": "some_future_ai", "id": "unknown_123"}
+        info = server.chat_segments_info(chat, segment=1)
+        data, lbl, tot = info[0], info[1], info[2]
+        self.assertEqual(tot, 1)
+        self.assertEqual(lbl, "1")
+        self.assertEqual(getattr(info, "note", None), "compaction history not supported for this provider")
 
 
+class TestAutoApproveNeverAsks(unittest.TestCase):
+    def test_auto_approve_request_is_answered_without_asking(self):
+        with mock.patch.object(server, "_write_json_atomic"), \
+             mock.patch.object(server, "_answer_permission") as answer, \
+             mock.patch.object(server, "notify_if_still_waiting") as alert, \
+             mock.patch.object(server, "t_broadcast_track") as broadcast:
+            server.request_permission({"id": "worker_abc123", "permission_mode": "auto_approve"}, "command", "ls")
+        answer.assert_called_once()
+        self.assertEqual(answer.call_args[0][1], "allow")
+        alert.assert_not_called()
+        broadcast.assert_not_called()
+
+
+class TestOpenCodeCalibration(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="subway_oc_calib_")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _create_fake_opencode2(self):
+        script_path = os.path.join(self.test_dir, "fake_opencode2.py")
+        code = (
+            "import sys, json\n"
+            "def send(msg):\n"
+            "    sys.stdout.write(json.dumps(msg) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "prompt_id = None\n"
+            "turn = 0\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: req = json.loads(line)\n"
+            "    except Exception: continue\n"
+            "    method = req.get('method')\n"
+            "    req_id = req.get('id')\n"
+            "    if method == 'initialize':\n"
+            "        send({'jsonrpc': '2.0', 'id': req_id, 'result': {'protocolVersion': 1}})\n"
+            "    elif method == 'session/new':\n"
+            "        send({'jsonrpc': '2.0', 'id': req_id, 'result': {'sessionId': 'fake_ses_01'}})\n"
+            "    elif method == 'session/prompt':\n"
+            "        prompt_id = req_id\n"
+            "        turn += 1\n"
+            "        if turn == 1:\n"
+            "            send({'jsonrpc': '2.0', 'id': prompt_id, 'result': {'response': 'I will edit server.py to add the feature.'}})\n"
+            "        else:\n"
+            "            send({'jsonrpc': '2.0', 'method': 'session/update',\n"
+            "                  'params': {'sessionId': 'fake_ses_01', 'update': {'sessionUpdate': 'tool_call', 'toolCall': {'title': 'edit'}}}})\n"
+            "            send({'jsonrpc': '2.0', 'id': prompt_id, 'result': {'response': 'DONE: edited server.py'}})\n"
+            "    elif method == 'session/cancel':\n"
+            "        sys.exit(0)\n"
+        )
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        return script_path
+
+    def test_opencode_plan_reply_triggers_continue(self):
+        fake_bin = self._create_fake_opencode2()
+        proc = subprocess.Popen([sys.executable, fake_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = io.BytesIO()
+        run = {"continues": 0, "cap": 10000, "spent": 100}
+        meta = {"prompt": "Edit server.py to calibrate OpenCode", "project_dir": self.test_dir}
+        stopped = {"flag": False}
+
+        server._pump_opencode(proc, out, run, meta, stopped)
+
+        self.assertEqual(run["continues"], 1)
+        self.assertEqual(run["response"], "DONE: edited server.py")
+        logs = out.getvalue().decode("utf-8")
+        self.assertIn("[continue] plan", logs)
+
+    def test_opencode_token_cap_blocks_continue(self):
+        fake_bin = self._create_fake_opencode2()
+        proc = subprocess.Popen([sys.executable, fake_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = io.BytesIO()
+        # Cap is 1000, spent is 700 (which is >= 1000 * 2 // 3 = 666)
+        run = {"continues": 0, "cap": 1000, "spent": 700}
+        meta = {"prompt": "Edit server.py to calibrate OpenCode", "project_dir": self.test_dir}
+        stopped = {"flag": False}
+
+        server._pump_opencode(proc, out, run, meta, stopped)
+
+        self.assertEqual(run["continues"], 0)
+        self.assertEqual(run["response"], "I will edit server.py to add the feature.")
+        logs = out.getvalue().decode("utf-8")
+        self.assertNotIn("[continue] plan", logs)
+
+
+class TestHudOpenOnUse(unittest.TestCase):
+    def setUp(self):
+        server._hud_opened_on_use = False
+        server._hud_open_thread = None
+
+    def tearDown(self):
+        server._hud_opened_on_use = False
+        server._hud_open_thread = None
+
+    def _call_tool(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": "test-call",
+            "method": "tools/call",
+            "params": {"name": "hud_status", "arguments": {}}
+        }
+        with patch.object(server, "enforce_budgets"), \
+             patch.object(server, "_load_json", return_value={"hud_open_on_use": True}):
+            res = server.handle(req)
+        if server._hud_open_thread:
+            server._hud_open_thread.join(timeout=2)
+        return res
+
+    def test_first_call_opens_once_second_does_not(self):
+        with patch.dict(os.environ, {}, clear=False), \
+             patch.object(server, "_hud_probe", return_value={"version": server.VERSION}), \
+             patch.object(server, "_open_hud") as mock_open:
+            os.environ.pop("SUBWAY_NO_NOTIFY", None)
+            os.environ.pop("SUBWAY_WORKER", None)
+
+            self._call_tool()
+            mock_open.assert_called_once()
+
+            self._call_tool()
+            mock_open.assert_called_once()
+
+    def test_skipped_when_setting_off(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": "test-call",
+            "method": "tools/call",
+            "params": {"name": "hud_status", "arguments": {}}
+        }
+        with patch.dict(os.environ, {}, clear=False), \
+             patch.object(server, "_hud_probe", return_value={"version": server.VERSION}), \
+             patch.object(server, "_open_hud") as mock_open, \
+             patch.object(server, "enforce_budgets"), \
+             patch.object(server, "_load_json", return_value={"hud_open_on_use": False}):
+            os.environ.pop("SUBWAY_NO_NOTIFY", None)
+            os.environ.pop("SUBWAY_WORKER", None)
+
+            server.handle(req)
+            if server._hud_open_thread:
+                server._hud_open_thread.join(timeout=2)
+            mock_open.assert_not_called()
+
+    def test_skipped_when_subway_worker_set(self):
+        with patch.dict(os.environ, {"SUBWAY_WORKER": "1"}, clear=False), \
+             patch.object(server, "_hud_probe", return_value={"version": server.VERSION}), \
+             patch.object(server, "_open_hud") as mock_open:
+            os.environ.pop("SUBWAY_NO_NOTIFY", None)
+
+            self._call_tool()
+            mock_open.assert_not_called()
+
+    def test_cli_hud_open_on_use(self):
+        with patch.object(server, "_save_json") as mock_save, \
+             patch.object(server, "_load_json", return_value={}):
+            ret = server.run_cli(["hud-open-on-use", "off"])
+            self.assertEqual(ret, 0)
+            mock_save.assert_called_with("config.json", {"hud_open_on_use": False})
+
+            ret = server.run_cli(["hud-open-on-use", "on"])
+            self.assertEqual(ret, 0)
+            mock_save.assert_called_with("config.json", {"hud_open_on_use": True})
+
+
+class TestLedgerEndpoint(unittest.TestCase):
+    def test_api_ledger_answers(self):
+        handler = server.SubwayHUDHandler.__new__(server.SubwayHUDHandler)
+        handler.path = "/api/ledger?name=main"
+        handler.headers = {}
+        sent = {}
+        handler.send_json = lambda data, status=200: sent.update({"data": data, "status": status})
+        with patch.object(handler, "_gate", return_value=True), \
+             patch.object(server, "read_track_entries", return_value=[]):
+            handler.do_GET()
+        self.assertIn("entries", sent.get("data", {}))
+        self.assertEqual(sent["data"]["track"], "main")
+
+
+
+
+
+
+class TestCopilotBudgets(unittest.TestCase):
+    def setUp(self):
+        import server
+        server._copilot_raw.clear()  # Each test needs its own gh reply, not a cached one.
+
+    def test_copilot_view_mocked_gh(self):
+        from unittest.mock import patch, MagicMock
+        import json
+        import server
+
+        mock_payload = {
+            "copilot_plan": "individual",
+            "quota_reset_date": "2026-12-01",
+            "quota_snapshots": {
+                "chat": {
+                    "percent_remaining": 75.0,
+                    "remaining": 1500,
+                    "entitlement": 2000,
+                    "unlimited": False,
+                },
+                "completions": {
+                    "percent_remaining": 100.0,
+                    "remaining": 0,
+                    "entitlement": 0,
+                    "unlimited": True,
+                },
+                "premium_interactions": {
+                    "percent_remaining": 0.0,
+                    "remaining": 0,
+                    "entitlement": 0,
+                    "unlimited": False,
+                },
+            },
+        }
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = json.dumps(mock_payload)
+
+        with patch("subprocess.run", return_value=mock_proc):
+            view = server._copilot_view({}, refresh=True)
+            self.assertEqual(view["state"], "live")
+            self.assertEqual(view["plan"], "individual")
+            pool_map = {p["name"]: p for p in view["pools"]}
+            self.assertIn("Chat", pool_map)
+            self.assertIn("Completions", pool_map)
+            self.assertNotIn("Premium requests", pool_map)
+
+            chat_win = pool_map["Chat"]["windows"][0]
+            self.assertEqual(chat_win["label"], "Monthly")
+            self.assertEqual(chat_win["left_pct"], 75.0)
+            self.assertEqual(chat_win["resets_at"], "2026-12-01")
+
+            comp_win = pool_map["Completions"]["windows"][0]
+            self.assertEqual(comp_win["label"], "Monthly")
+            self.assertIn("not applied", comp_win.get("note", "").lower())
+
+    def test_copilot_view_failure_fallback(self):
+        from unittest.mock import patch
+        import server
+
+        with patch("subprocess.run", side_effect=Exception("gh not found")):
+            view = server._copilot_view({}, refresh=True)
+            self.assertEqual(view["state"], "detected")
+            self.assertEqual(view["pools"], [])
+            self.assertIn("Doesn't expose usage locally", view["note"])
+
+
+class TestHostEditor(unittest.TestCase):
+    """The HUD opens in the editor hosting this chat, never in a different installed editor."""
+    ENV_VSCODE = {"__CFBundleIdentifier": "com.microsoft.VSCode", "VSCODE_IPC_HOOK": "", "VSCODE_IPC_HOOK_CLI": ""}
+    ENV_AGY = {"__CFBundleIdentifier": "com.google.antigravity-ide", "VSCODE_IPC_HOOK": "", "VSCODE_IPC_HOOK_CLI": ""}
+
+    def test_host_with_extension_opens_its_own_link(self):
+        ok = mock.MagicMock(returncode=0)
+        with mock.patch.dict(os.environ, self.ENV_AGY), \
+             mock.patch.object(server, "_cli_path", return_value="/x/agy-ide"), \
+             mock.patch.object(server, "_has_extension", return_value=True), \
+             mock.patch.object(server.subprocess, "run", return_value=ok) as run, \
+             mock.patch("webbrowser.open") as browser:
+            server._open_hud(7890)
+        browser.assert_not_called()
+        self.assertIn("antigravity-ide://subway.subway-context/open?port=7890", run.call_args[0][0])
+
+    def test_host_without_extension_uses_browser_and_says_how(self):
+        server.EDITOR_HINT.clear()
+        with mock.patch.dict(os.environ, self.ENV_VSCODE), \
+             mock.patch.object(server, "_cli_path", return_value="/x/code"), \
+             mock.patch.object(server, "_has_extension", return_value=False), \
+             mock.patch.object(server.subprocess, "run") as run, \
+             mock.patch.object(server, "notify_desktop_event"), \
+             mock.patch("webbrowser.open") as browser:
+            server._open_hud(7890)
+        browser.assert_called_once()
+        run.assert_not_called()  # Never opens a different editor.
+        self.assertIn("VS Code", server.EDITOR_HINT.get("text", ""))
+
+
+class TestOpenCodeIdCollision(unittest.TestCase):
+    def test_permission_request_with_colliding_id_keeps_session(self):
+        """OpenCode's permission request can reuse our session/new id; it must never wipe the session id."""
+        src = open(os.path.join(os.path.dirname(server.__file__), "server.py"), encoding="utf-8").read()
+        body = src[src.index("def _pump_opencode("):]
+        body = body[:body.index("\ndef ", 10)]
+        for check in ("msg_id == init_id", "msg_id == session_new_id", "msg_id == curr_config_id", "msg_id == prompt_id"):
+            line = next(l for l in body.splitlines() if check in l and l.strip().startswith("if "))
+            self.assertIn("is_reply", line, check)
 

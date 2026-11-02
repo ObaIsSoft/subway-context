@@ -462,6 +462,41 @@ Local workers run through ACP, so they ask permission and can be denied; auto_sa
 - **Fail-Open Hook Design**: Hook guard failures fail open to prevent blocking developer edits.
 - **Sandboxed Metadata**: State, aliases, checkpoints, and mailboxes live strictly in `~/.subway-context/`.
 
+---
+
+## Recommended Companion Tools
+
+Optional: Subway doesn't install, bundle or configure any of them. Users add them to their own MCP config if they want them.
+
+- **fetch (`mcp-server-fetch`)**: for simple pages.
+- **Lightpanda (`lightpanda.io`)**: a fast open-source headless browser for JavaScript-heavy pages, with its own MCP server. Install on macOS: `brew install lightpanda-io/browser/lightpanda`. No native Windows build (use WSL). It can't take screenshots or render PDFs.
+- **Apify (`@apify/actors-mcp-server`)**: cloud scrapers called Actors, useful for sites that block simple requests and for public social media research (YouTube, Reddit, X, TikTok, Instagram, LinkedIn). Needs Node 22+ and an `APIFY_TOKEN`.
+  - Cost warning: the free plan gives $5 of usage a month and blocks use when it runs out, which is the only hard ceiling. There is no setting that caps spending; on a paid plan, cap each run with `maxTotalChargeUsd` or `maxItems` when calling an Actor. Stay on the free plan unless you watch spend.
+  - Legal note: scraping public data can still break a platform's terms, and in the EU public posts are still personal data under GDPR. Prefer aggregate, public signals (counts, trends, sentiment) and don't store who said what.
+- **Suggested order**: fetch for simple pages, Lightpanda for JavaScript-heavy pages, Apify for blocked sites and social media.
+
+```json
+{
+  "mcpServers": {
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "lightpanda": {
+      "command": "lightpanda",
+      "args": ["mcp"]
+    },
+    "apify": {
+      "command": "npx",
+      "args": ["-y", "@apify/actors-mcp-server"],
+      "env": {
+        "APIFY_TOKEN": "<your token>"
+      }
+    }
+  }
+}
+```
+
 ## License
 
 MIT

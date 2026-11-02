@@ -1,27 +1,37 @@
-# Subway Context VS Code & Antigravity Extension
+# Subway Context Editor Extension
 
-Subway Context extension connects the Subway HUD directly into VS Code and Antigravity.
-
-## Features
-
-- **Subway: Open HUD** (`subway.openHud`): Opens the Live Subway HUD inside the editor using the built-in simple browser (`simpleBrowser.show`).
-- Reads the HUD port from `~/.subway-context/hud.json` (defaults to port `7890`).
-- Activates on `onStartupFinished`, pinging `/healthz` without auto-opening unprompted.
+This extension integrates the Subway Context HUD directly into VS Code, Cursor, Windsurf, and Google Antigravity IDE using VS Code's internal browser (`simpleBrowser`).
 
 ## Installation
 
-You can package and install this extension locally:
+### Automatic (Recommended)
+The Subway Context installer sets up the extension automatically for detected editors:
+```bash
+python3 install.py
+```
+Or with auto-install:
+```bash
+python3 install.py --yes
+```
 
-1. Package the extension into a `.vsix` file:
-   ```sh
-   npx vsce package
+### Manual Installation
+If you prefer to install it manually:
+
+1. Build the `.vsix` package (if not already packaged):
+   ```bash
+   npm run build:vsix
+   ```
+   Or inside `vscode/`:
+   ```bash
+   npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway-context.vsix
    ```
 
-2. Install via command line:
-   ```sh
-   code --install-extension subway-context-0.1.0.vsix
-   ```
-   Or inside VS Code / Antigravity:
-   - Open Command Palette (`Cmd+Shift+P` or `Ctrl+Shift+P`).
-   - Select **Extensions: Install from VSIX...**
-   - Choose the generated `.vsix` file.
+2. Install the `.vsix` into your editor:
+   - **VS Code**: `code --install-extension vscode/subway-context.vsix`
+   - **Cursor**: `cursor --install-extension vscode/subway-context.vsix`
+   - **Windsurf**: `windsurf --install-extension vscode/subway-context.vsix`
+   - **Antigravity IDE**: `~/.antigravity-ide/antigravity-ide/bin/agy-ide --install-extension vscode/subway-context.vsix`
+
+## Usage
+- Open the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) and run **Subway: Open HUD**.
+- When the Subway HUD server starts or when using `--open-url`, the editor URI handler (`vscode://subway.subway-context/open?port=N` or `antigravity://subway.subway-context/open?port=N`) will automatically open the dashboard in your editor.

@@ -1,6 +1,6 @@
 {
   "name": "subway-context",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "On-demand multi-window context transit and workspace guard for AI coding agents (Claude Code, OpenCode, Antigravity)",
   "main": "bin/subway-context.js",
   "bin": {
@@ -8,7 +8,9 @@
     "subway": "bin/subway-context.js"
   },
   "scripts": {
-    "test": "python3 -m unittest discover -s tests"
+    "test": "python3 -m unittest discover -s tests",
+    "build:vsix": "cd vscode && npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway-context.vsix",
+    "prepack": "npm run build:vsix"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -32,6 +34,7 @@
     "README.md",
     "AGENTS.md",
     "hud",
-    "assets"
+    "assets",
+    "vscode/subway-context.vsix"
   ]
 }

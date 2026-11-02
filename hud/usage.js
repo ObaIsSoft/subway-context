@@ -25,7 +25,7 @@ export function ring(pool, now) {
     s("svg", { viewBox: "0 0 96 96", width: 96, height: 96 },
       arc(42, a && usable(a, now) ? a.left_pct : null, "one"),
       b ? arc(30, usable(b, now) ? b.left_pct : null, "two") : null),
-    h("div", { class: "ring-label" }, lowest === null ? "–" : pct(Math.round(lowest)), h("small", {}, lowest === null ? "" : "lowest")));
+    h("div", { class: "ring-label" }, lowest === null ? "–" : pct(Math.round(lowest * 10) / 10), h("small", {}, lowest === null ? "" : "lowest")));
 }
 
 function windowRow(w, i, now) {
@@ -151,6 +151,12 @@ export function spendChart(providers) {
   ];
 }
 
+export function lowPools(p, now) {
+  return (p.pools || [])
+    .filter((pool) => (pool.windows || []).some((w) => usable(w, now) && w.left_pct <= 10))
+    .map((pool) => pool.name);
+}
+
 export function reachesLimit(p, now) {
-  return (p.pools || []).some((pool) => pool.windows.some((w) => usable(w, now) && w.left_pct <= 10));
+  return lowPools(p, now).length > 0;
 }

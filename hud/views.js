@@ -1,6 +1,8 @@
 /* One function per page. Each returns elements built from the latest status. */
 import { h, api, act, ask, field, get, icon, modal, pct, ticking, toast, tokens } from "./lib.js";
-import { nextResets, providerCard, reachesLimit, spendChart } from "./usage.js";
+import { lowPools, nextResets, providerCard, reachesLimit, spendChart } from "./usage.js";
+
+let resetCycle = { index: 0, lastAdvanced: 0 };
 
 const WORKER_STATE = {
   pending_approval: ["Awaiting approval", "gold"], launching: ["Launching", "gold"], running: ["Running", "gold"], stopping: ["Stopping", ""],
@@ -33,6 +35,89 @@ export function modeControl(settings) {
     h("div", { class: "seg", role: "group", "aria-labelledby": "mode-title" }, Object.entries(modes).map(([key, label]) =>
       h("button", { type: "button", "aria-pressed": String(key === current), on: { click: () => act("/api/settings", { permission_mode: key }) } }, label))),
     current === "auto_approve" ? h("div", { class: "err" }, "Workers will not ask before running commands.") : null);
+}
+
+export function settingsCard(settings) {
+  const s = settings || {};
+  const currentCompaction = s.compaction;
+  const modes = [
+    { key: "suggest", label: "Suggest" },
+    { key: "auto", label: "Auto" },
+    { key: "never", label: "Never" },
+  ];
+
+  const compactionHints = {
+    suggest: "Warns once when a chat's context gets expensive, with a ready /compact line. You decide.",
+    auto: "Warns the same way, and compacts OpenCode sessions itself. Claude Code compacts by itself near its limit.",
+    never: "No warnings.",
+  };
+  const compactionHint = compactionHints[currentCompaction];
+
+  const compactionSeg = h("div", { class: "seg", role: "group", "aria-labelledby": "settings-compaction-title" },
+    modes.map(({ key, label }) =>
+      h("button", {
+        type: "button",
+        "aria-pressed": String(currentCompaction === key),
+        on: { click: () => act("/api/settings", { compaction: key }) },
+      }, label)
+    )
+  );
+
+  const autostartCheck = h("input", {
+    type: "checkbox",
+    id: "hud-autostart",
+    checked: Boolean(s.hud_autostart),
+    on: { change: (e) => act("/api/settings", { hud_autostart: e.target.checked }) },
+  });
+
+  const openOnUseCheck = h("input", {
+    type: "checkbox",
+    id: "hud-open-on-use",
+    checked: Boolean(s.hud_open_on_use),
+    on: { change: (e) => act("/api/settings", { hud_open_on_use: e.target.checked }) },
+  });
+
+  return h("section", { class: "card", "aria-labelledby": "settings-title" },
+    h("div", {},
+      h("h2", { class: "card-title", id: "settings-title" }, "Settings"),
+      h("div", { class: "card-sub" }, "Context compaction and startup behavior.")),
+    h("div", { class: "field" },
+      h("span", { class: "label", id: "settings-compaction-title" }, "Compaction"),
+      compactionSeg,
+      compactionHint ? h("div", { class: "card-sub" }, compactionHint) : null),
+    h("div", { class: "switches" },
+      h("label", { class: "switch-row", for: "hud-autostart" },
+        h("span", { class: "switch-label" }, "Start the HUD with Subway"),
+        h("span", { class: "switch" }, autostartCheck, h("span", { class: "slider" }))),
+      h("div", { class: "card-sub" }, "Starts the dashboard whenever a chat connected to Subway opens, so a reload never leaves it down."),
+      h("label", { class: "switch-row", for: "hud-open-on-use" },
+        h("span", { class: "switch-label" }, "Open the HUD when Subway is used"),
+        h("span", { class: "switch" }, openOnUseCheck, h("span", { class: "slider" }))),
+      h("div", { class: "card-sub" }, "Opens the dashboard in your editor the first time a chat uses Subway.")));
+}
+
+/* ---- Chat Context Card ---- */
+export function chatContextCard(ctx) {
+  if (!ctx || ctx.pct == null) return null;
+  const segmentsTag = (ctx.segments && ctx.segments > 1)
+    ? h("span", { class: "tag" }, `${ctx.segments} segments`)
+    : null;
+  const pctNum = Math.min(100, Math.max(0, Number(ctx.pct) || 0));
+  const tokenStr = (ctx.tokens != null && ctx.window != null)
+    ? `${tokens(ctx.tokens)} of ${tokens(ctx.window)}`
+    : "";
+  const barClass = pctNum >= 90 ? "bar-fill bad" : (pctNum >= 75 ? "bar-fill gold" : "bar-fill");
+
+  return h("section", { class: "card", "aria-labelledby": "chat-context-title" },
+    h("div", { class: "card-head" },
+      h("h2", { class: "card-title", id: "chat-context-title" }, "This chat"),
+      segmentsTag ? h("div", { class: "tags" }, segmentsTag) : null),
+    h("div", { class: "context-gauge" },
+      h("div", { class: "context-gauge-head" },
+        h("span", { class: "context-gauge-pct" }, `${ctx.pct}%`),
+        tokenStr ? h("span", { class: "context-gauge-tokens" }, tokenStr) : null),
+      h("div", { class: "bar", role: "progressbar", "aria-valuenow": String(pctNum), "aria-valuemin": "0", "aria-valuemax": "100" },
+        h("div", { class: barClass, style: `width: ${pctNum}%` }))));
 }
 
 /* ---- Overview ---- */
@@ -129,27 +214,50 @@ export function overview(d, link) {
   const running = workers.filter((w) => w.status === "running").length;
   const waiting = (d.permissions || []).length;
   const resets = nextResets(providers, now);
-  const low = providers.filter((p) => reachesLimit(p, now)).map((p) => p.name);
+  const low = [];
+  for (const p of providers) {
+    const pools = lowPools(p, now);
+    if (pools.length) {
+      const named = pools.filter(Boolean);
+      low.push(named.length ? `${p.name} (${named.join(", ")})` : p.name);
+    }
+  }
   const needs = waiting + pending;
   const headline = needs ? `${needs} thing${needs > 1 ? "s" : ""} waiting on you` : running ? `${running} worker${running > 1 ? "s" : ""} running` : "All clear";
   const tokens5h = providers.reduce((sum, p) => sum + (p.tokens ? p.tokens["5h"].input + p.tokens["5h"].output : 0), 0);
 
   let resetSide = null;
   if (resets.length) {
-    const fig = ticking("div", { class: "hero-figure" }, resets[0].at, "countdown");
-    const note = h("div", { class: "hero-note" }, resets[0].label);
-    resetSide = h("div", { class: "hero-side" }, h("div", { class: "label" }, "Next limit reset"), fig, note);
+    const nowMs = Date.now();
+    if (!resetCycle.lastAdvanced) {
+      resetCycle.lastAdvanced = nowMs;
+    } else {
+      const elapsed = nowMs - resetCycle.lastAdvanced;
+      if (elapsed >= 5000) {
+        const steps = Math.floor(elapsed / 5000);
+        resetCycle.index = (resetCycle.index + steps) % resets.length;
+        resetCycle.lastAdvanced += steps * 5000;
+      }
+    }
+    const idx = resetCycle.index % resets.length;
+    const cur = resets[idx];
+    const counter = resets.length > 1 ? ` (${idx + 1} of ${resets.length})` : "";
+    const fig = ticking("div", { class: "hero-figure" }, cur.at, "countdown");
+    const note = h("div", { class: "hero-note" }, cur.label);
+    const label = h("div", { class: "label" }, `Next limit reset${counter}`);
+    resetSide = h("div", { class: "hero-side" }, label, fig, note);
     if (resets.length > 1) {
-      let idx = 0;
       const timer = setInterval(() => {
         if (!resetSide.isConnected) {
           clearInterval(timer);
           return;
         }
-        idx = (idx + 1) % resets.length;
-        const cur = resets[idx];
-        fig.dataset.epoch = cur.at;
-        note.textContent = cur.label;
+        resetCycle.index = (resetCycle.index + 1) % resets.length;
+        resetCycle.lastAdvanced = Date.now();
+        const nextCur = resets[resetCycle.index];
+        fig.dataset.epoch = nextCur.at;
+        note.textContent = nextCur.label;
+        label.textContent = `Next limit reset (${resetCycle.index + 1} of ${resets.length})`;
       }, 5000);
     }
   }
@@ -165,6 +273,7 @@ export function overview(d, link) {
     h("div", { class: "kpis" },
       kpi("workers", "Running workers", running), kpi("bell", "Waiting on you", needs),
       kpi("leases", "File leases", Object.keys(d.locks || {}).length), kpi("bolt", "Tokens, last 5h", tokens(tokens5h))),
+    chatContextCard(d.chat_context),
     budgetsCard(d),
     h("div", { class: "grid overview-grid" },
       h("section", { class: "card" },
@@ -201,6 +310,12 @@ export function usagePage(d) {
 function workerTags(w) {
   const [label, cls] = WORKER_STATE[w.status] || [w.status || "Unknown", ""];
   const tags = [h("span", { class: `tag ${cls}` }, label), h("span", { class: "tag" }, (w.provider || "").toUpperCase())];
+  if (w.priority === "urgent") tags.push(h("span", { class: "tag bad" }, "URGENT"));
+  if (w.verify && w.verify.status) {
+    const vCls = w.verify.status === "PASS" ? "ok" : (w.verify.status === "FLAG" ? "gold" : "bad");
+    tags.push(h("span", { class: `tag ${vCls}`, title: w.verify.line || "" }, w.verify.status));
+  }
+  if (w.partial_patch) tags.push(h("span", { class: "tag gold" }, "Partial patch kept"));
   if (w.model && !["default", "inherit"].includes(w.model)) tags.push(h("span", { class: "tag" }, w.model));
   if (w.effort) tags.push(h("span", { class: "tag" }, `effort ${w.effort}`));
   if (w.skip_permissions) tags.push(h("span", { class: "tag bad" }, "Prompts off"));
@@ -245,6 +360,7 @@ function workerRow(w, past) {
       if (reason !== null) act("/api/reject_worker", { id: w.id, reason });
     } } }, "Reject"));
   } else {
+    actions.push(h("button", { class: "btn", type: "button", on: { click: () => act("/api/verify", { id: w.id }) } }, "Verify"));
     actions.push(h("button", { class: "btn", type: "button", on: { click: () => showLog(w.id) } }, past ? "Report" : "Log"));
     if (w.status === "running") actions.push(h("button", { class: "btn danger", type: "button", on: { click: () => act("/api/stop_worker", { id: w.id, reason: "Stopped from the HUD" }) } }, "Stop"));
   }
@@ -252,11 +368,18 @@ function workerRow(w, past) {
   const isExpanded = expandedWorkers.has(w.id);
   const isLogOpen = openLogs.has(w.id);
 
+  const verifyLine = (w.verify && w.verify.line) ? w.verify.line : null;
+  const isLong = Boolean(text && (text.length > 180 || text.includes("\n")));
+  const hasExpandable = isLong || Boolean(verifyLine);
+
+  const verifyLineEl = verifyLine
+    ? h("div", { class: "row-sub mono", hidden: !isExpanded }, verifyLine)
+    : null;
+
   let textEl = null;
   if (text) {
-    const isLong = text.length > 180 || text.includes("\n");
     const subEl = h("div", { class: `row-sub${!isExpanded && isLong ? " clamped" : ""}` }, text);
-    if (isLong) {
+    if (hasExpandable) {
       const toggleBtn = h("button", {
         class: "link-btn",
         type: "button",
@@ -266,7 +389,8 @@ function workerRow(w, past) {
             if (expandedWorkers.has(w.id)) expandedWorkers.delete(w.id);
             else expandedWorkers.add(w.id);
             const open = expandedWorkers.has(w.id);
-            subEl.classList.toggle("clamped", !open);
+            if (isLong) subEl.classList.toggle("clamped", !open);
+            if (verifyLineEl) verifyLineEl.hidden = !open;
             e.currentTarget.textContent = open ? "Show less" : "Show more";
           },
         },
@@ -275,6 +399,22 @@ function workerRow(w, past) {
     } else {
       textEl = subEl;
     }
+  } else if (hasExpandable) {
+    const toggleBtn = h("button", {
+      class: "link-btn",
+      type: "button",
+      on: {
+        click: (e) => {
+          e.stopPropagation();
+          if (expandedWorkers.has(w.id)) expandedWorkers.delete(w.id);
+          else expandedWorkers.add(w.id);
+          const open = expandedWorkers.has(w.id);
+          if (verifyLineEl) verifyLineEl.hidden = !open;
+          e.currentTarget.textContent = open ? "Show less" : "Show more";
+        },
+      },
+    }, isExpanded ? "Show less" : "Show more");
+    textEl = h("div", {}, toggleBtn);
   }
 
   /* Updated in place, so it also works inside the history dialog, which doesn't redraw. */
@@ -304,6 +444,7 @@ function workerRow(w, past) {
     h("div", {}, h("div", { class: "row-title" }, w.role || "Worker"),
       h("div", { class: "row-sub" }, h("span", { class: "mono" }, w.id), w.project_dir ? ` · ${w.project_dir}` : ""),
       textEl,
+      verifyLineEl,
       h("div", {}, logToggleBtn),
       w.route ? h("div", { class: "row-sub" }, `Why this agent: ${w.route}`) : null,
       w.progress ? h("div", { class: "row-sub num" }, `${w.progress.files_done} of ${w.progress.files_total} files, ${w.progress.chunks_done} chunks done, ${w.progress.failed} failed`) : null,
@@ -531,6 +672,15 @@ export function modelsPage(d) {
       const tags = [h("span", { class: "tag" }, sourceTag)];
       if (m.scarce) tags.push(h("span", { class: "tag gold" }, "Scarce"));
 
+      const ex = (d.exhausted_models || []).find((e) => e.model && m.model && (e.model.toLowerCase() === m.model.toLowerCase() || e.model === m.model));
+      if (ex && ex.until) {
+        const ts = typeof ex.until === "number" ? (ex.until > 1e11 ? ex.until : ex.until * 1000) : Date.parse(ex.until);
+        const untilTime = ts ? new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+        if (untilTime) {
+          tags.push(h("span", { class: "tag bad" }, `Out of quota until ${untilTime}`));
+        }
+      }
+
       const isOpenCode = (m.provider || "").toLowerCase() === "opencode";
       if (m.free === true) {
         tags.push(h("span", { class: "tag" }, "Free tier"));
@@ -576,6 +726,31 @@ export function modelsPage(d) {
         tags.push(h("span", { class: "tag num" }, `${tokens(usedTokens)} tokens used, 7 days`));
       }
 
+      const modelTracks = (d.models_track || []).filter((t) => {
+        if (!t.model || !m.model) return false;
+        if (t.model.toLowerCase() !== m.model.toLowerCase()) return false;
+        if (t.provider && m.provider) {
+          return t.provider.toLowerCase() === m.provider.toLowerCase();
+        }
+        return true;
+      });
+      let trackLine = null;
+      if (modelTracks.length > 0) {
+        const landed = modelTracks.reduce((sum, x) => sum + (x.landed || 0), 0);
+        const noChange = modelTracks.reduce((sum, x) => sum + (x.no_change || 0), 0);
+        const failed = modelTracks.reduce((sum, x) => sum + (x.failed || 0), 0);
+        const budgetStopped = modelTracks.reduce((sum, x) => sum + (x.budget_stopped || 0), 0);
+        let ratePct = 0;
+        if (modelTracks.length === 1 && modelTracks[0].landed_rate != null) {
+          const r = Number(modelTracks[0].landed_rate);
+          ratePct = Math.round(r <= 1 && r > 0 ? r * 100 : r);
+        } else {
+          const total = landed + noChange + failed + budgetStopped;
+          ratePct = total > 0 ? Math.round((landed / total) * 100) : 0;
+        }
+        trackLine = h("div", { class: "row-sub model-track-record" }, `Track record: ${ratePct}% (${landed} landed, ${noChange} no change, ${failed} failed)`);
+      }
+
       const summaryBtn = h("button", {
         class: "model-row-btn",
         type: "button",
@@ -587,7 +762,9 @@ export function modelsPage(d) {
         },
       },
         h("div", { class: "model-row-main" },
-          h("div", { class: "row-title" }, m.model || "Default"),
+          h("div", { class: "model-info" },
+            h("div", { class: "row-title" }, m.model || "Default"),
+            trackLine),
           h("div", { class: "tags" }, tags)),
         h("div", { class: "model-meters" },
           meter("Coding", coding, "C"),
@@ -686,7 +863,7 @@ export function workersPage(d) {
 
   return [
     permissionsCard(d.permissions || []),
-    modeControl(d.settings),
+    h("div", { class: "controls-grid" }, modeControl(d.settings), settingsCard(d.settings)),
     hasChatScope ? null : chatBudgetCard,
     h("section", { class: "card" },
       h("div", { class: "card-head" },
@@ -719,9 +896,12 @@ function openClaim() {
 export function leasesPage(d) {
   const rows = [];
   for (const [path, l] of Object.entries(d.locks || {})) {
+    const isAutoClaimed = Boolean(l.purpose && l.purpose.includes("auto-claimed"));
     rows.push(h("div", { class: "row" },
       h("div", {}, h("div", { class: "row-title mono" }, path), h("div", { class: "row-sub" }, l.purpose || "")),
-      h("div", { class: "tags" }, h("span", { class: "tag gold" }, l.holder || "unknown"), h("span", { class: "tag" }, l.role || "implementer"),
+      h("div", { class: "tags" },
+        isAutoClaimed ? h("span", { class: "tag" }, "auto-claimed") : null,
+        h("span", { class: "tag gold" }, l.holder || "unknown"), h("span", { class: "tag" }, l.role || "implementer"),
         h("span", { class: "tag num" }, ticking("span", {}, l.expires_at, "countdown"), " left")),
       h("div", { class: "btns" }, h("button", { class: "btn danger", type: "button", on: { click: () => act("/api/release", { filepath: path }) } }, "Release"))));
   }

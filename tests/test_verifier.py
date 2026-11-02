@@ -64,6 +64,30 @@ class TestWorkerVerifier(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
+    def test_hud_import_missing_export_fails(self):
+        patch = (
+            "diff --git a/hud/views.js b/hud/views.js\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/hud/views.js\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+export function existingView() {\n"
+            "+    return 1;\n"
+            "+}\n"
+            "diff --git a/hud/app.js b/hud/app.js\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/hud/app.js\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+import { missingView } from \"./views.js\";\n"
+            "+missingView();\n"
+        )
+        meta = self._create_worker("w_bad_js", patch)
+        res = verify_worker(meta)
+        self.assertNotEqual(res["status"], "PASS")
+        self.assertEqual(res["status"], "FAIL")
+        self.assertTrue(any("views.js doesn't export missingView" in str(r) for r in res.get("reasons", [])))
+
     def _create_worker(self, wid: str, patch_content: str, meta_extra: dict = None) -> dict:
         patch_file = os.path.join(self.workers_dir, f"{wid}.patch")
         with open(patch_file, "w", encoding="utf-8") as f:

@@ -1,6 +1,7 @@
 /* Shell, routing and polling. */
 import { api, duration, get, h, icon, listen, set, subscribe, tickAll, toast, tokens } from "./lib.js";
-import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, updateWorkerUsage, usagePage, workersPage } from "./views.js";
+import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, usagePage, workersPage } from "./views.js";
+import { helpPage } from "./help.js";
 
 const POLL_MS = 1000;
 const FEED_MS = 3000;
@@ -11,6 +12,7 @@ const PAGES = {
   models: { label: "Models", sub: "How each model is ranked, and where that came from" },
   leases: { label: "Leases", sub: "Who holds which file" },
   ledger: { label: "Ledger", sub: "Shared decisions across agents" },
+  help: { label: "Help", sub: "Guides, terms, and commands for Subway Context" },
 };
 
 const nav = {};
@@ -29,17 +31,18 @@ function currentPage() {
 
 function buildShell() {
   const rail = h("nav", { class: "rail", "aria-label": "Sections" }, h("div", { class: "rail-brand", "aria-hidden": "true" }, "S"),
-    Object.entries(PAGES).map(([key, page]) => {
+    Object.entries(PAGES).filter(([key]) => key !== "help").map(([key, page]) => {
       const badge = h("span", { class: "nav-badge", hidden: true });
       const item = h("button", { class: "nav-item", type: "button", on: { click: () => { location.hash = key; } } }, icon(key), page.label, badge);
       nav[key] = { item, badge };
       return item;
     }));
+  const helpBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Help", on: { click: () => { location.hash = "help"; } } }, "?");
   const theme = h("button", { class: "icon-btn", type: "button", "aria-label": "Change theme", on: { click: cycleTheme } }, icon("theme"));
   content.append(
     h("header", { class: "topbar" },
       h("div", {}, h("div", { class: "title-mark" }, h("b", {}, "Subway"), " Context"), heading, subheading),
-      h("div", { class: "top-actions" }, h("span", { class: "pill", role: "status" }, linkDot, linkText), theme)),
+      h("div", { class: "top-actions" }, h("span", { class: "pill", role: "status" }, linkDot, linkText), helpBtn, theme)),
     alertBar, pageBody);
   document.getElementById("root").append(h("div", { class: "shell" }, rail, content));
   document.body.append(h("div", { class: "toast", id: "toast", role: "status", hidden: true }));
@@ -67,19 +70,22 @@ function focusInside() {
 function render() {
   const d = get("status");
   const page = currentPage();
-  for (const [key, { item }] of Object.entries(nav)) {
+  for (const [key, val] of Object.entries(nav)) {
+    if (!val) continue;
+    const { item } = val;
     if (key === page) item.setAttribute("aria-current", "page");
     else item.removeAttribute("aria-current");
   }
   heading.textContent = PAGES[page].label;
   subheading.textContent = PAGES[page].sub;
-  if (!d) return;
+  if (!d && page !== "help") return;
   if (focusInside()) return; // Never wipe out what someone is typing.
   const open = [...pageBody.querySelectorAll("details[open] summary")].map((x) => x.closest(".card")?.querySelector(".provider-name")?.textContent);
   const views = {
     overview: () => overview(d), usage: () => usagePage(d), workers: () => workersPage(d),
     models: () => modelsPage(d),
     leases: () => leasesPage(d), ledger: () => ledgerPage(d, switchTrack),
+    help: () => helpPage(),
   };
   const pageTop = window.scrollY;
   const out = views[page]();
@@ -92,7 +98,7 @@ function render() {
 
 async function loadFeed() {
   try {
-    const d = await api(`/api/track?name=${encodeURIComponent(ledger.track)}`);
+    const d = await api(`/api/ledger?name=${encodeURIComponent(ledger.track)}`);
     ledger.entries = d.entries || [];
     set("feed", ledger.entries);
   } catch (e) { /* The connection state already shows this. */ }

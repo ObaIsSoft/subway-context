@@ -163,7 +163,7 @@ Workers should spend tokens editing, not searching. One round spent 3.83M input 
 - Count everything that costs: thinking tokens and cache creation, not just input and output. Each call resends the whole context, so a cap must allow for the next call.
 - Wrap up at two thirds of a cap, and never start a call that would pass it. Make edits early, so a stop loses little.
 - Never print large outputs into the chat. Trim every command, and never echo a worker's prompt.
-- Free OpenCode models suit reviews and text. Don't rely on them for code edits until they've proven it.
+- Before blaming a model, prove the runner. Every OpenCode edit failure in our first sessions came from our own ACP runner (auto-deny, relative paths, auto-approve gaps, and an id collision that wiped the session id at the first edit). Once fixed, three free OpenCode models landed a calibration edit in 14-17s at about 34-40K tokens, faster and cheaper than Gemini Flash Low (36s, 71K).
 - Don't rely on a test harness's silence: a hook or guard can stop a whole command, so confirm it ran.
 - A killed Antigravity turn sends no total, and the resumed turn's total then includes it. Trust the live per-step count over a final total when they disagree.
 

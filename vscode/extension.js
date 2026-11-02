@@ -38,6 +38,29 @@ function activate(context) {
   });
   context.subscriptions.push(openHudCommand);
 
+  const uriHandler = vscode.window.registerUriHandler({
+    handleUri(uri) {
+      let port = getHudPort();
+      if (uri.query) {
+        try {
+          const params = new URLSearchParams(uri.query);
+          const p = params.get('port');
+          if (p && !isNaN(Number(p))) {
+            port = Number(p);
+          }
+        } catch (e) {
+          const match = uri.query.match(/port=(\d+)/);
+          if (match) {
+            port = Number(match[1]);
+          }
+        }
+      }
+      const url = `http://127.0.0.1:${port}`;
+      vscode.commands.executeCommand('simpleBrowser.show', url);
+    }
+  });
+  context.subscriptions.push(uriHandler);
+
   // Activation onStartupFinished: if the HUD answers /healthz, do nothing more, never auto-open.
   const port = getHudPort();
   checkHealth(port).then((isHealthy) => {

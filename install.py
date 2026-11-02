@@ -860,6 +860,74 @@ def ensure_notifier(interactive: bool, auto_yes: bool) -> str:
     return "failed"
 
 
+def ensure_editor_extension(interactive: bool, auto_yes: bool) -> List[str]:
+    """Offer or install Subway HUD editor extension in detected editors."""
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    vsix_path = os.path.join(pkg_dir, "vscode", "subway-context.vsix")
+
+    agy_ide = os.path.expanduser("~/.antigravity-ide/antigravity-ide/bin/agy-ide")
+    candidates = [
+        ("code", shutil.which("code")),
+        ("cursor", shutil.which("cursor")),
+        ("windsurf", shutil.which("windsurf")),
+        ("agy-ide", agy_ide if os.path.exists(agy_ide) else shutil.which("agy-ide")),
+    ]
+
+    results = []
+    why = "Subway HUD extension integrates the dashboard into your editor."
+
+    for name, cli_path in candidates:
+        if not cli_path:
+            continue
+
+        try:
+            proc = subprocess.run([cli_path, "--list-extensions"], capture_output=True, text=True, timeout=5)
+            has_ext = proc.returncode == 0 and "subway.subway-context" in (proc.stdout or "").lower()
+        except Exception:
+            has_ext = False
+
+        if has_ext:
+            print(f"  ✓ Editor extension: {name} already has subway.subway-context installed.")
+            results.append("installed")
+            continue
+
+        if not os.path.exists(vsix_path):
+            print(f"\n  ! Editor extension for {name}: {vsix_path} not found.")
+            print("    To build it: npm run build:vsix")
+            print("    (or: cd vscode && npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway-context.vsix)")
+            results.append("missing-vsix")
+            continue
+
+        if not interactive and not auto_yes:
+            print(f"\n  Optional: {why}")
+            print(f"  To install in {name}: {cli_path} --install-extension {vsix_path}")
+            results.append("hint")
+            continue
+
+        if interactive and not auto_yes:
+            print(f"\n  {why}")
+            answer = input(f"  Install Subway extension in {name} now? [Y/n]: ").strip().lower()
+            if answer not in ("", "y", "yes"):
+                print(f"  Skipped. You can install it any time: {cli_path} --install-extension {vsix_path}")
+                results.append("declined")
+                continue
+
+        print(f"  Installing Subway extension in {name} ({cli_path} --install-extension {vsix_path})...")
+        try:
+            done = subprocess.run([cli_path, "--install-extension", vsix_path], timeout=60).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            done = False
+
+        if done:
+            print(f"  ✓ Subway extension installed in {name}.")
+            results.append("installed-now")
+        else:
+            print(f"  ✗ Couldn't install in {name}. To try manually: {cli_path} --install-extension {vsix_path}")
+            results.append("failed")
+
+    return results
+
+
 def main() -> None:
     args = sys.argv[1:]
 
@@ -954,6 +1022,7 @@ def main() -> None:
     print(f"\n✓ Completed. {connected_count} agent line(s) connected.")
     print("You can now bridge chats across your selected windows.")
     ensure_notifier(interactive=sys.stdin.isatty(), auto_yes=auto_yes)
+    ensure_editor_extension(interactive=sys.stdin.isatty(), auto_yes=auto_yes)
 
 
 if __name__ == "__main__":
