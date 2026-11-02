@@ -3129,8 +3129,63 @@ def _catalog_stamp() -> Tuple[float, ...]:
     return tuple(stamps)
 
 
+def _opencode_free_exhausted_models(providers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, float]:
+    """Map of OpenCode model name -> timestamp when it hit free limit within the last 24 hours."""
+    exhausted: Dict[str, float] = {}
+    now = time.time()
+    rec = None
+    if providers:
+        rec = next((p for p in providers if p.get("id") == "opencode"), None)
+    if not rec:
+        with contextlib.suppress(Exception):
+            src = _source("opencode", 5.0)
+            rec = src.get("data")
+    if not rec:
+        with contextlib.suppress(Exception):
+            rec = _fetch_opencode_usage()
+    if isinstance(rec, dict):
+        limited = rec.get("limited") or {}
+        for k, v in limited.items():
+            if isinstance(v, dict):
+                at = float(v.get("at") or 0)
+                if at and (now - at <= 86400):
+                    m = str(v.get("model") or k)
+                    if m:
+                        exhausted[m] = at
+                        if "/" in m:
+                            exhausted[m.split("/", 1)[1]] = at
+        hit = rec.get("limit_hit")
+        if isinstance(hit, dict):
+            at = float(hit.get("at") or 0)
+            if at and (now - at <= 86400):
+                m = str(hit.get("model") or rec.get("model") or "")
+                if m and m != "Free model":
+                    exhausted[m] = at
+                    if "/" in m:
+                        exhausted[m.split("/", 1)[1]] = at
+    return exhausted
+
+
+def _is_opencode_model_exhausted(model: str, providers: Optional[List[Dict[str, Any]]] = None) -> bool:
+    if not model:
+        return False
+    ex = _opencode_free_exhausted_models(providers)
+    if model in ex:
+        return True
+    clean = model.split("/", 1)[1] if "/" in model else model
+    return clean in ex
+
+
 def model_catalog() -> List[Dict[str, Any]]:
-    return [dict(m) for m in _model_catalog(_catalog_stamp())]
+    catalog = [dict(m) for m in _model_catalog(_catalog_stamp())]
+    oc_ex = _opencode_free_exhausted_models()
+    for entry in catalog:
+        m_prov = entry.get("provider", "")
+        m_name = (entry.get("model") or "").strip()
+        is_bad = _model_is_bad(m_name) if m_name else False
+        is_oc_ex = (m_prov == "opencode" and (m_name in oc_ex or m_name.split("/", 1)[-1] in oc_ex))
+        entry["exhausted"] = bool(is_bad or is_oc_ex)
+    return catalog
 
 
 @ttl_cached(120.0)
@@ -3292,6 +3347,8 @@ def _pool_left(providers: List[Dict[str, Any]], provider: str, model: str) -> Op
     if not record:
         return None
     if provider == "opencode":
+        if _is_opencode_model_exhausted(model, providers):
+            return 0.0
         return 0.0 if (record.get("limited") or {}).get(model, {}).get("recent") else None
     pool = _select_pool(record, model)
     if not pool:
@@ -3357,20 +3414,24 @@ def _model_is_bad(model: str) -> bool:
         return False
     bad = _load_json("bad_models.json")
     entry = _match_bad_entry(bad, model)
-    if not entry:
-        return False
-    if isinstance(entry, dict) and ("reset_time" in entry or "resets_at" in entry):
-        rt = entry.get("reset_time") or entry.get("resets_at")
-        try:
-            return time.time() < float(rt)
-        except (TypeError, ValueError):
-            pass
-    ts = entry.get("timestamp") if isinstance(entry, dict) else entry
-    try:
-        ts_val = float(ts)
-    except (TypeError, ValueError):
-        return False
-    return (time.time() - ts_val) < 24 * 3600
+    if entry:
+        if isinstance(entry, dict) and ("reset_time" in entry or "resets_at" in entry):
+            rt = entry.get("reset_time") or entry.get("resets_at")
+            try:
+                return time.time() < float(rt)
+            except (TypeError, ValueError):
+                pass
+        else:
+            ts = entry.get("timestamp") if isinstance(entry, dict) else entry
+            try:
+                if (time.time() - float(ts)) < 24 * 3600:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    with contextlib.suppress(Exception):
+        if _is_opencode_model_exhausted(model):
+            return True
+    return False
 
 
 def _resolve_agy_model(model: str = "") -> str:
@@ -3453,7 +3514,7 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             if m["provider"] == "local":
                 model_name = choose_local_model(need_tools=False) or "local"
             elif m["provider"] == "opencode":
-                oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om)]
+                oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om) and not _is_opencode_model_exhausted(om, providers)]
                 model_name = oc_cand[0] if oc_cand else ""
             elif m["provider"] == "copilot":
                 cp_cand = [cm["model"] for cm in _copilot_models() if cm.get("model") and not _model_is_bad(cm["model"]) and not is_copilot_cli_refused(cm["model"])]
@@ -3461,6 +3522,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             else:
                 model_name = m["provider"]
         if not model_name or _model_is_bad(model_name):
+            continue
+        if m["provider"] == "opencode" and _is_opencode_model_exhausted(model_name, providers):
             continue
         if m["provider"] == "copilot" and is_copilot_cli_refused(model_name):
             continue
@@ -4742,6 +4805,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "code_hashes": file_hashes,
         "route": route_reason or (route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}."),
         "then": steps,
+        "review": review,
         "usage": {"input": 0, "output": 0, "cache_read": 0},
         "status": "pending_approval",
         "cmd": cmd,
@@ -6026,6 +6090,244 @@ def t_on_worker_done(worker_id: str, then: str = "") -> str:
     return f"[TRIGGERS FIRED] Worker `{worker_id}` already finished; started its follow-up steps."
 
 
+DEFAULT_STALL_TIMEOUT = 120.0
+
+QUOTA_ERROR_PATTERNS: Dict[str, List[str]] = {
+    "opencode": [
+        r"free\s*limit",
+        r"rate\s*limit",
+        r"\bquota\b",
+        r"usage\s*limit",
+        r"\binsufficient\b",
+        r"\b429\b",
+        r"too\s*many\s*requests",
+    ],
+    "antigravity": [
+        r"quota\s*exhausted",
+        r"quota\s*exceeded",
+        r"resource\s*exhausted",
+        r"resource_exhausted",
+        r"rate\s*limit",
+        r"usage\s*limit",
+        r"\b429\b",
+        r"\bquota\b",
+    ],
+    "claude": [
+        r"usage\s*limit\s*reached",
+        r"usage\s*limit",
+        r"rate\s*limit",
+        r"\bquota\b",
+        r"\b429\b",
+    ],
+    "copilot": [
+        r"not\s*available",
+        r"rate\s*limit",
+        r"\bquota\b",
+        r"usage\s*limit",
+        r"\b429\b",
+    ],
+    "*": [
+        r"free\s*limit",
+        r"rate\s*limit",
+        r"quota\s*exhausted",
+        r"quota\s*exceeded",
+        r"usage\s*limit\s*reached",
+        r"usage\s*limit",
+        r"\binsufficient\b",
+        r"\b429\b",
+    ],
+}
+
+
+def check_quota_error(provider: str, text: str) -> Optional[str]:
+    """Check text against provider's quota error patterns. Returns matched snippet if found."""
+    if not text:
+        return None
+    patterns = QUOTA_ERROR_PATTERNS.get(provider, []) + QUOTA_ERROR_PATTERNS.get("*", [])
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return None
+
+
+def get_stall_timeout(meta: Dict[str, Any]) -> float:
+    """Configurable stall timeout (default 120s; long thinking models get more)."""
+    cfg = _load_json("config.json")
+    val = (
+        meta.get("stall_timeout")
+        or os.environ.get("SUBWAY_STALL_TIMEOUT")
+        or (cfg.get("stall_timeout") if isinstance(cfg, dict) else None)
+        or (cfg.get("worker_stall_timeout") if isinstance(cfg, dict) else None)
+        or DEFAULT_STALL_TIMEOUT
+    )
+    try:
+        timeout = float(val)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_STALL_TIMEOUT
+    model = str(meta.get("model") or "").lower()
+    effort = str(meta.get("effort") or "").lower()
+    if "thinking" in model or effort in ("high", "max"):
+        timeout = max(timeout * 2, timeout + 120.0)
+    return timeout
+
+
+def _ping_launcher(launcher: str, text: str, from_id: str = "") -> None:
+    if not launcher:
+        return
+    _ensure_subway_dir()
+    targets = {launcher}
+    with contextlib.suppress(Exception):
+        res = resolve(launcher, strict=False)
+        if isinstance(res, dict) and "id" in res and res["id"]:
+            targets.add(res["id"])
+    inbox_dir = os.path.join(SUBWAY_DIR, "inbox")
+    os.makedirs(inbox_dir, exist_ok=True)
+    with contextlib.suppress(Exception):
+        with _state_lock("inbox"):
+            for tid in targets:
+                with open(os.path.join(inbox_dir, f"{tid}.jsonl"), "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "from": from_id or "subway",
+                        "shared_chat": None,
+                        "text": text,
+                    }) + "\n")
+
+
+def _handle_worker_exhaustion_or_stall(
+    worker_id: str,
+    meta: Dict[str, Any],
+    reason: str,
+    is_stall: bool = False,
+    reset_time: Optional[float] = None,
+) -> Dict[str, Any]:
+    """On quota/stall: stop worker, mark model exhausted, reroute once or mark failed."""
+    model = (meta.get("model") or "").strip()
+    if not model or model in ("auto", "inherit", "default"):
+        model = (meta.get("model_used") or "").strip()
+    if not model:
+        cmd = meta.get("cmd") or []
+        if "--model" in cmd:
+            idx = cmd.index("--model")
+            if idx + 1 < len(cmd):
+                model = cmd[idx + 1]
+    if not model:
+        model = meta.get("provider", "")
+
+    # Reset time when known, else a few hours
+    if reset_time is None and reason:
+        m_retry = re.search(r"retry\s+(?:after|in)\s+(\d+)", reason, re.IGNORECASE)
+        if m_retry:
+            reset_time = time.time() + float(m_retry.group(1))
+    if reset_time is None:
+        reset_time = time.time() + 4 * 3600
+
+    _mark_model_bad(model, reason=reason, reset_time=reset_time)
+    if "/" in model:
+        _mark_model_bad(model.split("/", 1)[1], reason=reason, reset_time=reset_time)
+
+    launcher = str(meta.get("launched_by") or "")
+
+    # Loop prevention: once per original task (no loops; keep a chain 'rerouted_from')
+    if meta.get("rerouted_from"):
+        fail_msg = f"Model '{model}' exhausted/stalled; worker `{worker_id}` was already rerouted from `{meta['rerouted_from']}`, not rerouting again."
+        _ping_launcher(launcher, fail_msg, from_id=worker_id)
+        return {"status": "failed", "exit_code": 1, "reason": fail_msg}
+
+    # Route next model
+    prompt = meta.get("prompt", "")
+    role = meta.get("role", "")
+    private = bool(meta.get("private"))
+    is_god = meta.get("mode") == "god"
+    route = route_task(prompt, role=role, private=private, god=is_god)
+    picks = route.get("picks", [])
+
+    excluded = {model.lower(), (model.split("/", 1)[1] if "/" in model else model).lower()}
+    binaries = {
+        "claude": find_claude_binary(),
+        "opencode": find_opencode_binary(),
+        "antigravity": find_agy_binary(),
+        "local": find_opencode_binary(),
+        "copilot": find_copilot_binary(),
+    }
+    for cid, cp in {p["id"]: p for p in load_custom_providers()}.items():
+        binaries[cid] = shutil.which(cp.get("bin", ""))
+
+    next_cand = None
+    for cand in picks:
+        cand_m = (cand.get("model") or "").lower()
+        cand_m_clean = (cand_m.split("/", 1)[1] if "/" in cand_m else cand_m).lower()
+        if cand_m in excluded or cand_m_clean in excluded:
+            continue
+        if _model_is_bad(cand.get("model") or ""):
+            continue
+        cand_prov = cand.get("provider", "")
+        if not binaries.get(cand_prov):
+            continue
+        next_cand = cand
+        break
+
+    if not next_cand:
+        fail_msg = f"Model '{model}' exhausted/stalled and no alternative model available to reroute: {route.get('reason', 'no candidates')}"
+        _ping_launcher(launcher, fail_msg, from_id=worker_id)
+        return {"status": "failed", "exit_code": 1, "reason": fail_msg}
+
+    # Spin same task (same prompt, project, review, priority, launcher)
+    spin_res = t_spin_worker(
+        role=meta.get("role", ""),
+        prompt=prompt,
+        provider=next_cand["provider"],
+        model=next_cand["model"],
+        project_dir=meta.get("project_dir", ""),
+        timeout_seconds=int(meta.get("timeout_seconds") or DEFAULT_WORKER_TIMEOUT),
+        effort=meta.get("effort", "auto"),
+        mode=meta.get("mode", "standard"),
+        permission_mode=meta.get("permission_mode", ""),
+        capabilities=meta.get("capabilities"),
+        budget_session_pct=(meta.get("budget") or {}).get("session_pct"),
+        budget_weekly_pct=(meta.get("budget") or {}).get("weekly_pct"),
+        max_budget_usd=(meta.get("budget") or {}).get("max_usd"),
+        isolate=bool(meta.get("isolate")),
+        priority=meta.get("priority", "normal"),
+        track=meta.get("track", "main"),
+        swarm_id=meta.get("swarm_id", ""),
+        review=meta.get("review", ""),
+    )
+
+    m_wid = re.search(r"Worker `(worker_[0-9a-f]+)`", spin_res)
+    if not m_wid:
+        fail_msg = f"Model '{model}' exhausted/stalled; reroute failed: {spin_res}"
+        _ping_launcher(launcher, fail_msg, from_id=worker_id)
+        return {"status": "failed", "exit_code": 1, "reason": fail_msg}
+
+    new_worker_id = m_wid.group(1)
+    with _state_lock("workers"):
+        new_meta = _load_worker(new_worker_id)
+        if new_meta:
+            new_meta["rerouted_from"] = worker_id
+            if meta.get("launched_by"):
+                new_meta["launched_by"] = meta.get("launched_by")
+            if meta.get("priority"):
+                new_meta["priority"] = meta.get("priority")
+            if meta.get("review"):
+                new_meta["review"] = meta.get("review")
+            if meta.get("then") and not new_meta.get("then"):
+                new_meta["then"] = meta.get("then")
+            _save_worker(new_meta)
+
+    ping_text = f"Worker `{worker_id}` model `{model}` exhausted/stalled. Task rerouted to `{next_cand['model']}` (`{new_worker_id}`)."
+    _ping_launcher(launcher, ping_text, from_id=worker_id)
+    t_broadcast_track(ping_text, track=meta.get("track", "main"), station_id=worker_id)
+
+    return {
+        "status": "stopped",
+        "exit_code": 0,
+        "reason": f"Model '{model}' exhausted/stalled; stopped and rerouted to `{new_worker_id}` ({next_cand['model']}).",
+        "rerouted_to": new_worker_id,
+    }
+
+
 def supervise_worker(worker_id: str) -> int:
     """Own one worker: enforce its timeout, relay permission requests, and record how it really ended."""
     meta = _load_worker(worker_id)
@@ -6151,6 +6453,34 @@ def supervise_worker(worker_id: str) -> int:
                                         stdout=subprocess.PIPE if (is_agy or is_claude or is_acp or is_copilot) else out, stderr=subprocess.STDOUT)
                 current["proc"] = proc
                 pump = None
+                stall_timeout = get_stall_timeout(meta)
+                stall_event = threading.Event()
+                start_time = time.time()
+                has_output = {"seen": False}
+                run["has_output"] = has_output
+
+                def stall_watchdog() -> None:
+                    while not stall_event.is_set() and not stopped["flag"]:
+                        if not has_output["seen"]:
+                            log_p = meta.get("log_file")
+                            if log_p and os.path.exists(log_p) and os.path.getsize(log_p) > 0:
+                                has_output["seen"] = True
+                            elif run.get("spent", 0) > 0:
+                                has_output["seen"] = True
+                        if not has_output["seen"] and (time.time() - start_time) >= stall_timeout:
+                            stopped["stall"] = f"No output at all for {int(stall_timeout)}s after start."
+                            stopped["flag"] = True
+                            if is_acp and run.get("conversation") and proc.poll() is None:
+                                with contextlib.suppress(Exception):
+                                    proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                                    proc.stdin.flush()
+                            if proc.poll() is None:
+                                proc.terminate()
+                            return
+                        stall_event.wait(0.2)
+
+                threading.Thread(target=stall_watchdog, daemon=True).start()
+
                 if is_agy or is_claude or is_acp or is_copilot:
                     run["spent"] = max(run.get("spent", 0), sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output")))
                     run["cap"], run["on_cap"] = turn_cap or int(budget.get("max_tokens") or 0), budget_stop
@@ -6164,6 +6494,7 @@ def supervise_worker(worker_id: str) -> int:
                 try:
                     code = proc.wait(timeout=remaining())
                 except subprocess.TimeoutExpired:
+                    stall_event.set()
                     if is_acp and run.get("conversation") and proc.poll() is None:
                         with contextlib.suppress(Exception):
                             proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
@@ -6178,6 +6509,7 @@ def supervise_worker(worker_id: str) -> int:
                     break
                 if pump:
                     pump.join(timeout=5)
+                    stall_event.set()
                     save_kwargs = {}
                     if run.get("model_used"):
                         meta["model_used"] = run["model_used"]
@@ -6198,6 +6530,11 @@ def supervise_worker(worker_id: str) -> int:
                         diff = run["spent"] - (int(usage.get("input") or 0) + int(usage.get("output") or 0))
                         usage["input"] = int(usage.get("input") or 0) + diff
                         save_progress(usage=usage)
+
+                if stopped.get("stall") or stopped.get("quota_error"):
+                    reason = str(stopped.get("stall") or stopped.get("quota_error"))
+                    result = _handle_worker_exhaustion_or_stall(worker_id, meta, reason, is_stall=bool(stopped.get("stall")))
+                    break
 
                 if stopped["flag"]:
                     fresh_meta = _load_worker(worker_id) or meta
@@ -6300,6 +6637,24 @@ def supervise_worker(worker_id: str) -> int:
                             used_m = cmd[idx + 1]
                     if used_m and used_m != "auto":
                         record_copilot_cli_accepted(used_m)
+
+                raw_out = run.get("raw_output") or ""
+                if not raw_out and os.path.exists(meta.get("log_file", "")):
+                    with contextlib.suppress(Exception):
+                        with open(meta["log_file"], "r", encoding="utf-8", errors="replace") as f:
+                            raw_out = f.read()
+
+                q_err = check_quota_error(meta.get("provider", ""), raw_out)
+                if not q_err:
+                    for extra in (str(run.get("last_error") or ""), str(run.get("response") or "")):
+                        if extra:
+                            q_err = check_quota_error(meta.get("provider", ""), extra)
+                            if q_err:
+                                break
+                if q_err:
+                    result = _handle_worker_exhaustion_or_stall(worker_id, meta, f"Quota/usage limit error: {q_err}", is_stall=False)
+                    break
+
                 if code != 0:
                     fresh_meta = _load_worker(worker_id) or meta
                     stop_r = fresh_meta.get("stop_reason") or ""
@@ -6652,9 +7007,11 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
             hit = None
             with contextlib.suppress(Exception):
                 hit = _fetch_opencode_usage().get("limit_hit")
-            if run.get("on_cap") and hit and hit.get("at", 0) >= began and hit.get("model") == meta.get("model"):
+            if hit and hit.get("at", 0) >= began and (not hit.get("model") or hit.get("model") == meta.get("model")):
                 send_cancel()
-                run["on_cap"](f"OpenCode's free limit was reached, so it stopped instead of sitting in a retry loop. {hit['message']}")
+                stopped["quota_error"] = f"OpenCode free limit reached: {hit['message']}"
+                stopped["flag"] = True
+                proc.terminate()
                 return
 
             toks = _opencode_session_tokens(sid)
