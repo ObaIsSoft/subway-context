@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.3.1 - 2026-11-02
+
+> [!IMPORTANT]
+> Chat budgets were one global value: a budget set in one chat blocked every other chat whose own total passed it. Budgets now belong to the chat that sets them.
+
+- **Per-chat budgets**: `subway-context budget chat <tokens>` typed in a chat sets that chat's own budget. Run in a terminal it sets a universal default (off unless you set it); `--chat <id>` sets one chat. A chat's budget never blocks another chat. Block and warning messages say whose budget it is and give the exact command. An old global chat budget becomes the universal default. The HUD settings card lists the universal default and each chat's own budget.
+- **GitHub Copilot as a provider**:
+  - Models come from Copilot Chat's own list on this Mac, one entry per model name, with other ids kept as aliases.
+  - Workers run through the Copilot CLI (`npm i -g @github/copilot`, then run `copilot` once to sign in; the VS Code sign-in isn't shared).
+  - Each worker records tokens (cached input included), AIC credits, requests, and the model `auto` picked.
+  - The CLI can refuse specific models on a plan (Copilot Free accepts only `auto`). Subway learns which, retries once with `auto`, and stops routing refused models to workers; it relearns after 7 days, so a plan upgrade is picked up.
+  - Routing follows the live chat allowance and the shared low-allowance rule; an empty chat allowance excludes Copilot. Inline completions are shown, never spent.
+  - Copilot appears in model rankings, the usage graph (from Copilot CLI sessions) and every HUD endpoint.
+- **Reviews**: Reviewers now receive the builder's task, so they judge the patch against it.
+- **Guard**: Workers can edit files in their own worktrees under `~/.subway-context/worktrees`; the rest of Subway's state stays off limits.
+- **HUD**: Rankings filters and graph colours come from the providers present; any new provider gets its own colour.
+- **Not yet**: Copilot Chat sessions can't be read or handed off from (next release). Subway still can't see OpenCode free-model quota, so a worker on an exhausted free model can stall.
+
 ## 1.3.0 - 2026-11-02
 
 > [!IMPORTANT]

@@ -1554,7 +1554,7 @@ class TestCopilotBudgets(unittest.TestCase):
             view = server._copilot_view({}, refresh=True)
             self.assertEqual(view["state"], "detected")
             self.assertEqual(view["pools"], [])
-            self.assertIn("Doesn't expose usage locally", view["note"])
+            self.assertIn("could not be read", view["note"])
 
     def test_copilot_models_usable_filter(self):
         from unittest.mock import patch
