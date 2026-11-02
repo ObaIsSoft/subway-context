@@ -212,5 +212,89 @@ class TestWorkerRulesAndReadGuard(unittest.TestCase):
             self.assertIsNone(server._large_file_read_denial(meta, "read_file", path))
 
 
+class TestThreadPermissionOverride(unittest.TestCase):
+    """A1: per-thread permission-mode overrides on top of the universal default."""
+
+    setUp = TestWorkerRulesAndReadGuard.setUp
+    tearDown = TestWorkerRulesAndReadGuard.tearDown
+    _spin_as = TestWorkerRulesAndReadGuard._spin_as
+
+    def test_get_permission_mode_thread_override_wins_over_universal(self):
+        server.set_permission_mode("auto_safe")
+        self.assertEqual(server.get_permission_mode("chat-1"), "auto_safe")
+        server.set_permission_mode("auto_approve", thread_id="chat-1")
+        self.assertEqual(server.get_permission_mode("chat-1"), "auto_approve")
+        # Other threads and the universal lookup are unaffected.
+        self.assertEqual(server.get_permission_mode("chat-2"), "auto_safe")
+        self.assertEqual(server.get_permission_mode(), "auto_safe")
+
+    def test_set_permission_mode_thread_clear_resets_to_universal(self):
+        server.set_permission_mode("auto_approve")
+        server.set_permission_mode("ask", thread_id="chat-1")
+        self.assertEqual(server.get_permission_mode("chat-1"), "ask")
+        msg = server.set_permission_mode("", thread_id="chat-1")
+        self.assertIn("reset to the universal mode", msg)
+        self.assertEqual(server.get_permission_mode("chat-1"), "auto_approve")
+
+    def test_set_permission_mode_invalid_mode_for_thread_errors_without_writing(self):
+        before = server._load_json("thread_settings.json")
+        result = server.set_permission_mode("not-a-mode", thread_id="chat-1")
+        self.assertTrue(result.startswith("Error:"))
+        self.assertEqual(server._load_json("thread_settings.json"), before)
+
+    def test_get_permission_mode_corrupt_thread_settings_falls_back_to_universal(self):
+        server.set_permission_mode("auto_safe")
+        path = os.path.join(server.SUBWAY_DIR, "thread_settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        self.assertEqual(server.get_permission_mode("chat-1"), "auto_safe")
+
+    def test_get_permission_mode_unknown_or_finished_thread_falls_back(self):
+        # A thread with no override, or one whose worker has already finished, just gets the universal mode.
+        server.set_permission_mode("ask")
+        self.assertEqual(server.get_permission_mode("worker_zzzzzz"), "ask")
+        self.assertEqual(server.get_permission_mode(""), "ask")
+
+    def test_spin_worker_direct_launch_uses_launching_chats_override(self):
+        server.set_permission_mode("ask")
+        server.set_permission_mode("auto_safe", thread_id="test-launcher")
+        child, _, _ = self._spin_as("")
+        self.assertEqual(child["permission_mode"], "auto_safe")
+
+    def test_spin_worker_explicit_permission_mode_beats_thread_default(self):
+        server.set_permission_mode("auto_safe", thread_id="test-launcher")
+        child, _, _ = self._spin_as("", permission_mode="ask")
+        self.assertEqual(child["permission_mode"], "ask")
+
+    def test_spin_worker_with_no_override_falls_back_to_universal(self):
+        server.set_permission_mode("auto_approve")
+        child, _, _ = self._spin_as("")
+        self.assertEqual(child["permission_mode"], "auto_approve")
+
+    def test_running_worker_keeps_its_mode_after_override_changes(self):
+        server.set_permission_mode("auto_safe", thread_id="test-launcher")
+        child, _, _ = self._spin_as("")
+        self.assertEqual(child["permission_mode"], "auto_safe")
+        server.set_permission_mode("ask", thread_id="test-launcher")
+        reloaded = server._load_worker(child["id"])
+        self.assertEqual(reloaded["permission_mode"], "auto_safe")
+
+    def test_thread_permission_rows_lists_overrides_with_labels(self):
+        server._save_worker({"id": "worker_bbbbbb", "role": "Sub Lead", "provider": "claude",
+                              "status": "running", "permission_mode": "ask", "launched_by": "test-launcher"})
+        server.set_permission_mode("auto_safe")
+        server.set_permission_mode("auto_approve", thread_id="worker_bbbbbb")
+        rows = server.thread_permission_rows()["threads"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["thread_id"], "worker_bbbbbb")
+        self.assertEqual(rows[0]["label"], "Sub Lead")
+        self.assertEqual(rows[0]["permission_mode"], "auto_approve")
+        self.assertEqual(rows[0]["universal"], "auto_safe")
+        self.assertTrue(rows[0]["is_worker"])
+
+    def test_thread_permission_rows_empty_when_no_overrides(self):
+        self.assertEqual(server.thread_permission_rows(), {"threads": []})
+
+
 if __name__ == "__main__":
     unittest.main()

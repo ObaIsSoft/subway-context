@@ -85,7 +85,7 @@ function render() {
   const open = [...pageBody.querySelectorAll("details[open] summary")].map((x) => x.closest(".card")?.querySelector(".provider-name")?.textContent);
   const views = {
     overview: () => overview(d), usage: () => usagePage(d), workers: () => workersPage(d),
-    threads: () => threadsPage(threads.chats, () => loadThreads(true), threads.error),
+    threads: () => threadsPage(d, threads.chats, () => loadThreads(true), threads.error),
     models: () => modelsPage(d),
     leases: () => leasesPage(d), ledger: () => ledgerPage(d, switchTrack),
     help: () => helpPage(),

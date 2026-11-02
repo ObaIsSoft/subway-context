@@ -1651,6 +1651,82 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertEqual(updated["status"], "budget_stopped")
         self.assertIn("token cap", updated.get("report", ""))
 
+    def _create_fake_agy_headless_denial(self):
+        """Prints Antigravity's headless-mode permission denial and exits clean, with no result event."""
+        script_path = os.path.join(self.test_dir, "fake_agy_denial.py")
+        code = (
+            "import sys\n"
+            "sys.stdout.write('jetski: no output produced \\u2014 a tool required the \"command\" permission "
+            "that headless mode cannot prompt for\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        return script_path
+
+    def _agy_worker_meta(self, worker_id, script_path, project_dir):
+        return {
+            "id": worker_id, "role": "Antigravity Builder", "provider": "antigravity",
+            "cmd": [sys.executable, script_path],
+            "project_dir": project_dir, "log_file": server._log_file(worker_id),
+            "status": "running", "pid": os.getpid(), "prompt": "edit the file",
+            "permission_mode": "auto_safe", "timeout_seconds": 10,
+        }
+
+    def test_headless_command_denial_with_changes_completes_with_warning(self):
+        script_path = self._create_fake_agy_headless_denial()
+        repo = os.path.join(self.test_dir, "agy_repo_with_changes")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        with open(os.path.join(repo, "note.txt"), "w", encoding="utf-8") as f:
+            f.write("a change the worker made\n")
+
+        worker_id = "worker_a9d001"
+        server._save_worker(self._agy_worker_meta(worker_id, script_path, repo))
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("command", updated.get("report", ""))
+
+    def test_headless_command_denial_with_no_changes_stays_failed(self):
+        script_path = self._create_fake_agy_headless_denial()
+        repo = os.path.join(self.test_dir, "agy_repo_no_changes")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+        worker_id = "worker_a9d002"
+        server._save_worker(self._agy_worker_meta(worker_id, script_path, repo))
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "failed")
+        self.assertIn("finished without producing a result", updated.get("report", ""))
+
+    def test_headless_command_denial_outside_git_repo_stays_failed(self):
+        script_path = self._create_fake_agy_headless_denial()
+        plain_dir = os.path.join(self.test_dir, "agy_not_a_repo")
+        os.makedirs(plain_dir)
+
+        worker_id = "worker_a9d003"
+        server._save_worker(self._agy_worker_meta(worker_id, script_path, plain_dir))
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "failed")
+
+
+class TestHeadlessPermissionDenialParsing(unittest.TestCase):
+    def test_matches_the_antigravity_headless_denial_text(self):
+        log = ('jetski: no output produced — a tool required the "command" permission '
+               'that headless mode cannot prompt for')
+        self.assertEqual(server._headless_permission_denial(log), "command")
+
+    def test_no_match_on_ordinary_log_text(self):
+        self.assertIsNone(server._headless_permission_denial("Finished. Added the missing test case."))
+        self.assertIsNone(server._headless_permission_denial(""))
+        self.assertIsNone(server._headless_permission_denial(None))
+
 
 class TestIsolatedWorkerOutcome(unittest.TestCase):
     def test_read_only_worker_with_no_changes_completes_with_reply(self):

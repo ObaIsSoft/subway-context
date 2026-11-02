@@ -31,7 +31,7 @@ export function modeControl(settings) {
   const current = settings.permission_mode;
   return h("section", { class: "card", "aria-labelledby": "mode-title" },
     h("div", {}, h("h2", { class: "card-title", id: "mode-title" }, "Worker permissions"),
-      h("div", { class: "card-sub" }, "How spun agents get permission to act. You can override this per worker.")),
+      h("div", { class: "card-sub" }, "How spun agents get permission to act. Any chat can override this for itself on the Chat threads page; a chat's override always wins over this universal default.")),
     h("div", { class: "seg", role: "group", "aria-labelledby": "mode-title" }, Object.entries(modes).map(([key, label]) =>
       h("button", { type: "button", "aria-pressed": String(key === current), on: { click: () => act("/api/settings", { permission_mode: key }) } }, label))),
     current === "auto_approve" ? h("div", { class: "err" }, "Workers will not ask before running commands.") : null);
@@ -1005,7 +1005,10 @@ export function leasesPage(d) {
 /* Copilot and other provider chat sessions, loaded from the read-only threads API. */
 export const threads = { chats: [], loadedAt: 0, loading: false, error: "" };
 
-export function threadsPage(chats, onRefresh, error = "") {
+export function threadsPage(d, chats, onRefresh, error = "") {
+  const settings = (d && d.settings) || {};
+  const modes = settings.permission_modes || {};
+  const universal = settings.permission_mode;
   const rows = (chats || []).map((chat) => {
     const updated = chat.updated
       ? new Date(typeof chat.updated === "number" ? chat.updated * 1000 : chat.updated).toLocaleString()
@@ -1016,16 +1019,28 @@ export function threadsPage(chats, onRefresh, error = "") {
       chat.model || "",
       chat.tokens != null ? `${tokens(chat.tokens)} tokens` : "",
     ].filter(Boolean);
+    const override = chat.permission_override;
+    const permSelect = chat.id ? h("select", {
+      "aria-label": `Permission mode for ${chat.title || chat.id}`,
+      on: { change: (ev) => act("/api/settings", { permission_mode: ev.target.value, thread: chat.id }) },
+    },
+      h("option", { value: "", selected: !override }, `Default: ${modes[universal] || universal || "?"}`),
+      Object.entries(modes).map(([key, label]) => h("option", { value: key, selected: key === override }, label))) : null;
+    const resetBtn = override ? h("button", {
+      class: "btn", type: "button",
+      on: { click: () => act("/api/settings", { permission_mode: "", thread: chat.id }) },
+    }, "Reset to universal") : null;
     return h("div", { class: "row" },
       h("div", {},
         h("b", {}, chat.title || "(untitled)"),
         h("div", { class: "row-sub" }, `${chat.source || ""} · ${chat.project || "No workspace"}${updated ? ` · ${updated}` : ""}`)),
-      labels.length ? h("div", { class: "tags" }, labels.map((label) => h("span", { class: "tag" }, label))) : null);
+      labels.length ? h("div", { class: "tags" }, labels.map((label) => h("span", { class: "tag" }, label))) : null,
+      permSelect ? h("div", { style: "display: flex; gap: 6px; align-items: center;" }, permSelect, resetBtn) : null);
   });
   return h("section", { class: "card" },
     h("div", { class: "card-head" },
       h("div", {}, h("h2", { class: "card-title" }, "Chat threads"),
-        h("div", { class: "card-sub" }, "Readable history is available on demand with read_chat; worker sessions are hidden by default.")),
+        h("div", { class: "card-sub" }, "Readable history is available on demand with read_chat; worker sessions are hidden by default. Each chat's permission mode can override the universal default.")),
       h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
     error ? h("div", { class: "err" }, `Could not refresh chat threads: ${error}`) : null,
     h("div", { class: "rows" }, rows.length ? rows : h("div", { class: "empty" }, "No chat threads found.")));

@@ -3455,6 +3455,17 @@ def _git_dirty_paths(project_dir: str) -> Optional[List[str]]:
     return [path for _, path in _git_status_entries(status.stdout)][:500]
 
 
+_HEADLESS_DENIAL_RE = re.compile(r'required the "([\w:.\-]+)" permission that headless mode cannot prompt for')
+
+
+def _headless_permission_denial(log_text: str) -> Optional[str]:
+    """The permission name refused, if the log shows a headless-mode denial the worker could not recover from
+    (e.g. Antigravity's auto_safe headless mode: 'a tool required the "command" permission that headless mode
+    cannot prompt for'). None otherwise."""
+    m = _HEADLESS_DENIAL_RE.search(log_text or "")
+    return m.group(1) if m else None
+
+
 def _settle_worker_result(result: Dict[str, Any], meta: Dict[str, Any], no_changes: bool, reply: str) -> None:
     if result.get("status") != "completed" or not no_changes:
         return
@@ -5434,8 +5445,27 @@ def enforce_budgets() -> None:
     except Exception as e:
         log("enforce_budgets error:", e)
 
-def set_permission_mode(mode: str) -> str:
-    """Only the HUD and terminal call this: agents can't loosen oversight for themselves."""
+def set_permission_mode(mode: str, thread_id: str = "") -> str:
+    """Only the HUD and terminal call this: agents can't loosen oversight for themselves.
+
+    With thread_id, sets (or with an empty mode, clears) that chat's or worker's own override
+    instead of the universal default. A thread override always wins over the universal mode
+    (see get_permission_mode)."""
+    thread_id = str(thread_id or "").strip()
+    if thread_id:
+        mode = _MODE_ALIASES.get(mode, mode) if mode else ""
+        if mode and mode not in PERMISSION_MODES:
+            return f"Error: mode must be one of {', '.join(PERMISSION_MODES)}."
+        with _state_lock("thread_settings"):
+            data = _load_json("thread_settings.json")
+            if mode:
+                data[thread_id] = {"permission_mode": mode}
+            else:
+                data.pop(thread_id, None)
+            _save_json("thread_settings.json", data)
+        if mode:
+            return f"[PERMISSION MODE] {thread_id}: {PERMISSION_MODES[mode]} (overrides the universal mode)."
+        return f"[PERMISSION MODE] {thread_id}: reset to the universal mode."
     mode = _MODE_ALIASES.get(mode, mode)
     if mode not in PERMISSION_MODES:
         return f"Error: mode must be one of {', '.join(PERMISSION_MODES)}."
@@ -5444,6 +5474,33 @@ def set_permission_mode(mode: str) -> str:
         data["permission_mode"] = mode
         _save_json("config.json", data)
     return f"[PERMISSION MODE] {PERMISSION_MODES[mode]}. Applies to workers queued from now on."
+
+
+def thread_permission_rows() -> Dict[str, Any]:
+    """One row per chat or worker with its own permission-mode override, for the HUD."""
+    overrides = _load_json("thread_settings.json")
+    if not overrides:
+        return {"threads": []}
+    titles = {}
+    with contextlib.suppress(Exception):
+        titles = {c["id"]: c.get("title") for c in all_chats("all") if c.get("id")}
+    universal = get_permission_mode()
+    rows = []
+    for thread_id, entry in overrides.items():
+        mode = (entry or {}).get("permission_mode") if isinstance(entry, dict) else None
+        if mode not in PERMISSION_MODES:
+            continue
+        worker = _load_worker(thread_id) if WORKER_ID_RE.match(thread_id) else None
+        label = titles.get(thread_id) or (worker.get("role") if worker else None) or _short_id(thread_id)
+        rows.append({
+            "thread_id": thread_id,
+            "label": label,
+            "permission_mode": mode,
+            "universal": universal,
+            "is_worker": bool(worker),
+        })
+    rows.sort(key=lambda r: r["label"])
+    return {"threads": rows}
 
 
 AGY_SAFE_COMMANDS = ["ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "mkdir", "git status", "git diff", "git log",
@@ -5836,7 +5893,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     lineage_parent = _lineage_parent()
     permission_mode, mode = _inherit_from_parent(lineage_parent, _MODE_ALIASES.get(permission_mode, permission_mode),
                                                  (mode or "standard").lower())
-    permission_mode = permission_mode or get_permission_mode()
+    permission_mode = permission_mode or get_permission_mode(_self_id())
     if permission_mode not in PERMISSION_MODES:
         return f"Error: unknown permission_mode '{permission_mode}'. Must be one of {', '.join(PERMISSION_MODES)}."
     selected_mode = (mode or "standard").lower()
@@ -8590,7 +8647,18 @@ def supervise_worker(worker_id: str) -> int:
                 elif is_acp and run.get("user_denied") and not run.get("response"):
                     result = {"status": "stopped", "exit_code": 0, "reason": "You denied its request, so it stopped."}
                 elif (is_agy or is_acp or is_copilot) and not run.get("response"):
-                    result = {"status": "failed", "exit_code": 0, "reason": "The agent finished without producing a result."}
+                    refused = _headless_permission_denial(raw_out)
+                    dirty = None
+                    if refused:
+                        with contextlib.suppress(OSError, subprocess.SubprocessError):
+                            dirty = _git_dirty_paths(meta.get("project_dir") or HOME)
+                    if refused and dirty:
+                        detail = run.get("last_tool") or f'the "{refused}" permission'
+                        result = {"status": "completed", "exit_code": 0,
+                                  "reason": f"Finished, but headless mode could not prompt for permission to run "
+                                            f"{detail}. Its changes are kept — review them."}
+                    else:
+                        result = {"status": "failed", "exit_code": 0, "reason": "The agent finished without producing a result."}
                 else:
                     result = {"status": "completed", "exit_code": 0}
                 break
@@ -11427,6 +11495,7 @@ def _compile_hud_data(project: str = "") -> Dict[str, Any]:
         "models_track": get_models_track(),
         "exhausted_models": get_exhausted_models(),
         "settings": {"permission_mode": get_permission_mode(), "permission_modes": PERMISSION_MODES,
+                     "thread_permissions": thread_permission_rows(),
                      "capacity": capacity(), "models": model_catalog(), "benchmarks": benchmarks_meta,
                      "chat_budget": cfg_data.get("chat_budget_default") or cfg_data.get("chat_budget_tokens", 0),
                      "chat_budgets": chat_budget_rows(),
@@ -11911,6 +11980,13 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 aliases.setdefault(str(chat_id), []).append(alias)
             chats = all_chats(source, include_subagents=include_subagents)
             chats.sort(key=lambda c: (bool(c.get("open")), sort_key_ts(c.get("updated"))), reverse=True)
+            thread_overrides = _load_json("thread_settings.json")
+
+            def _override_mode(cid: str) -> Optional[str]:
+                entry = thread_overrides.get(str(cid or ""))
+                mode = entry.get("permission_mode") if isinstance(entry, dict) else None
+                return mode if mode in PERMISSION_MODES else None
+
             self.send_json({"chats": [{
                 "source": c.get("source"), "id": c.get("id"), "title": c.get("title"),
                 "project": c.get("project"), "updated": c.get("updated"), "open": bool(c.get("open")),
@@ -11919,6 +11995,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 "surface": c.get("surface") or "", "model": c.get("model") or "",
                 "tokens": c.get("tokens"), "usage": c.get("usage"),
                 "aliases": aliases.get(str(c.get("id")), []),
+                "permission_override": _override_mode(c.get("id")),
             } for c in chats[:limit]], "total": len(chats)})
             return
 
@@ -12033,7 +12110,8 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/settings":
             res = {}
             if "permission_mode" in payload:
-                res["permission_mode"] = set_permission_mode(str(payload.get("permission_mode", "")))
+                res["permission_mode"] = set_permission_mode(str(payload.get("permission_mode", "")),
+                                                              thread_id=str(payload.get("thread", "")))
             if "compaction" in payload:
                 c_val = str(payload.get("compaction", "")).lower().strip()
                 if c_val not in ("suggest", "auto", "never"):
@@ -12307,7 +12385,7 @@ TOOLS = {
             "effort": {"type": "string", "enum": ["auto", "low", "medium", "high", "max"], "default": "auto"},
             "mode": {"type": "string", "enum": ["standard", "god"], "default": "standard", "description": "'god' turns permission prompts off. Only with your user's explicit request."},
             "permission_mode": {"type": "string", "enum": ["ask", "auto_safe", "auto_approve"],
-                                "description": "Omit to use your user's default. 'ask' sends every request to this chat and the HUD. 'auto_safe' auto-approves a read-only list. 'auto_approve' never asks: use it only if your user said so."},
+                                "description": "Omit to use this chat's effective mode: its own per-chat override if your user set one, else their universal default. A per-chat override always wins over the universal default. 'ask' sends every request to this chat and the HUD. 'auto_safe' auto-approves a read-only list. 'auto_approve' never asks: use it only if your user said so."},
             "capabilities": {"type": "array", "items": {"type": "string", "enum": sorted(VALID_CAPABILITIES)}, "description": "Default: files:read, files:write, terminal:safe."},
             "budget_session_pct": {"type": "number", "description": "Most of the 5-hour limit this worker may use, in points. Checked before it starts, and it's stopped when reached."},
             "budget_weekly_pct": {"type": "number", "description": "Most of the weekly limit this worker may use, in points. Checked before it starts, and it's stopped when reached."},
