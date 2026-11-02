@@ -1926,14 +1926,8 @@ def t_send_note(to: str, text: str, from_chat: str = "", share_chat: str = "") -
         det_id = det["id"]
         if from_chat:
             if not _id_matches(from_chat, det_id):
-                is_w, launcher = _is_authorized_worker(from_chat, det_id)
-                if is_w:
-                    sender = from_chat
-                    parent = launcher
-                else:
-                    return f"Error: caller is '{det_id}', cannot send note as '{from_chat}'."
-            else:
-                sender = from_chat
+                return f"Error: caller is '{det_id}', cannot send note as '{from_chat}'."
+            sender = from_chat
         else:
             sender = _short_id(det_id)
         if not parent:
@@ -2004,7 +1998,8 @@ def t_check_notes(my_chat_id: str = "", keep: bool = False) -> str:
     if corrupt:
         out.append(f"> {corrupt} unreadable line(s) were skipped.")
     for r in recs:
-        out.append(f"\n## From {_short_id(str(r.get('from', '?')))} at {r.get('ts')}\n{r.get('text', '')}")
+        unv_note = " [unverified]" if r.get("unverified") else ""
+        out.append(f"\n## From {_short_id(str(r.get('from', '?')))} at {r.get('ts')}{unv_note}\n{r.get('text', '')}")
         sc = r.get("shared_chat")
         if sc:
             out.append(f"Transit link: {sc['source'].upper()} `{sc['id']}` ({sc.get('title')}). "
@@ -2208,10 +2203,7 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
         det_id = det["id"]
         if holder:
             if not _id_matches(holder, det_id):
-                is_w, _ = _is_authorized_worker(holder, det_id)
-                if not is_w:
-                    return f"Error: caller is '{det_id}', cannot claim file as '{holder}'."
-                me_id = det_id
+                return f"Error: caller is '{det_id}', cannot claim file as '{holder}'."
             else:
                 me_id = det_id
         else:
@@ -2231,6 +2223,8 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
 
     head = _git_head(path)
     override = ""
+    worker = _load_worker(me_id)
+    parent = worker.get("launched_by") if worker else None
     with _state_lock("locks"):
         now = time.time()
         data = load_locks()
@@ -2271,15 +2265,20 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
             "role": role,
             "status": "LEASED",
         }
+        if parent:
+            locks[path]["parent"] = parent
         if is_unverified:
             locks[path]["unverified"] = True
         data["authors"][path] = {"holder": holder, "holder_id": me_id}
+        if parent:
+            data["authors"][path]["parent"] = parent
         if is_unverified:
             data["authors"][path]["unverified"] = True
         save_locks(data)
 
     if override:
-        _broadcast_track_internal(override, track="main", files=[path], station_id=holder)
+        _broadcast_track_internal(override, track="main", files=[path], station_id=holder,
+                                  parent=parent, is_unverified=is_unverified)
     exp_iso = _dt.datetime.fromtimestamp(expires_at).astimezone().strftime("%H:%M:%S")
     base_note = f" (baseline: {baseline})" if baseline else ""
     unv_note = " [unverified]" if is_unverified else ""
@@ -2300,10 +2299,7 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
         det_id = det["id"]
         if reviewer:
             if not _id_matches(reviewer, det_id):
-                is_w, _ = _is_authorized_worker(reviewer, det_id)
-                if not is_w:
-                    return f"Error: caller is '{det_id}', cannot sign off as '{reviewer}'."
-                me_id = det_id
+                return f"Error: caller is '{det_id}', cannot sign off as '{reviewer}'."
             else:
                 me_id = det_id
         else:
@@ -2317,6 +2313,8 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
     is_approved = verdict.strip().lower() in ("approved", "accept", "pass", "good")
     status_str = "APPROVED" if is_approved else "NEEDS_WORK"
     commit_sha = _git_head(path) or "uncommitted"
+    worker = _load_worker(me_id)
+    parent = worker.get("launched_by") if worker else None
 
     with _state_lock("locks"):
         data = load_locks()
@@ -2333,6 +2331,8 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
             "timestamp": time.time(),
             "time_iso": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if parent:
+            data["signoffs"][path]["parent"] = parent
         if is_unverified:
             data["signoffs"][path]["unverified"] = True
         save_locks(data)
@@ -2340,7 +2340,7 @@ def t_signoff_file(filepath: str, verdict: str = "approved", notes: str = "", re
     final_notes = data["signoffs"][path]["notes"]
     _broadcast_track_internal(f"[SIGNOFF: {status_str}] '{path}' evaluated by {reviewer} at commit {commit_sha}. Notes: {final_notes}",
                               track="main", files=[path], decisions=[f"Sign-off {status_str} by {reviewer}"],
-                              station_id=reviewer)
+                              station_id=reviewer, parent=parent, is_unverified=is_unverified)
     unv_note = " [unverified]" if is_unverified else ""
     if is_approved:
         return f"[SIGNOFF: APPROVED] '{path}' marked approved by {reviewer}{unv_note} (commit: {commit_sha}). Regression Shield active."
@@ -2364,23 +2364,25 @@ def t_release_file(filepath: str, holder: str = "", project_dir: str = "", force
         det = _detected_chat()
         if det is not None:
             det_id = det["id"]
-            if holder and not _id_matches(holder, det_id):
-                is_w, _ = _is_authorized_worker(holder, det_id)
-                if not is_w:
-                    return f"Error: caller is '{det_id}', cannot release as '{holder}'."
-
             owns_lock = _id_matches(det_id, lock_holder_id) or _id_matches(det_id, lock_holder)
-            if not owns_lock:
-                is_w, launcher = _is_authorized_worker(lock_holder, det_id)
-                if is_w:
-                    owns_lock = True
-                elif lock_holder_id:
-                    is_w2, _ = _is_authorized_worker(lock_holder_id, det_id)
-                    if is_w2:
-                        owns_lock = True
+            worker_id = lock_holder_id if WORKER_ID_RE.match(lock_holder_id or "") else lock_holder
+            worker = _load_worker(worker_id) if WORKER_ID_RE.match(worker_id or "") else None
+            if worker:
+                worker = _update_worker_status(worker)
+            worker_ended = bool(worker and worker.get("status") and
+                                worker.get("status") not in ACTIVE_WORKER_STATES)
+            launcher_cleanup = bool(worker_ended and _id_matches(worker.get("launched_by"), det_id))
+
+            if holder and not _id_matches(holder, det_id):
+                requested_worker = bool(launcher_cleanup and _id_matches(holder, worker_id))
+                if not requested_worker:
+                    return f"Error: caller is '{det_id}', cannot release as '{holder}'."
+            if not owns_lock and launcher_cleanup:
+                owns_lock = True
 
             if not owns_lock:
                 return f"Error: file '{path}' is held by '{lock_holder}', caller '{det_id}' cannot release another chat's lock."
+            released_for = worker_id if launcher_cleanup and not _id_matches(det_id, worker_id) else ""
         else:
             me_id = _self_id()
             caller_holder = holder or _short_id(me_id)
@@ -2391,7 +2393,8 @@ def t_release_file(filepath: str, holder: str = "", project_dir: str = "", force
 
         del data["locks"][path]
         save_locks(data)
-    return f"[RELEASED] '{path}' is now free for modification by any agent."
+    release_note = f" released by {det_id} for ended worker {released_for}" if det is not None and released_for else ""
+    return f"[RELEASED] '{path}' is now free for modification by any agent.{release_note}"
 
 
 def t_list_locks() -> str:
@@ -2610,16 +2613,9 @@ def t_broadcast_track(message: str, track: str = "main", files: Optional[List[st
     if det is not None:
         det_id = det["id"]
         if station_id and not _id_matches(station_id, det_id):
-            is_worker, launcher = _is_authorized_worker(station_id, det_id)
-            if not is_worker:
-                return f"Error: caller is '{det_id}', cannot broadcast as '{station_id}'."
-            parent = launcher
+            return f"Error: caller is '{det_id}', cannot broadcast as '{station_id}'."
         if session_id and not _id_matches(session_id, det_id):
-            is_worker, launcher = _is_authorized_worker(session_id, det_id)
-            if not is_worker:
-                return f"Error: caller is '{det_id}', cannot broadcast as '{session_id}'."
-            if not parent:
-                parent = launcher
+            return f"Error: caller is '{det_id}', cannot broadcast as '{session_id}'."
 
         if not station_id:
             station_id = _short_id(det_id)
@@ -9703,7 +9699,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 message=str(payload.get("message", "")), track=str(payload.get("track", "main")),
                 files=[str(f) for f in payload.get("files") or []],
                 decisions=[str(d) for d in payload.get("decisions") or []],
-                station_id=str(payload.get("station_id") or "web-hud"), session_id=str(payload.get("session_id", "")))
+                station_id="user (HUD)")
         elif path == "/api/approve_worker":
             res = _launch_worker(str(payload.get("id", "")))  # The HUD token proves this is the user.
         elif path == "/api/reject_worker":

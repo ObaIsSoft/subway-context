@@ -709,6 +709,25 @@ class TestHTTPServer(SubwayTestCase):
         self.assertEqual(code, 400)
         self.assertIn(b"invalid worker id", body)
 
+    def test_hud_broadcast_uses_user_identity_and_requires_token(self):
+        body = json.dumps({
+            "message": "HUD update",
+            "track": "hud_identity",
+            "station_id": "forged-station",
+            "session_id": "forged-session",
+        }).encode()
+        headers = {"Content-Type": "application/json"}
+        code, response, _ = self._request("/api/broadcast", method="POST", headers=headers, body=body)
+        self.assertEqual(code, 401)
+        self.assertIn(b"Missing or invalid token", response)
+
+        headers["X-Subway-Token"] = self.token
+        code, _, _ = self._request("/api/broadcast", method="POST", headers=headers, body=body)
+        self.assertEqual(code, 200)
+        entry = server.read_track_entries("hud_identity")[-1]
+        self.assertEqual(entry["station_id"], "user (HUD)")
+        self.assertEqual(entry["session_id"], "user (HUD)")
+
     def test_spawn_never_launches(self):
         payload = json.dumps({"role": "Linter", "prompt": "lint files"}).encode("utf-8")
         code, body, _ = self._request("/api/spawn", method="POST", headers={
@@ -1662,6 +1681,96 @@ class TestLedgerIdentity(SubwayTestCase):
             canon = server._canon_path(claim_file)
             self.assertTrue(server.load_locks()["locks"][canon].get("unverified"))
 
+            signoff_file = os.path.join(self.test_dir, "unverified_signoff.txt")
+            sign_res = server.t_signoff_file(signoff_file, verdict="needs_work", reviewer="unknown-reviewer")
+            self.assertIn("[unverified]", sign_res)
+            signoff_entry = server.read_track_entries("main")[-1]
+            self.assertTrue(signoff_entry.get("unverified"))
+            self.assertIn("[unverified]", server.t_read_track("main"))
+
+            with unittest.mock.patch.object(
+                    server, "resolve",
+                    side_effect=lambda ident, strict=False: {
+                        "id": ident, "source": "test", "title": ident,
+                    }):
+                server.t_send_note(to="unverified-recipient", text="Unverified dispatch")
+                notes = server.t_check_notes(my_chat_id="unverified-recipient")
+            self.assertIn("[unverified]", notes)
+
+    def test_launcher_cannot_write_as_worker_but_worker_records_parent(self):
+        worker_id = "worker_abcdef"
+        server._save_worker({
+            "id": worker_id,
+            "role": "tester",
+            "launched_by": "launcher-chat",
+            "status": "running",
+        })
+
+        server._self_id = lambda: "launcher-chat"
+        self.assertIn("cannot broadcast as", server.t_broadcast_track(
+            "forged", track="worker_identity", station_id=worker_id))
+        self.assertIn("cannot broadcast as", server.t_broadcast_track(
+            "forged session", track="worker_identity", session_id=worker_id))
+        self.assertIn("cannot send note as", server.t_send_note(
+            to="recipient", text="forged", from_chat=worker_id))
+        self.assertIn("cannot claim file as", server.t_claim_file(
+            os.path.join(self.test_dir, "forged_claim.txt"), holder=worker_id))
+        self.assertIn("cannot sign off as", server.t_signoff_file(
+            os.path.join(self.test_dir, "forged_signoff.txt"), reviewer=worker_id))
+
+        server._self_id = lambda: worker_id
+        claim_file = os.path.join(self.test_dir, "worker_claim.txt")
+        self.assertIn("[LEASE ACQUIRED]", server.t_claim_file(claim_file, holder=worker_id))
+        claim = server.load_locks()["locks"][server._canon_path(claim_file)]
+        self.assertEqual(claim["parent"], "launcher-chat")
+
+        signoff_file = os.path.join(self.test_dir, "worker_signoff.txt")
+        server.t_signoff_file(signoff_file, verdict="needs_work", reviewer=worker_id)
+        signoff = server.load_locks()["signoffs"][server._canon_path(signoff_file)]
+        self.assertEqual(signoff["parent"], "launcher-chat")
+        self.assertEqual(server.read_track_entries("main")[-1]["parent"], "launcher-chat")
+
+        with unittest.mock.patch.object(
+                server, "resolve",
+                return_value={"id": "recipient-chat", "source": "test", "title": "recipient"}):
+            server.t_send_note(to="recipient-chat", text="Worker dispatch", from_chat=worker_id)
+        with open(os.path.join(server.SUBWAY_DIR, "inbox", "recipient-chat.jsonl"), encoding="utf-8") as f:
+            note = json.loads(f.readline())
+        self.assertEqual(note["from"], worker_id)
+        self.assertEqual(note["parent"], "launcher-chat")
+
+        server.t_broadcast_track(
+            "worker update", track="worker_identity", station_id=worker_id, session_id=worker_id)
+        entry = server.read_track_entries("worker_identity")[-1]
+        self.assertEqual(entry["station_id"], worker_id)
+        self.assertEqual(entry["parent"], "launcher-chat")
+
+    def test_launcher_can_release_only_ended_own_worker_lock(self):
+        worker_id = "worker_123abc"
+        server._save_worker({
+            "id": worker_id,
+            "launched_by": "launcher-chat",
+            "status": "running",
+            "pid": os.getpid(),
+        })
+        filepath = os.path.join(self.test_dir, "worker_release.txt")
+        server._self_id = lambda: worker_id
+        self.assertIn("[LEASE ACQUIRED]", server.t_claim_file(filepath, holder=worker_id))
+
+        server._self_id = lambda: "launcher-chat"
+        with unittest.mock.patch.object(server, "_is_authorized_worker", return_value=(True, "launcher-chat")):
+            self.assertIn("cannot release another chat's lock", server.t_release_file(filepath))
+        self.assertIn(server._canon_path(filepath), server.load_locks()["locks"])
+
+        server._save_worker({
+            "id": worker_id,
+            "launched_by": "launcher-chat",
+            "status": "completed",
+        })
+        result = server.t_release_file(filepath)
+        self.assertIn(f"released by launcher-chat for ended worker {worker_id}", result)
+        self.assertNotIn(server._canon_path(filepath), server.load_locks()["locks"])
+
     def test_worker_posting_as_itself_works(self):
         worker_id = "worker_123456"
         meta = {
@@ -1685,12 +1794,10 @@ class TestLedgerIdentity(SubwayTestCase):
         self.assertEqual(last.get("parent"), "launcher-chat")
         self.assertFalse(last.get("unverified", False))
 
-        # Launcher posting on behalf of worker also works
+        # A launcher cannot spoof its worker's identity.
         server._self_id = lambda: "launcher-chat"
         res2 = server.t_broadcast_track("Report from launcher", track="main", station_id=worker_id)
-        self.assertIn("[BROADCAST]", res2)
-        entries = server.read_track_entries("main")
-        self.assertEqual(entries[-1]["parent"], "launcher-chat")
+        self.assertIn("cannot broadcast as", res2)
 
         # Intruder trying to post as worker fails
         server._self_id = lambda: "intruder-chat"
