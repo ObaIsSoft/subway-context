@@ -245,6 +245,117 @@ class TestCopilotIntegration(unittest.TestCase):
         self.assertNotIn("Work only in this repo", child_prompt)
         self.assertLess(child_prompt.index("TASK:"), child_prompt.index("PREVIOUS WORKER"))
 
+    def test_copilot_auto_cli_catalog_entry(self):
+        server._model_catalog.clear()
+        with patch.object(server, "find_copilot_binary", return_value=None):
+            catalog_no_cli = server.model_catalog()
+            copilot_autos = [m for m in catalog_no_cli if m.get("provider") == "copilot" and m.get("model") == "auto"]
+            self.assertEqual(len(copilot_autos), 0)
+
+        server._model_catalog.clear()
+        with patch.object(server, "find_copilot_binary", return_value="/usr/local/bin/copilot"):
+            catalog_cli = server.model_catalog()
+            copilot_autos = [m for m in catalog_cli if m.get("provider") == "copilot" and m.get("model") == "auto"]
+            self.assertEqual(len(copilot_autos), 1)
+
+    def test_route_task_copilot_chat_allowance(self):
+        healthy_raw = {
+            "quota_snapshots": {
+                "chat": {"remaining": 100, "entitlement": 200, "percent_remaining": 50.0, "unlimited": False},
+                "premium_interactions": {"remaining": 0, "entitlement": 0, "unlimited": False}
+            }
+        }
+        low_raw = {
+            "quota_snapshots": {
+                "chat": {"remaining": 10, "entitlement": 200, "percent_remaining": 5.0, "unlimited": False},
+                "premium_interactions": {"remaining": 0, "entitlement": 0, "unlimited": False}
+            }
+        }
+        zero_raw = {
+            "quota_snapshots": {
+                "chat": {"remaining": 0, "entitlement": 200, "percent_remaining": 0.0, "unlimited": False},
+                "premium_interactions": {"remaining": 0, "entitlement": 0, "unlimited": False}
+            }
+        }
+        provs = [
+            {"id": "copilot", "client": {"dispatchable": True}},
+            {"id": "antigravity", "client": {"dispatchable": True}}
+        ]
+        with patch.object(server, "_copilot_models", return_value=[{"model": "copilot-small", "coding": 2, "reasoning": 2, "writing": 2}]):
+            server._model_catalog.clear()
+            # Healthy chat pool picks Copilot for a small task when it is cheapest
+            with patch.object(server, "_copilot_raw", return_value=healthy_raw):
+                res_healthy = server.route_task("fix typo in readme", providers=provs)
+                self.assertEqual(res_healthy["picks"][0]["provider"], "copilot")
+
+            # Chat under shed_at_pct demotes it
+            with patch.object(server, "_copilot_raw", return_value=low_raw):
+                res_low = server.route_task("fix typo in readme", providers=provs)
+                self.assertNotEqual(res_low["picks"][0]["provider"], "copilot")
+
+            # Chat 0 excludes it
+            with patch.object(server, "_copilot_raw", return_value=zero_raw):
+                res_zero = server.route_task("fix typo in readme", providers=provs)
+                self.assertFalse(any(p["provider"] == "copilot" for p in res_zero["picks"]))
+
+    def test_token_counting_model_metrics(self):
+        ev = {
+            "type": "session.usage_checkpoint",
+            "data": {
+                "tokenDetails": {
+                    "input": {"tokenCount": 3},
+                    "output": {"tokenCount": 100},
+                    "cache_read": {"tokenCount": 50}
+                },
+                "modelMetrics": {
+                    "gpt-4o": {
+                        "usage": {
+                            "inputTokens": 25000,
+                            "outputTokens": 100,
+                            "cacheReadTokens": 50,
+                            "cacheWriteTokens": 0
+                        }
+                    }
+                }
+            }
+        }
+        run = {}
+        server._process_copilot_event(ev, run, lambda text: None)
+        self.assertEqual(run["usage"]["input_tokens"], 25000)
+        self.assertEqual(run["usage"]["output_tokens"], 100)
+        self.assertEqual(run["spent"], 25100)
+
+    def test_copilot_models_deduplicate(self):
+        raw_models = [
+            {"id": "mai-code-1-flash-4th", "name": "MAI-Code-1.1-Flash", "policy": {"state": "enabled"}},
+            {"id": "mai-code-1.1-flash", "name": "MAI-Code-1.1-Flash", "policy": {"state": "enabled"}},
+            {"id": "mai-code-1-flash-secondary", "name": "MAI-Code-1.1-Flash", "policy": {"state": "enabled"}},
+            {"id": "mai-code-1-flash-tertiary", "name": "MAI-Code-1.1-Flash", "policy": {"state": "enabled"}},
+            {"id": "kimi-k3-copilot", "name": "Kimi K3 (GitHub)", "policy": {"state": "enabled"}},
+            {"id": "kimi-k3-base", "name": "Kimi K3 (GitHub)", "policy": {"state": "enabled"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_dir = os.path.join(tmp_dir, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws1", "GitHub.copilot-chat", "debug-logs", "run1")
+            os.makedirs(model_dir, exist_ok=True)
+            with open(os.path.join(model_dir, "models.json"), "w", encoding="utf-8") as f:
+                json.dump(raw_models, f)
+
+            def fake_expand(p):
+                if p.startswith("~/"):
+                    return os.path.join(tmp_dir, p[2:])
+                return tmp_dir if p == "~" else p
+
+            with patch("os.path.expanduser", side_effect=fake_expand):
+                server._copilot_models.clear()
+                models = server._copilot_models()
+                self.assertEqual(len(models), 2)
+                mai = next(m for m in models if m["name"] == "MAI-Code-1.1-Flash")
+                kimi = next(m for m in models if m["name"] == "Kimi K3 (GitHub)")
+                self.assertEqual(mai["model"], "mai-code-1.1-flash")
+                self.assertEqual(set(mai["aliases"]), {"mai-code-1-flash-4th", "mai-code-1-flash-secondary", "mai-code-1-flash-tertiary"})
+                self.assertEqual(kimi["model"], "kimi-k3-base")
+                self.assertEqual(kimi["aliases"], ["kimi-k3-copilot"])
+
 
 if __name__ == "__main__":
     unittest.main()

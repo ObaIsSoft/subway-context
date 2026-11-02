@@ -2750,7 +2750,6 @@ DEFAULT_MODELS: List[Dict[str, Any]] = [
     {"provider": "antigravity", "model": "gemini-3.8-flash-medium", "coding": 3, "reasoning": 3, "writing": 3},
     {"provider": "claude", "model": "haiku", "coding": 2, "reasoning": 2, "writing": 3},
     {"provider": "antigravity", "model": "gemini-3.8-flash-low", "coding": 2, "reasoning": 2, "writing": 2},
-    {"provider": "copilot", "model": "auto", "coding": 3, "reasoning": 3, "writing": 3},
     {"provider": "opencode", "model": "", "coding": 2, "reasoning": 2, "writing": 2},
     {"provider": "local", "model": "", "coding": 1, "reasoning": 1, "writing": 2},
 ]
@@ -3024,6 +3023,7 @@ def _copilot_models() -> List[Dict[str, Any]]:
     if not isinstance(data, list):
         return []
     usable: List[Dict[str, Any]] = []
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
     for entry in data:
         if not isinstance(entry, dict):
             continue
@@ -3034,13 +3034,32 @@ def _copilot_models() -> List[Dict[str, Any]]:
             m_id = entry.get("id")
             if not m_id:
                 continue
-            usable.append({
-                "model": m_id,
-                "name": entry.get("name"),
-                "vendor": entry.get("vendor"),
-                "price_band": entry.get("model_picker_price_category"),
-                "default": is_default,
-            })
+            name = entry.get("name") or m_id
+            by_name.setdefault(name, []).append(entry)
+
+    def _pref_copilot_key(e: Dict[str, Any]) -> Tuple[int, int, str]:
+        eid = e.get("id") or ""
+        ename = e.get("name") or ""
+        slug = re.sub(r"[^\w.-]+", "-", ename.lower()).strip("-")
+        is_def = bool(e.get("is_chat_default"))
+        matches_slug = (eid.lower() == slug.lower())
+        prio = 0 if matches_slug else (1 if is_def else 2)
+        return (prio, len(eid), eid)
+
+    for name, entries in by_name.items():
+        sorted_entries = sorted(entries, key=_pref_copilot_key)
+        best = sorted_entries[0]
+        aliases = [e.get("id") for e in sorted_entries[1:] if e.get("id")]
+        res_entry = {
+            "model": best.get("id"),
+            "name": best.get("name"),
+            "vendor": best.get("vendor"),
+            "price_band": best.get("model_picker_price_category"),
+            "default": bool(best.get("is_chat_default")),
+        }
+        if aliases:
+            res_entry["aliases"] = aliases
+        usable.append(res_entry)
     return usable
 
 def _catalog_stamp() -> Tuple[float, ...]:
@@ -3062,10 +3081,12 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
     b_rows = b_data.get("rows") if isinstance(b_data, dict) else []
     oc_models = _opencode_models()
     cp_models = _copilot_models()
+    has_copilot_cli = bool(find_copilot_binary())
     all_models_to_bench = (
         list(DEFAULT_MODELS)
         + [{"provider": "opencode", "model": m} for m in oc_models]
         + [{"provider": "copilot", "model": m["model"]} for m in cp_models]
+        + ([{"provider": "copilot", "model": "auto"}] if has_copilot_cli else [])
     )
     b_strengths = benchmark_strengths(b_rows, all_models_to_bench) if isinstance(b_rows, list) else {}
 
@@ -3126,6 +3147,25 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
                 entry["vendor"] = cp_m["vendor"]
             if m_id in b_strengths:
                 s = b_strengths[m_id]
+                entry["coding"] = s
+                entry["reasoning"] = s
+                entry["writing"] = s
+                entry["source"] = "benchmark"
+            catalog_map[key] = entry
+
+    if has_copilot_cli:
+        key = ("copilot", "auto")
+        if key not in catalog_map:
+            entry = {
+                "provider": "copilot",
+                "model": "auto",
+                "coding": 3,
+                "reasoning": 3,
+                "writing": 3,
+                "source": "default",
+            }
+            if "auto" in b_strengths:
+                s = b_strengths["auto"]
                 entry["coding"] = s
                 entry["reasoning"] = s
                 entry["writing"] = s
@@ -3309,18 +3349,33 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     stats = _load_model_stats()
     raw_copilot = _copilot_raw()
     copilot_limited = False
+    copilot_exhausted = False
+    copilot_chat_low = False
     if isinstance(raw_copilot, dict):
         snaps = raw_copilot.get("quota_snapshots") or {}
         chat = snaps.get("chat") or {}
         prem = snaps.get("premium_interactions") or {}
         shed_pct = _load_json("config.json").get("shed_at_pct", 20)
         chat_ent = chat.get("entitlement", 0)
-        chat_finite = (not chat.get("unlimited", False)) and (chat_ent > 0)
+        chat_unl = bool(chat.get("unlimited", False))
+        chat_rem = chat.get("remaining")
+        chat_pct = chat.get("percent_remaining")
+        if chat_pct is None and chat_ent > 0 and chat_rem is not None:
+            chat_pct = (chat_rem / chat_ent) * 100.0
+
+        if not chat_unl and (chat_rem == 0 or (chat_rem is not None and chat_rem <= 0) or (chat_pct is not None and chat_pct <= 0)):
+            copilot_exhausted = True
+
+        chat_finite = (not chat_unl) and (chat_ent > 0)
+        chat_little_left = (not chat_unl) and (chat_pct is not None and chat_pct <= shed_pct)
+        if chat_little_left:
+            copilot_chat_low = True
+
         prem_ent = prem.get("entitlement", 0)
         prem_unl = prem.get("unlimited", False)
         prem_pct = prem.get("percent_remaining")
         prem_little_left = (not prem_unl) and (prem_pct is not None and prem_pct <= shed_pct)
-        if chat_finite and ((prem_ent == 0 and not prem_unl) or prem_little_left):
+        if chat_finite and not chat_little_left and not copilot_exhausted and ((prem_ent == 0 and not prem_unl) or prem_little_left):
             copilot_limited = True
     is_code_edit = (skill == "coding" and not _has_any(text, ["review", "audit"]))
     ranked = []
@@ -3343,6 +3398,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
                 model_name = m["provider"]
         if not model_name or _model_is_bad(model_name):
             continue
+        if m["provider"] == "copilot" and copilot_exhausted:
+            continue
         if m["provider"] == "copilot" and copilot_limited:
             usable_cp = {cm["model"] for cm in _copilot_models() if cm.get("model")}
             if model_name not in usable_cp and model_name != "auto":
@@ -3352,6 +3409,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
         left = _pool_left(providers, m_entry["provider"], m_entry["model"])
         if left is not None and left <= 0:
             continue
+        if m["provider"] == "copilot" and left is not None and left <= shed_pct:
+            m_entry["copilot_low"] = True
 
         # Weigh recent landed rate for this job type (if >= 5 records; benchmarks stay as prior otherwise)
         m_recs = [r for r in stats if r.get("provider") == m_entry["provider"]
@@ -3383,7 +3442,7 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             if is_free or prov == "local":
                 return 3
             if prov == "copilot":
-                return 0 if (copilot_limited and need <= 2) else 2
+                return 2 if (copilot_chat_low or m_info.get("copilot_low")) else (0 if (copilot_limited and need <= 2) else 2)
             if prov == "antigravity":
                 return 0
             if prov == "claude":
@@ -3393,7 +3452,7 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
             if is_free or prov == "local":
                 return 0
             if prov == "copilot":
-                return 0 if (copilot_limited and need <= 2) else 2
+                return 2 if (copilot_chat_low or m_info.get("copilot_low")) else (0 if (copilot_limited and need <= 2) else 2)
             if prov == "antigravity":
                 return 1
             if prov == "claude":
@@ -3406,7 +3465,7 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     elif need >= 4:
         # Hard work: the strongest model, and a scarce one only if nothing else is as strong. Free models last on code edits.
         enough.sort(key=lambda r: (
-            2 if (r[2]["provider"] == "copilot" and copilot_limited) else (
+            2 if (r[2]["provider"] == "copilot" and (copilot_limited or copilot_chat_low or r[2].get("copilot_low"))) else (
                 2 if is_code_edit and r[2].get("high_no_change") else (1 if is_code_edit and (r[2].get("free") or r[2]["model"].endswith("-free") or r[2]["provider"] == "local") else 0)
             ),
             -r[0],
@@ -5549,9 +5608,10 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
         inp = int((td.get("input") or {}).get("tokenCount", 0))
         out_tok = int((td.get("output") or {}).get("tokenCount", 0))
         cache_read = int((td.get("cache_read") or {}).get("tokenCount", 0))
+        cache_write = int((td.get("cache_write") or td.get("cache_creation") or {}).get("tokenCount", 0))
 
         mm = data.get("modelMetrics") or snap.get("modelMetrics") or {}
-        mm_inp = mm_out = mm_cache = mm_reasoning = 0
+        mm_inp = mm_out = mm_cache = mm_write = mm_reasoning = 0
         for m_name, m_info in mm.items():
             if m_name and not run.get("model_used"):
                 run["model_used"] = m_name
@@ -5559,12 +5619,21 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             mm_inp += int(mu.get("inputTokens") or 0)
             mm_out += int(mu.get("outputTokens") or 0)
             mm_cache += int(mu.get("cacheReadTokens") or 0)
+            mm_write += int(mu.get("cacheWriteTokens") or mu.get("cacheCreationTokens") or 0)
             mm_reasoning += int(mu.get("reasoningTokens") or 0)
+
+        if mm_inp > inp:
+            inp = mm_inp
+        if mm_cache > cache_read:
+            cache_read = mm_cache
+        if mm_write > cache_write:
+            cache_write = mm_write
 
         if not inp and not out_tok:
             inp = mm_inp
             out_tok = mm_out + mm_reasoning
             cache_read = mm_cache
+            cache_write = mm_write
         elif mm_reasoning:
             out_tok += mm_reasoning
 
@@ -5573,11 +5642,11 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             u["credits"] = credits_val
         if reqs_val is not None:
             u["requests"] = int(reqs_val)
-        u["input_tokens"] = inp
+        u["input_tokens"] = inp + cache_write
         u["output_tokens"] = out_tok
         u["cache_read_tokens"] = cache_read
 
-        step_cost = inp + out_tok
+        step_cost = inp + cache_write + out_tok
         new_cost = max(0, step_cost - run.get("seen_tokens", 0))
         run["seen_tokens"] = max(step_cost, run.get("seen_tokens", 0))
         run["spent"] = run.get("spent", 0) + new_cost
