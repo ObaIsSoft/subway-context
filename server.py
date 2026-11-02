@@ -4474,6 +4474,77 @@ def _reviewer_task_text(prompt: str, limit: int = 6000) -> str:
     return text[:limit].rstrip()
 
 
+_REVIEW_DIFF_LIMIT = 60000
+
+
+def _capture_in_place_review_diff(meta: Dict[str, Any]) -> None:
+    """Save an in-place worker's git changes where reviewer triggers look for patches."""
+    project_dir = str(meta.get("project_dir") or "")
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diff_text = f"No diff is available: could not inspect the project git repository: {one_line(str(exc), 200)}"
+    else:
+        if root_result.returncode:
+            diff_text = "No diff is available: the project folder is not a git repository."
+        else:
+            root = root_result.stdout.strip()
+            try:
+                diff_result = subprocess.run(
+                    ["git", "-C", root, "diff", "--no-ext-diff", "--"],
+                    capture_output=True, text=True, errors="replace", timeout=60,
+                )
+                staged_result = subprocess.run(
+                    ["git", "-C", root, "diff", "--cached", "--no-ext-diff", "--"],
+                    capture_output=True, text=True, errors="replace", timeout=60,
+                )
+                status_result = subprocess.run(
+                    ["git", "-C", root, "status", "--porcelain", "--untracked-files=all"],
+                    capture_output=True, text=True, errors="replace", timeout=60,
+                )
+                untracked_result = subprocess.run(
+                    ["git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z"],
+                    capture_output=True, timeout=60,
+                )
+                if (diff_result.returncode or staged_result.returncode or status_result.returncode
+                        or untracked_result.returncode):
+                    errors = [one_line(result.stderr, 200) for result in
+                              (diff_result, staged_result, status_result, untracked_result)
+                              if result.returncode]
+                    diff_text = "No diff is available: could not capture git changes. " + "; ".join(errors)
+                else:
+                    pieces = ["Git status --porcelain:\n" + status_result.stdout.rstrip(),
+                              "Git diff:\n" + diff_result.stdout.rstrip(),
+                              "Git staged diff:\n" + staged_result.stdout.rstrip()]
+                    for raw_path in untracked_result.stdout.split(b"\0"):
+                        if not raw_path:
+                            continue
+                        rel_path = os.fsdecode(raw_path)
+                        file_path = os.path.realpath(os.path.join(root, rel_path))
+                        if os.path.commonpath((root, file_path)) != root or not os.path.isfile(file_path):
+                            continue
+                        with open(file_path, "rb") as f:
+                            content = f.read(_REVIEW_DIFF_LIMIT + 1).decode("utf-8", "replace")
+                        pieces.append(f"Untracked file {rel_path}:\n{content}")
+                    diff_text = "\n\n".join(piece for piece in pieces if piece.strip())
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                diff_text = f"No diff is available: could not capture git changes: {one_line(str(exc), 200)}"
+
+    trimmed_note = "\n\n[Review diff trimmed to 60000 characters.]"
+    if len(diff_text) > _REVIEW_DIFF_LIMIT:
+        diff_text = diff_text[:_REVIEW_DIFF_LIMIT - len(trimmed_note)] + trimmed_note
+    patch_path = os.path.join(WORKERS_DIR, f"{meta['id']}.patch")
+    try:
+        with open(patch_path, "w", encoding="utf-8") as f:
+            f.write(diff_text)
+        meta["patch_path"] = patch_path
+    except OSError as exc:
+        meta["review_diff_note"] = f"No diff is available: could not save reviewer diff: {one_line(str(exc), 200)}"
+
+
 def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
     """Parse and validate worker follow-up steps. Bad input is refused before anything is queued."""
     if raw in (None, "", []):
@@ -5929,8 +6000,10 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
             patch_file = meta.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
             with contextlib.suppress(OSError):
                 with open(patch_file, "r", encoding="utf-8", errors="replace") as f:
-                    patch_text = f.read(40000)
+                    patch_text = f.read(_REVIEW_DIFF_LIMIT)
         report_text = str(result.get("reason") or meta.get("report") or "").strip()
+        if not patch_text and meta.get("review_diff_note"):
+            patch_text = str(meta["review_diff_note"])
         if want in ("patch", "both") and not patch_text:
             patch_text = report_text[:40000]
         pieces = []
@@ -6340,6 +6413,9 @@ def supervise_worker(worker_id: str) -> int:
             if os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
                     verify_worker(worker_id)
+    elif result.get("status") == "completed" and any(step.get("verdict") for step in fresh.get("then") or []):
+        _capture_in_place_review_diff(fresh)
+        _save_worker(fresh)
     with contextlib.suppress(Exception):
         result["response"] = str(run.get("response") or "")
     _write_json_atomic(_exit_file(worker_id), result)
