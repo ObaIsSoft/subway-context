@@ -4083,6 +4083,9 @@ def _catalog_stamp() -> Tuple[float, ...]:
     return tuple(stamps)
 
 
+_LOCAL_OPENCODE_PROVIDERS = {"ollama", "lmstudio", "llama.cpp", "local"}
+
+
 def _opencode_free_exhausted_models(providers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, float]:
     """Map of OpenCode model name -> timestamp when it hit free limit within the last 24 hours."""
     exhausted: Dict[str, float] = {}
@@ -9832,12 +9835,6 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
         limited: Dict[str, Dict[str, Any]] = {}  # Limits apply per model: one free model can be out while another works.
         with contextlib.suppress(Exception):
             # A rate limit isn't recorded as an error: OpenCode keeps retrying, with the details on the message.
-            for created, raw_retry in con.execute(
-                    "select time_created, json_extract(data,'$.retry'), json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id')"
-                    " from session_message where type='assistant'"
-                    " and json_extract(data,'$.retry') is not null and time_created>=? order by time_created desc limit 50",
-                    (now_ms - 86400 * 1000,)):
-                pass
             for created, raw_retry, prov, mid in con.execute(
                     "select time_created, json_extract(data,'$.retry'), json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id')"
                     " from session_message where type='assistant'"
@@ -9846,22 +9843,30 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
                 retry = json.loads(raw_retry)
                 error = retry.get("error") or {}
                 key = f"{prov}/{mid}"
+                if prov in _LOCAL_OPENCODE_PROVIDERS:
+                    continue  # Local models have no free limit; their failures are memory or load problems.
                 if "rate-limit" in str(error.get("type")) and key not in limited:
                     until = (retry.get("at") or 0) / 1000.0
                     limited[key] = {"at": created / 1000.0, "retry_at": until, "model": key,
                                     "message": one_line(str(error.get("message", "")), 160), "recent": time.time() < until + 3600}
             limit_hit = next((v for v in limited.values() if v["recent"]), None)
         with contextlib.suppress(Exception):
-            for created, err in () if limit_hit else con.execute(
-                    "select time_created, json_extract(data,'$.error') from session_message where type='assistant'"
+            for created, err, prov, mid in () if limit_hit else con.execute(
+                    "select time_created, json_extract(data,'$.error'), json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id')"
+                    " from session_message where type='assistant'"
                     " and json_extract(data,'$.finish')='error' and time_created>=? order by time_created desc limit 50",
                     (now_ms - 86400 * 1000,)):
+                if prov in _LOCAL_OPENCODE_PROVIDERS:
+                    continue
                 info = json.loads(err) if isinstance(err, str) and err.startswith("{") else {}
                 text = f"{info.get('type', '')} {info.get('message', '')}".lower()
                 if info.get("status") == 429 or re.search(r"rate.?limit|quota|free.*(limit|usage)|usage limit|too many requests|exceeded", text):
-                    limit_hit = {"at": created / 1000.0, "message": one_line(str(info.get("message", "")), 160),
-                                 "recent": now_ms - created < 3600 * 1000}
-                    break
+                    key = f"{prov}/{mid}" if prov and mid else ""
+                    hit = {"at": created / 1000.0, "message": one_line(str(info.get("message", "")), 160),
+                           "recent": now_ms - created < 3600 * 1000, "model": key}
+                    if key and key not in limited:
+                        limited[key] = {**hit, "retry_at": 0}
+                    limit_hit = limit_hit or hit
         accounts = 0
         with contextlib.suppress(Exception):
             accounts = con.execute("select (select count(*) from account)+(select count(*) from credential)").fetchone()[0]
@@ -9916,6 +9921,12 @@ def memory_snapshot() -> Dict[str, int]:
         page = int(re.search(r"page size of (\d+)", out).group(1))  # type: ignore[union-attr]
         pages = {m.group(1): int(m.group(2)) for m in re.finditer(r"Pages (\w+):\s+(\d+)", out)}
         available = sum(pages.get(k, 0) for k in ("free", "inactive", "speculative", "purgeable")) * page
+        # macOS frees memory by compressing it, which page counts miss. Its own gauge (the free percentage
+        # memory_pressure prints) includes that, so use it when it is higher.
+        with contextlib.suppress(Exception):
+            level = int(subprocess.check_output(["sysctl", "-n", "kern.memorystatus_level"], text=True, timeout=3).strip())
+            if 0 < level <= 100:
+                available = max(available, total * level // 100)
         swap = subprocess.check_output(["sysctl", "-n", "vm.swapusage"], text=True, timeout=3)
         m = re.search(r"used = ([\d.]+)M", swap)
         return {"total": total, "available": available, "swap_used": int(float(m.group(1)) * 1024 ** 2) if m else 0}
@@ -10815,7 +10826,7 @@ def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     hit = data.get("limit_hit")
     note = "OpenCode doesn't publish a remaining free allowance, so limits show only when one is hit."
     if hit and (time.time() - hit.get("at", 0) <= 86400):
-        model_name = hit.get("model") or data.get("model") or "Free model"
+        model_name = hit.get("model") or "A free model"  # Never the last-used model: that may be local, with no limit.
         note = f"{model_name} hit its free limit at {fmt_ts(hit['at'])}; other free models may still run"
     state = "loading" if is_loading else ("stale" if is_stale else ("live" if data else "unavailable"))
     return {"plan": plan, "state": state, "source": "OpenCode database", "limit_hit": hit,
