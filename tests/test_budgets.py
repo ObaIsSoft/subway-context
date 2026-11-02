@@ -290,30 +290,12 @@ class TestEnforceBudgets(unittest.TestCase):
             mock_stop.assert_not_called()
 
     def test_isolate_worker_claims_edits_without_changes_fails(self):
-        worker_id = "w_isolate_test"
-        meta = {
-            "id": worker_id,
-            "provider": "claude",
-            "model": "haiku",
-            "cmd": ["test"],
-            "timeout_seconds": 10,
-            "worktree": "/tmp/test_wt",
-            "repo": "/tmp/test_repo",
-            "base": "HEAD",
-            "isolate": True,
-            "prompt": "Edit server.py to add tests",
-            "status": "running",
-        }
-        # Simulate exit file processing in supervise_worker or test logic
+        meta = {"role": "Builder", "prompt": "Edit server.py to add tests",
+                "mode": "standard", "capabilities": ["files:read", "files:write"]}
         exit_res = {"status": "completed", "exit_code": 0}
-        wt_note = "No files changed."
-        if exit_res.get("status") == "completed" and meta.get("isolate"):
-            prompt = meta.get("prompt") or ""
-            if ("Edit " in prompt or "edit" in prompt) and wt_note == "No files changed.":
-                exit_res["status"] = "failed"
-                exit_res["reason"] = "Reported work, but no files changed."
+        server._settle_worker_result(exit_res, meta, True, "Done.")
         self.assertEqual(exit_res["status"], "failed")
-        self.assertEqual(exit_res["reason"], "Reported work, but no files changed.")
+        self.assertIn("no changes made", exit_res["reason"].lower())
 
 
 class TestCheckBudgetPreflight(unittest.TestCase):

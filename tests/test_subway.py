@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1451,17 +1452,63 @@ class TestLocalAndRouting(SubwayTestCase):
 class TestIsolatedWorkerOutcome(unittest.TestCase):
     def test_read_only_worker_with_no_changes_completes_with_reply(self):
         result = {"status": "completed", "exit_code": 0}
-        server._settle_isolated_result(result, "Read-only research. Do not edit any file.",
-                                       "No files changed.", "Found three call sites.")
+        meta = {"role": "Researcher", "prompt": "Read-only research. Do not edit any file.",
+                "capabilities": ["files:read"]}
+        server._settle_worker_result(result, meta, True, "Found three call sites.")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["reason"], "Found three call sites.")
 
-    def test_editing_worker_with_no_changes_still_fails(self):
+    def test_edit_worker_with_empty_patch_does_not_complete(self):
         result = {"status": "completed", "exit_code": 0}
-        server._settle_isolated_result(result, "Edit the parser and add a test.",
-                                       "No files changed.", "Done.")
+        meta = {"role": "Builder", "prompt": "Edit the parser and add a test.",
+                "mode": "standard", "capabilities": ["files:read", "files:write"]}
+        server._settle_worker_result(result, meta, True, "I made no changes because the parser already supports this.")
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["reason"], "Reported work, but no files changed.")
+        self.assertIn("no changes made", result["reason"].lower())
+        self.assertIn("parser already supports this", result["reason"])
+        self.assertEqual(server._determine_outcome(meta, result), "no_change")
+
+    def test_reviewer_with_no_changes_completes(self):
+        result = {"status": "completed", "exit_code": 0}
+        meta = {"role": "Code Reviewer", "prompt": "Review the parser change.",
+                "mode": "standard", "capabilities": ["files:read", "files:write"]}
+        server._settle_worker_result(result, meta, True, "No issues found.")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["reason"], "No issues found.")
+
+    def test_edit_worker_with_patch_completes(self):
+        result = {"status": "completed", "exit_code": 0}
+        meta = {"role": "Builder", "prompt": "Add parser support.",
+                "mode": "standard", "capabilities": ["files:read", "files:write"]}
+        server._settle_worker_result(result, meta, False, "Added parser support.")
+        self.assertEqual(result["status"], "completed")
+
+    def test_in_place_fingerprint_tracks_untracked_file_edits(self):
+        with tempfile.TemporaryDirectory() as repo:
+            path = os.path.join(repo, "new.py")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("before\n")
+
+            def fake_git(args, **kwargs):
+                output = b"?? new.py\0" if args[1] == "status" else b""
+                return subprocess.CompletedProcess(args, 0, stdout=output, stderr=b"")
+
+            with mock.patch.object(server.subprocess, "run", side_effect=fake_git):
+                start = server._git_change_fingerprint(repo)
+                self.assertEqual(start, server._git_change_fingerprint(repo))
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("after\n")
+                self.assertNotEqual(start, server._git_change_fingerprint(repo))
+
+    def test_no_change_failure_is_reported_in_worker_ping(self):
+        meta = {"id": "worker_abcdef", "role": "Builder", "status": "failed",
+                "report": "No changes made. Parser already supports this.", "launched_by": "launcher"}
+        with mock.patch.object(server, "_all_workers", return_value=[meta]), \
+             mock.patch.object(server, "_load_json", return_value={}), \
+             mock.patch.object(server, "_save_json"), \
+             mock.patch.object(server, "_state_lock", return_value=contextlib.nullcontext()):
+            lines = server.pending_worker_pings("launcher")
+        self.assertIn("[WORKER] worker_abcdef (Builder) failed: No changes made. Parser already supports this.", lines)
 
 
 if __name__ == "__main__":
