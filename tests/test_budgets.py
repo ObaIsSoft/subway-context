@@ -615,14 +615,17 @@ class TestCompaction(unittest.TestCase):
         pct_high = server.compaction_threshold_pct(high_prompt)
         self.assertEqual(pct_high, 60.0)
         self.assertEqual(server.compaction_threshold(high_prompt, 200000), 120000)
-        self.assertEqual(server.compaction_threshold(high_prompt, 1000000), 600000)
+        # On a 1M window the token point (300K by default) comes first.
+        with patch.object(server, "compact_at_tokens", return_value=300000):
+            self.assertEqual(server.compaction_threshold(high_prompt, 1000000), 300000)
 
         # Normal/low complexity -> 75% threshold
         low_prompt = "Fix a typo in the comment"
         pct_low = server.compaction_threshold_pct(low_prompt)
         self.assertEqual(pct_low, 75.0)
         self.assertEqual(server.compaction_threshold(low_prompt, 200000), 150000)
-        self.assertEqual(server.compaction_threshold(low_prompt, 1000000), 750000)
+        with patch.object(server, "compact_at_tokens", return_value=1000000):
+            self.assertEqual(server.compaction_threshold(low_prompt, 1000000), 750000)
 
     def test_quiet_rule(self):
         # Window = 200,000 -> half window = 100,000
@@ -701,7 +704,8 @@ class TestCompaction(unittest.TestCase):
              patch.object(server, "notify_desktop_event") as mock_notify:
             notice = server.compaction_notice("session_suggest", "normal prompt")
             self.assertIsNotNone(notice)
-            self.assertIn("This chat is at 80% of its context. Compact now: /compact keep refactor auth", notice)
+            self.assertIn("This chat holds 160K tokens of context (80% of its window), re-read on every turn. "
+                          "Compact now: /compact keep refactor auth", notice)
             mock_notify.assert_called_once()
 
         # Test 'auto' adds claude note
@@ -714,8 +718,49 @@ class TestCompaction(unittest.TestCase):
              patch.object(server, "compact_opencode_workers") as mock_compact_opencode:
             notice_auto = server.compaction_notice("session_auto", "normal prompt")
             self.assertIsNotNone(notice_auto)
-            self.assertIn("Claude Code compacts by itself near its limit; Subway can't run /compact inside an open chat", notice_auto)
+            self.assertIn("In auto mode Claude Code compacts by itself near 300,000 tokens; Subway can't run /compact", notice_auto)
             mock_compact_opencode.assert_called_once()
+
+    def test_window_survives_compaction(self):
+        t_file = os.path.join(self.tmpdir, "s.jsonl")
+        with open(t_file, "w") as f:
+            for n in (700000, 180000):  # Before and after a compaction, model name without [1m].
+                f.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-5-5",
+                                    "usage": {"input_tokens": n}}}) + "\n")
+        self.assertEqual(server.chat_context_usage(t_file), (180000, 1000000))
+
+    def test_focus_line_skips_compaction_markers(self):
+        entries = [{"message": "Compacted (manual) at 12:57. Full history: read_chat(x, segment=2)"},
+                   {"message": "ship the Kimi gauge"}]
+        with patch.object(server, "read_track_entries", return_value=entries):
+            self.assertEqual(server.compact_focus_line(), "keep ship the Kimi gauge")
+
+    def _sync(self, cfg, mode, at=300000):
+        saved = {}
+        with patch.object(server, "CLAUDE_DIR", self.tmpdir), \
+             patch.object(server, "_load_json", side_effect=lambda f: cfg if f == "config.json" else {}), \
+             patch.object(server, "_save_json", side_effect=lambda f, d: saved.update(d)):
+            note = server._sync_claude_autocompact(mode, at)
+        path = os.path.join(self.tmpdir, "settings.json")
+        return note, (json.load(open(path)) if os.path.exists(path) else {}), saved
+
+    def test_auto_sets_and_removes_claude_compaction_point(self):
+        with open(os.path.join(self.tmpdir, "settings.json"), "w") as f:
+            json.dump({"hooks": {"PreCompact": []}}, f)
+        note, data, saved = self._sync({}, "auto")
+        self.assertIn("300,000", note)
+        self.assertEqual(data, {"hooks": {"PreCompact": []}, "autoCompactWindow": 300000})
+        note, data, _ = self._sync({"claude_autocompact_set": 300000}, "suggest")
+        self.assertEqual(data, {"hooks": {"PreCompact": []}})
+
+    def test_auto_leaves_the_users_own_compaction_point(self):
+        with open(os.path.join(self.tmpdir, "settings.json"), "w") as f:
+            json.dump({"autoCompactWindow": 500000}, f)
+        note, data, _ = self._sync({}, "auto")
+        self.assertIn("left it alone", note)
+        self.assertEqual(data["autoCompactWindow"], 500000)
+        _, data, _ = self._sync({}, "never")
+        self.assertEqual(data["autoCompactWindow"], 500000)
 
 
 class TestCodePacket(unittest.TestCase):
@@ -1314,7 +1359,7 @@ class TestCopilotBudgets(unittest.TestCase):
             chat_win = pool_map["Chat"]["windows"][0]
             self.assertEqual(chat_win["label"], "Monthly")
             self.assertEqual(chat_win["left_pct"], 75.0)
-            self.assertEqual(chat_win["resets_at"], "2026-12-01")
+            self.assertEqual(chat_win["resets_at"], server._parse_ts("2026-12-01"))
 
             comp_win = pool_map["Completions"]["windows"][0]
             self.assertEqual(comp_win["label"], "Monthly")
@@ -1449,3 +1494,17 @@ class TestOpenCodeIdCollision(unittest.TestCase):
             line = next(l for l in body.splitlines() if check in l and l.strip().startswith("if "))
             self.assertIn("is_reply", line, check)
 
+
+
+class TestResetTimes(unittest.TestCase):
+    def test_copilot_reset_date_becomes_seconds(self):
+        raw = {"copilot_plan": "individual", "quota_reset_date": "2026-12-01", "quota_snapshots": {
+            "chat": {"entitlement": 100, "remaining": 40, "percent_remaining": 40.0, "unlimited": False}}}
+        with patch.object(server, "_copilot_raw", return_value=raw):
+            v = server._copilot_view({}, False)
+        resets = [w["resets_at"] for p in v["pools"] for w in p["windows"]]
+        self.assertTrue(resets and all(isinstance(r, float) for r in resets), resets)
+
+    def test_fmt_reset_accepts_text(self):
+        self.assertEqual(server._fmt_reset("2001-01-01"), "now")
+        self.assertEqual(server._fmt_reset("not a date"), "unknown")

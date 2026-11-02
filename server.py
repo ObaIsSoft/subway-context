@@ -3527,15 +3527,74 @@ def get_compaction() -> str:
     return val if val in ("suggest", "auto", "never") else "suggest"
 
 
-def set_compaction(mode: str) -> str:
+COMPACT_AT_DEFAULT = 300000  # Every turn re-reads the whole context, so a big context costs on every turn.
+
+
+def compact_at_tokens() -> int:
+    """The context size, in tokens, at which Subway asks for compaction (100K to 1M)."""
+    try:
+        v = int(_load_json("config.json").get("compact_at_tokens") or COMPACT_AT_DEFAULT)
+    except (TypeError, ValueError):
+        v = COMPACT_AT_DEFAULT
+    return max(100000, min(1000000, v))
+
+
+def _claude_settings_file() -> str:
+    return os.path.join(CLAUDE_DIR, "settings.json")
+
+
+def _sync_claude_autocompact(mode: str, at: int) -> str:
+    """Auto mode: set Claude Code's own autoCompactWindow so Claude Code compacts by itself near `at` tokens.
+    Leaves a value the user set themselves alone, and removes only the value Subway set."""
+    path = _claude_settings_file()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return ""
+    except FileNotFoundError:
+        data = {}
+    except Exception:
+        return " Couldn't read Claude Code's settings, so Claude Code keeps its own compaction point."
+    cfg = _load_json("config.json")
+    ours = cfg.get("claude_autocompact_set")
+    current = data.get("autoCompactWindow")
+    if mode == "auto":
+        if current is not None and current != ours:
+            return f" Claude Code already has its own compaction point ({current:,} tokens), so Subway left it alone."
+        data["autoCompactWindow"] = at
+        cfg["claude_autocompact_set"] = at
+        note = f" Claude Code now compacts by itself near {at:,} tokens."
+    else:
+        if current is None or current != ours:
+            return ""
+        data.pop("autoCompactWindow", None)
+        cfg.pop("claude_autocompact_set", None)
+        note = " Claude Code's compaction point is back to its default."
+    try:
+        tmp = path + ".subway.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        return " Couldn't update Claude Code's settings."
+    _save_json("config.json", cfg)
+    return note
+
+
+def set_compaction(mode: str, at: Optional[int] = None) -> str:
     m = (mode or "").lower().strip()
     if m not in ("suggest", "auto", "never"):
         return f"Error: compaction mode must be one of 'suggest', 'auto', 'never', got '{mode}'."
     with _state_lock("config"):
         data = _load_json("config.json")
         data["compaction"] = m
+        if at is not None:
+            data["compact_at_tokens"] = max(100000, min(1000000, int(at)))
         _save_json("config.json", data)
-    return f"[COMPACTION] Compaction mode set to '{m}'."
+        note = _sync_claude_autocompact(m, compact_at_tokens())
+    return f"[COMPACTION] Compaction mode set to '{m}', at {compact_at_tokens():,} tokens.{note}"
 
 
 def chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[int], int]:
@@ -3561,6 +3620,7 @@ def chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[int],
         return None, 200000
 
     last_tokens: Optional[int] = None
+    biggest = 0  # The largest context this chat ever had: survives compaction.
     window = 200000
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -3580,6 +3640,7 @@ def chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[int],
                     cread = int(usage.get("cache_read_input_tokens") or 0)
                     ccreate = int(usage.get("cache_creation_input_tokens") or 0)
                     last_tokens = inp + cread + ccreate
+                    biggest = max(biggest, last_tokens)
                 model = str(msg.get("model") or ent.get("model") or "")
                 if "[1m]" in model.lower() or "1m" in model.lower():
                     window = 1000000
@@ -3587,8 +3648,8 @@ def chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[int],
                     window = 200000
     except Exception:
         pass
-    if last_tokens and last_tokens > window:
-        window = 1000000  # A context bigger than 200K proves the larger window, whatever the name says.
+    if biggest > window:
+        window = 1000000  # A context ever bigger than 200K proves the larger window, even after compaction.
     return last_tokens, window
 
 
@@ -3601,7 +3662,8 @@ def compaction_threshold_pct(prompt: str) -> float:
 
 
 def compaction_threshold(prompt: str, window: int = 200000) -> int:
-    return int((compaction_threshold_pct(prompt) / 100.0) * window)
+    """The lower of a share of the window and the token point, since cost grows with the context."""
+    return min(int((compaction_threshold_pct(prompt) / 100.0) * window), compact_at_tokens())
 
 
 def is_compaction_quiet(remaining_chat_budget: Optional[int], window: int = 200000) -> bool:
@@ -3628,7 +3690,7 @@ def compact_focus_line(track: str = "main", limit: int = 5) -> str:
             if s not in items:
                 items.append(s)
         msg = (e.get("message") or "").strip()
-        if msg and not msg.startswith("[PERMISSION") and msg not in items:  # Permission records aren't decisions.
+        if msg and not msg.startswith(("[PERMISSION", "Compacted (")) and msg not in items:  # Records, not decisions.
             items.append(msg[:120])
         if len(items) >= 3:
             break
@@ -3690,7 +3752,7 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
         return None
 
     thresh_pct = compaction_threshold_pct(prompt)
-    thresh_tokens = int((thresh_pct / 100.0) * window)
+    thresh_tokens = compaction_threshold(prompt, window)
 
     cfg = _load_json("config.json")
     chat_limit = cfg.get("chat_budget_tokens")
@@ -3705,6 +3767,7 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
 
     pct = (usage / window) * 100.0
     level = 90 if pct >= 90 else (80 if pct >= 80 else (75 if (pct >= 75 and thresh_pct <= 75) else 60))
+    level = f"{level}|{usage // 100000}"  # Warn again for every 100K more, not only at window shares.
     sid = session_id or _self_id()
     key = f"compaction_warning|{sid}|{level}"
     now = time.time()
@@ -3717,11 +3780,13 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
 
     focus = compact_focus_line()
     x_pct = int(round(pct))
-    msg = f"This chat is at {x_pct}% of its context. Compact now: /compact {focus}"
+    msg = (f"This chat holds {usage // 1000:,}K tokens of context ({x_pct}% of its window), re-read on every turn. "
+           f"Compact now: /compact {focus}")
     notify_desktop_event(key, "Subway Context", msg)
 
     if mode == "auto":
-        msg += ". Claude Code compacts by itself near its limit; Subway can't run /compact inside an open chat"
+        msg += (f". In auto mode Claude Code compacts by itself near {compact_at_tokens():,} tokens; "
+                "Subway can't run /compact inside an open chat")
         compact_opencode_workers()
 
     return msg
@@ -7218,7 +7283,7 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         }
 
     plan = raw.get("copilot_plan") or ""
-    quota_reset = raw.get("quota_reset_date")
+    quota_reset = _parse_ts(raw.get("quota_reset_date"))  # "2026-12-01" -> seconds, like every other gauge.
     snapshots = raw.get("quota_snapshots") or {}
     name_map = {
         "chat": "Chat",
@@ -7324,12 +7389,7 @@ def _kimi_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
             if not isinstance(window, dict) or window.get("used_ratio") is None:
                 continue
             left_pct = round((1.0 - window["used_ratio"]) * 100.0, 2)
-            resets_at = window.get("reset_time")
-            if isinstance(resets_at, str) and resets_at:
-                try:
-                    resets_at = _dt.datetime.fromisoformat(resets_at).timestamp()
-                except ValueError:
-                    pass
+            resets_at = _parse_ts(window.get("reset_time"))  # Handles "Z", which Python 3.9 can't parse alone.
             pools.append({"key": key, "name": name, "windows": [{
                 "key": "rolling", "label": name, "used_pct": round(100.0 - left_pct, 2),
                 "left_pct": left_pct, "resets_at": resets_at, "disabled": False, "note": ""}]})
@@ -7492,7 +7552,9 @@ def low_limit_notice() -> str:
             _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
     return "[LOW LIMIT] " + "; ".join(notes) + ". Plan around it, and shed load if it's yours." if notes else ""
 
-def _fmt_reset(resets_at: Optional[float]) -> str:
+def _fmt_reset(resets_at: Any) -> str:
+    if isinstance(resets_at, str):
+        resets_at = _parse_ts(resets_at)
     if not resets_at:
         return "unknown"
     secs = int(resets_at - time.time())
@@ -8362,7 +8424,8 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 if c_val not in ("suggest", "auto", "never"):
                     self._deny(400, f"Invalid compaction mode: {payload.get('compaction')}")
                     return
-                res["compaction"] = set_compaction(c_val)
+                at_val = payload.get("compact_at_tokens")
+                res["compaction"] = set_compaction(c_val, int(at_val) if isinstance(at_val, (int, float)) else None)
             if "hud_autostart" in payload:
                 val = payload["hud_autostart"]
                 if isinstance(val, bool):
@@ -9047,9 +9110,13 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         prompt_text = str(event.get("prompt") or "")
         for line in prompt_text.splitlines():
             line_str = line.strip()
-            m_comp = re.match(r"^!?\s*subway-context\s+compaction\s+(\S+)\s*$", line_str, re.IGNORECASE)
+            m_comp = re.match(r"^!?\s*subway-context\s+compaction\s+(\S+)(?:\s+<?([\d.]+)\s*([kKmM]?)>?)?\s*$",
+                              line_str, re.IGNORECASE)
             if m_comp:
-                res = set_compaction(m_comp.group(1).lower().strip())
+                at = None
+                if m_comp.group(2):
+                    at = int(float(m_comp.group(2)) * {"k": 1000, "m": 1000000}.get(m_comp.group(3).lower(), 1))
+                res = set_compaction(m_comp.group(1).lower().strip(), at)
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "UserPromptSubmit",
@@ -9305,7 +9372,9 @@ def run_cli(argv: List[str]) -> int:
         if not rest:
             print(f"Compaction mode: {get_compaction()}")
             return 0
-        print(set_compaction(rest[0]))
+        at = int(float(rest[1].lower().rstrip("km")) * (1000 if rest[1].lower().endswith("k") else
+                 1000000 if rest[1].lower().endswith("m") else 1)) if len(rest) > 1 else None
+        print(set_compaction(rest[0], at))
         return 0
     if arg in ("budget", "--budget"):
         if not rest:
