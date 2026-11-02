@@ -2994,6 +2994,61 @@ def _opencode_models() -> List[str]:
     return []
 
 
+COPILOT_CLI_MODELS_FILE = "copilot_cli_models.json"
+COPILOT_CLI_MODEL_EXPIRY = 7 * 86400.0  # 7 days
+
+
+def _load_copilot_cli_models() -> Dict[str, Dict[str, float]]:
+    data = _load_json(COPILOT_CLI_MODELS_FILE)
+    if not isinstance(data, dict):
+        return {"refused": {}, "accepted": {}}
+    refused = data.get("refused") if isinstance(data.get("refused"), dict) else {}
+    accepted = data.get("accepted") if isinstance(data.get("accepted"), dict) else {}
+    return {"refused": refused, "accepted": accepted}
+
+
+def _save_copilot_cli_models(data: Dict[str, Dict[str, float]]) -> None:
+    _save_json(COPILOT_CLI_MODELS_FILE, data)
+
+
+def record_copilot_cli_refused(model: str, ts: Optional[float] = None) -> None:
+    if not model or model == "auto":
+        return
+    now = time.time() if ts is None else float(ts)
+    with _state_lock("copilot_cli_models"):
+        store = _load_copilot_cli_models()
+        store["refused"][model] = now
+        store["accepted"].pop(model, None)
+        _save_copilot_cli_models(store)
+
+
+def record_copilot_cli_accepted(model: str, ts: Optional[float] = None) -> None:
+    if not model or model == "auto":
+        return
+    now = time.time() if ts is None else float(ts)
+    with _state_lock("copilot_cli_models"):
+        store = _load_copilot_cli_models()
+        store["accepted"][model] = now
+        store["refused"].pop(model, None)
+        _save_copilot_cli_models(store)
+
+
+def is_copilot_cli_refused(model: str) -> bool:
+    if not model or model == "auto":
+        return False
+    store = _load_copilot_cli_models()
+    refused = store.get("refused", {})
+    if model not in refused:
+        return False
+    try:
+        ts = float(refused[model])
+        if (time.time() - ts) > COPILOT_CLI_MODEL_EXPIRY:
+            return False
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 @ttl_cached(300.0)
 def _copilot_models() -> List[Dict[str, Any]]:
     patterns = [
@@ -3065,7 +3120,7 @@ def _copilot_models() -> List[Dict[str, Any]]:
 def _catalog_stamp() -> Tuple[float, ...]:
     """Changes when rankings do, so an edit shows up straight away despite the cache."""
     stamps = []
-    for name in ("models.json", "benchmarks.json", "providers.json", "opencode_models.json", "copilot_models.json"):
+    for name in ("models.json", "benchmarks.json", "providers.json", "opencode_models.json", "copilot_models.json", "copilot_cli_models.json"):
         with contextlib.suppress(OSError):
             stamps.append(os.path.getmtime(os.path.join(SUBWAY_DIR, name)))
     return tuple(stamps)
@@ -3177,6 +3232,10 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
         for c in custom:
             key = (str(c.get("provider")), c.get("model") or "")
             catalog_map[key] = dict(catalog_map.get(key, {}), **c, source="owner")
+
+    for (prov, m_id), entry in list(catalog_map.items()):
+        if prov == "copilot" and m_id and m_id != "auto" and is_copilot_cli_refused(m_id):
+            entry["cli"] = False
 
     catalog = list(catalog_map.values())
     for p in load_custom_providers():
@@ -3392,16 +3451,18 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
                 oc_cand = [om for om in _opencode_models() if om and not _model_is_bad(om)]
                 model_name = oc_cand[0] if oc_cand else ""
             elif m["provider"] == "copilot":
-                cp_cand = [cm["model"] for cm in _copilot_models() if cm.get("model") and not _model_is_bad(cm["model"])]
+                cp_cand = [cm["model"] for cm in _copilot_models() if cm.get("model") and not _model_is_bad(cm["model"]) and not is_copilot_cli_refused(cm["model"])]
                 model_name = cp_cand[0] if cp_cand else "auto"
             else:
                 model_name = m["provider"]
         if not model_name or _model_is_bad(model_name):
             continue
+        if m["provider"] == "copilot" and is_copilot_cli_refused(model_name):
+            continue
         if m["provider"] == "copilot" and copilot_exhausted:
             continue
         if m["provider"] == "copilot" and copilot_limited:
-            usable_cp = {cm["model"] for cm in _copilot_models() if cm.get("model")}
+            usable_cp = {cm["model"] for cm in _copilot_models() if cm.get("model") and not is_copilot_cli_refused(cm["model"])}
             if model_name not in usable_cp and model_name != "auto":
                 continue
         m_entry = dict(m, model=model_name)
@@ -4380,11 +4441,15 @@ def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
         if max_tokens is not None:
             if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0:
                 raise ValueError(f"{label}[{i}] max_tokens must be a non-negative integer.")
+        step_prov = str(step.get("provider") or "auto").lower()
+        step_model = str(step.get("model") or "")
+        if step_prov == "copilot" and step_model and step_model != "auto" and is_copilot_cli_refused(step_model):
+            step_model = "auto"
         out.append({
             "role": role,
             "prompt": prompt,
-            "provider": str(step.get("provider") or "auto").lower(),
-            "model": str(step.get("model") or ""),
+            "provider": step_prov,
+            "model": step_model,
             "when": when,
             "include": include,
             "other_provider": other_provider,
@@ -4406,9 +4471,12 @@ def _review_trigger_step(review: str) -> Optional[Dict[str, Any]]:
         provider, model = (part.strip() for part in review.split("/", 1))
         if not provider or not model:
             raise ValueError("review must be '', 'auto', or 'provider/model'.")
-    return {"role": "Reviewer", "prompt": _REVIEW_PROMPT, "provider": provider.lower(), "model": model,
-            "when": "completed", "include": "patch", "other_provider": True, "max_tokens": 0,
-            "verdict": True, "then": []}
+    raw = [{
+        "role": "Reviewer", "prompt": _REVIEW_PROMPT, "provider": provider.lower(), "model": model,
+        "when": "completed", "include": "patch", "other_provider": True, "max_tokens": 0,
+        "verdict": True, "then": []
+    }]
+    return _parse_trigger_steps(raw, label="review")[0]
 
 
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
@@ -5711,16 +5779,20 @@ def _pump_copilot(proc: subprocess.Popen, out: Any, run: Dict[str, Any]) -> None
         out.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
         out.flush()
 
+    raw_lines = []
     for raw in proc.stdout:  # type: ignore[union-attr]
         line = raw.decode("utf-8", "replace").strip()
         if not line:
             continue
+        raw_lines.append(line)
         try:
             ev = json.loads(line)
         except ValueError:
             write(line)
             continue
         _process_copilot_event(ev, run, write)
+    if raw_lines:
+        run["raw_output"] = "\n".join(raw_lines)
 
 
 def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
@@ -5804,6 +5876,8 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         child_prompt += f"\n\nPREVIOUS WORKER {worker_id} ({meta.get('role') or 'worker'}, {status}):\n{included}"
         provider = str(step.get("provider") or "auto").lower()
         model = str(step.get("model") or "")
+        if provider == "copilot" and model and model != "auto" and is_copilot_cli_refused(model):
+            model = "auto"
         if provider == "auto":
             try:
                 route = route_task(child_prompt, str(step.get("role") or ""))
@@ -6118,8 +6192,43 @@ def supervise_worker(worker_id: str) -> int:
                     cmd = _agy_resume(cmd, run["conversation"], "Your connection dropped. Continue your task "
                                       "from where you stopped.", [])
                     continue
+                if code != 0 and is_copilot and retries < 1:
+                    raw_out = run.get("raw_output") or ""
+                    if not raw_out and os.path.exists(meta.get("log_file", "")):
+                        with contextlib.suppress(Exception):
+                            with open(meta["log_file"], "r", encoding="utf-8", errors="replace") as f:
+                                raw_out = f.read()
+                    if "from --model flag is not available" in raw_out:
+                        m_match = re.search(r'Model\s+["\']?([^"\'\s]+)["\']?\s+from --model flag is not available', raw_out)
+                        refused_id = m_match.group(1) if m_match else meta.get("model", "")
+                        if not refused_id or refused_id == "auto":
+                            if "--model" in cmd:
+                                idx = cmd.index("--model")
+                                if idx + 1 < len(cmd):
+                                    refused_id = cmd[idx + 1]
+                        if refused_id and refused_id != "auto":
+                            record_copilot_cli_refused(refused_id)
+                            msg = f"[copilot] {refused_id} is not available to the CLI on this plan; using auto"
+                            log(msg)
+                            out.write((msg + "\n").encode("utf-8", "replace"))
+                            out.flush()
+                            retries += 1
+                            if "--model" in cmd:
+                                idx = cmd.index("--model")
+                                if idx + 1 < len(cmd):
+                                    cmd[idx + 1] = "auto"
+                            meta["model"] = "auto"
+                            continue
                 if is_acp and run.get("finished"):
                     code = 0
+                if is_copilot and code == 0:
+                    used_m = meta.get("model") or ""
+                    if not used_m and "--model" in cmd:
+                        idx = cmd.index("--model")
+                        if idx + 1 < len(cmd):
+                            used_m = cmd[idx + 1]
+                    if used_m and used_m != "auto":
+                        record_copilot_cli_accepted(used_m)
                 if code != 0:
                     fresh_meta = _load_worker(worker_id) or meta
                     stop_r = fresh_meta.get("stop_reason") or ""

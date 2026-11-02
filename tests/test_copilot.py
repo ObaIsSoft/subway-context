@@ -357,5 +357,139 @@ class TestCopilotIntegration(unittest.TestCase):
                 self.assertEqual(kimi["aliases"], ["kimi-k3-copilot"])
 
 
+    def test_copilot_cli_refused_recorded_and_retried_with_auto(self):
+        worker_id = "worker_cptest1"
+        log_file = os.path.join(self.temp_dir, f"{worker_id}.log")
+        meta = {
+            "id": worker_id,
+            "provider": "copilot",
+            "model": "gpt-4.1",
+            "cmd": ["copilot", "-p", "hi", "--model", "gpt-4.1", "--output-format", "json"],
+            "log_file": log_file,
+            "status": "running",
+            "timeout_seconds": 60,
+        }
+        with open(log_file, "w") as f:
+            f.write("")
+
+        first_proc = MagicMock()
+        first_proc.poll.return_value = 1
+        first_proc.wait.return_value = 1
+        first_proc.stdout = [b'Error: Model "gpt-4.1" from --model flag is not available.\n']
+
+        second_proc = MagicMock()
+        second_proc.poll.return_value = 0
+        second_proc.wait.return_value = 0
+        second_proc.stdout = [b'{"type":"assistant.message","data":{"content":"done"}}\n']
+
+        spawned_cmds = []
+
+        def fake_popen(cmd, **kwargs):
+            spawned_cmds.append(list(cmd))
+            if len(spawned_cmds) == 1:
+                return first_proc
+            return second_proc
+
+        with patch.object(server, "_load_worker", return_value=meta), \
+             patch.object(server, "_save_worker"), \
+             patch.object(server, "_write_json_atomic"), \
+             patch.object(server, "_load_json", return_value={"refused": {}, "accepted": {}}), \
+             patch.object(server, "_save_json") as mock_save, \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            server.supervise_worker(worker_id)
+
+        self.assertEqual(len(spawned_cmds), 2)
+        self.assertIn("gpt-4.1", spawned_cmds[0])
+        self.assertIn("auto", spawned_cmds[1])
+        # Saved refused store
+        saved_stores = [args[1] for args, _ in mock_save.call_args_list if args[0] == server.COPILOT_CLI_MODELS_FILE]
+        self.assertTrue(any("gpt-4.1" in s.get("refused", {}) for s in saved_stores))
+
+    def test_copilot_cli_accepted_recorded(self):
+        worker_id = "worker_cptest2"
+        log_file = os.path.join(self.temp_dir, f"{worker_id}.log")
+        meta = {
+            "id": worker_id,
+            "provider": "copilot",
+            "model": "gpt-6-luna",
+            "cmd": ["copilot", "-p", "hi", "--model", "gpt-6-luna", "--output-format", "json"],
+            "log_file": log_file,
+            "status": "running",
+            "timeout_seconds": 60,
+        }
+        with open(log_file, "w") as f:
+            f.write("")
+
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.wait.return_value = 0
+        proc.stdout = [b'{"type":"assistant.message","data":{"content":"hello"}}\n']
+
+        with patch.object(server, "_load_worker", return_value=meta), \
+             patch.object(server, "_save_worker"), \
+             patch.object(server, "_write_json_atomic"), \
+             patch.object(server, "_load_json", return_value={"refused": {}, "accepted": {}}), \
+             patch.object(server, "_save_json") as mock_save, \
+             patch("subprocess.Popen", return_value=proc):
+            server.supervise_worker(worker_id)
+
+        saved_stores = [args[1] for args, _ in mock_save.call_args_list if args[0] == server.COPILOT_CLI_MODELS_FILE]
+        self.assertTrue(any("gpt-6-luna" in s.get("accepted", {}) for s in saved_stores))
+
+    def test_copilot_cli_expiry_after_7_days(self):
+        now = time.time()
+        store = {
+            "refused": {
+                "old-refused": now - (8 * 86400),
+                "recent-refused": now - (2 * 86400),
+            },
+            "accepted": {}
+        }
+        with patch.object(server, "_load_copilot_cli_models", return_value=store):
+            self.assertFalse(server.is_copilot_cli_refused("old-refused"))
+            self.assertTrue(server.is_copilot_cli_refused("recent-refused"))
+
+    def test_copilot_routing_excludes_refused_ids(self):
+        provs = [{"id": "copilot", "client": {"dispatchable": True}}]
+        cp_models = [{"model": "refused-mod", "coding": 4, "reasoning": 4, "writing": 4},
+                     {"model": "good-mod", "coding": 3, "reasoning": 3, "writing": 3}]
+        with patch.object(server, "_copilot_models", return_value=cp_models), \
+             patch.object(server, "is_copilot_cli_refused", side_effect=lambda m: m == "refused-mod"), \
+             patch.object(server, "_copilot_raw", return_value={"quota_snapshots": {"chat": {"remaining": 100, "entitlement": 100, "unlimited": True}}}):
+            server._model_catalog.clear()
+            route = server.route_task("write a python script", providers=provs)
+            picks = [p["model"] for p in route.get("picks", []) if p["provider"] == "copilot"]
+            self.assertNotIn("refused-mod", picks)
+
+    def test_copilot_catalog_marks_cli_false(self):
+        cp_models = [{"model": "refused-mod"}, {"model": "accepted-mod"}]
+        with patch.object(server, "_copilot_models", return_value=cp_models), \
+             patch.object(server, "is_copilot_cli_refused", side_effect=lambda m: m == "refused-mod"):
+            server._model_catalog.clear()
+            catalog = server.model_catalog()
+            refused_entries = [m for m in catalog if m.get("provider") == "copilot" and m.get("model") == "refused-mod"]
+            accepted_entries = [m for m in catalog if m.get("provider") == "copilot" and m.get("model") == "accepted-mod"]
+            self.assertTrue(len(refused_entries) > 0)
+            self.assertIs(refused_entries[0].get("cli"), False)
+            self.assertTrue(len(accepted_entries) > 0)
+            self.assertNotEqual(accepted_entries[0].get("cli"), False)
+
+    def test_copilot_review_step_falls_back_to_auto(self):
+        with patch.object(server, "is_copilot_cli_refused", side_effect=lambda m: m == "refused-mod"):
+            step_refused = server._review_trigger_step("copilot/refused-mod")
+            self.assertEqual(step_refused["provider"], "copilot")
+            self.assertEqual(step_refused["model"], "auto")
+
+            step_accepted = server._review_trigger_step("copilot/good-mod")
+            self.assertEqual(step_accepted["provider"], "copilot")
+            self.assertEqual(step_accepted["model"], "good-mod")
+
+            then_steps = server._parse_trigger_steps([
+                {"role": "Tester", "prompt": "test", "provider": "copilot", "model": "refused-mod"}
+            ])
+            self.assertEqual(then_steps[0]["provider"], "copilot")
+            self.assertEqual(then_steps[0]["model"], "auto")
+
+
 if __name__ == "__main__":
     unittest.main()
