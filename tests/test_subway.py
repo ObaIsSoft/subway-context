@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive test suite for Subway Context."""
+import os as _os
+_os.environ["SUBWAY_NO_NOTIFY"] = "1"  # Never send real desktop alerts from tests.
 import contextlib
 import datetime as _dt
 import hashlib

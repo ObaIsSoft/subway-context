@@ -1,6 +1,6 @@
 /* Shell, routing and polling. */
 import { api, duration, get, h, icon, listen, set, subscribe, tickAll, toast, tokens } from "./lib.js";
-import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, usagePage, workersPage } from "./views.js";
+import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, updateWorkerUsage, usagePage, workersPage } from "./views.js";
 
 const POLL_MS = 1000;
 const FEED_MS = 3000;

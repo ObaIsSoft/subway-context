@@ -60,6 +60,8 @@ Install subway-context directly via npm (v1.2.0):
 npx -y subway-context install
 ```
 
+
+On macOS the installer also offers terminal-notifier through Homebrew, so clicking a Subway alert opens the HUD. It tells you what it's doing, asks first when it can, and only suggests the command when it can't ask.
 Or run the universal installer script locally:
 
 ```bash

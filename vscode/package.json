@@ -1,0 +1,25 @@
+{
+  "name": "subway-context",
+  "displayName": "Subway Context",
+  "description": "Subway Context HUD integration for VS Code and Antigravity",
+  "version": "0.1.0",
+  "publisher": "subway",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "subway.openHud",
+        "title": "Subway: Open HUD"
+      }
+    ]
+  }
+}

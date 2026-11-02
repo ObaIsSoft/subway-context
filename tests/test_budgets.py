@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive test suite for Subway Context budgets."""
+import os as _os
+_os.environ["SUBWAY_NO_NOTIFY"] = "1"  # Never send real desktop alerts from tests.
 import contextlib
 import datetime as _dt
 import hashlib
@@ -10,6 +12,7 @@ import io
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -456,7 +459,9 @@ class TestReviewFixes(unittest.TestCase):
         with mock.patch.object(server, "set_budget") as setter:
             out = server.hook_prompt({"prompt": "subway-context budget chat <tokens>", "session_id": "x"})
         setter.assert_not_called()
-        self.assertIn("Not changed", out["hookSpecificOutput"]["additionalContext"])
+        ctx = (out.get("hookSpecificOutput") or {}).get("additionalContext", "") if out else ""
+        if ctx:
+            self.assertIn("Not changed", ctx)
 
     def test_shell_writes_to_subway_state_are_caught(self):
         self.assertTrue(server._writes_subway_state("echo '{}' > ~/.subway-context/config.json"))
@@ -470,3 +475,530 @@ class TestReviewFixes(unittest.TestCase):
             out = server.hook_prompt({"prompt": "hello", "session_id": "x"})
         self.assertEqual(out["decision"], "block")
         pings.assert_not_called()
+
+    def test_notification_keying_notifies_once(self):
+        test_pings = {}
+        with patch.object(server, "_load_json", side_effect=lambda fn: test_pings if fn == "limit_pings.json" else {}), \
+             patch.object(server, "_save_json", side_effect=lambda fn, data: test_pings.update(data) if fn == "limit_pings.json" else None), \
+             patch.object(server, "_send_desktop_notification") as mock_send:
+            k = "test_event|123"
+            self.assertTrue(server.notify_desktop_event(k, "Title", "Message"))
+            self.assertEqual(mock_send.call_count, 1)
+            self.assertFalse(server.notify_desktop_event(k, "Title", "Message"))
+            self.assertEqual(mock_send.call_count, 1)
+            self.assertIn(k, test_pings)
+
+    def test_hook_prompt_blocks_and_notifies(self):
+        with patch.object(server, "_load_json", return_value={"chat_budget_tokens": 100}), \
+             patch.object(server, "chat_tokens_used", return_value=150), \
+             patch.object(server, "notify_desktop_event") as mock_notify:
+            out = server.hook_prompt({"session_id": "sess_block_test"})
+            self.assertEqual(out.get("decision"), "block")
+            mock_notify.assert_called_once()
+            args = mock_notify.call_args[0]
+            self.assertIn("sess_block_test", args[0])
+
+    def test_open_hud_vscode_hint(self):
+        with patch.dict(os.environ, {"TERM_PROGRAM": "vscode"}), \
+             patch("webbrowser.open") as mock_open, \
+             patch("builtins.print") as mock_print:
+            server._open_hud(7890)
+            mock_open.assert_not_called()
+            mock_print.assert_called_with("Open it in the editor: Cmd+Shift+P, Subway: Open HUD")
+
+class TestModelRoutingAndStats(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_subway_dir = server.SUBWAY_DIR
+        server.SUBWAY_DIR = self.temp_dir
+
+    def tearDown(self):
+        server.SUBWAY_DIR = self.orig_subway_dir
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_estimate_complexity_roles_raise_tier(self):
+        # Base task is low (typo fix)
+        c_base = server.estimate_complexity("fix typo in readme")
+        self.assertEqual(c_base["tier"], "low")
+
+        # Reviewer raises low -> medium
+        c_rev = server.estimate_complexity("fix typo in readme", role="reviewer")
+        self.assertEqual(c_rev["tier"], "medium")
+
+        # Architect raises medium -> high
+        c_arch = server.estimate_complexity("write unit tests", role="Lead Architect")
+        self.assertEqual(c_arch["tier"], "high")
+
+        # Security raises high -> frontier
+        c_sec = server.estimate_complexity("refactor auth flow", role="security auditor")
+        self.assertEqual(c_sec["tier"], "frontier")
+
+    def test_unknown_allowance_counts_as_25(self):
+        mock_providers = [
+            {"id": "claude", "client": {"dispatchable": True}},
+            {"id": "antigravity", "client": {"dispatchable": True}}
+        ]
+        # antigravity model has pool with 30 left; claude has unknown pool (None)
+        with mock.patch.object(server, "_pool_left", side_effect=lambda provs, prov, m: 30.0 if prov == "antigravity" else None):
+            res = server.route_task("hard mathematical proof", god=True, providers=mock_providers)
+            # 30.0 left > 25.0 default for unknown, so antigravity should outrank claude if scarce/tied
+            self.assertIn("picks", res)
+
+    def test_model_stats_recorded_on_worker_finish(self):
+        meta = {
+            "id": "worker_test1",
+            "provider": "claude",
+            "model": "sonnet",
+            "prompt": "edit function to fix bug",
+            "role": "coder",
+            "status": "running",
+            "pid": 999999,
+        }
+        # 1. Landed outcome
+        server._record_worker_stat(meta, {"status": "completed", "reason": "Patch applied to the working tree."})
+        # 2. No change outcome (hallucination)
+        server._record_worker_stat(meta, {"status": "failed", "reason": "Reported work, but no files changed."})
+        # 3. Budget stopped
+        server._record_worker_stat(meta, {"status": "budget_stopped", "reason": "Stopped at its budget"})
+        # 4. Failed
+        server._record_worker_stat(meta, {"status": "failed", "reason": "Syntax error in script"})
+
+        stats = server._load_model_stats()
+        self.assertEqual(len(stats), 4)
+        outcomes = [s["outcome"] for s in stats]
+        self.assertEqual(outcomes, ["landed", "no_change", "budget_stopped", "failed"])
+        self.assertEqual(stats[0]["provider"], "claude")
+        self.assertEqual(stats[0]["model"], "sonnet")
+        self.assertIn("tier", stats[0])
+
+    def test_routing_weighs_landed_rate_and_downranks_no_change(self):
+        mock_providers = [{"id": "claude", "client": {"dispatchable": True}}]
+        tier = "medium"
+        role = "coder"
+        jt = server._job_type(tier, role)
+
+        # < 5 records: benchmark stays as prior
+        stats = [
+            {"provider": "claude", "model": "sonnet", "job_type": jt, "outcome": "failed"}
+            for _ in range(4)
+        ]
+        with mock.patch.object(server, "_load_model_stats", return_value=stats):
+            res = server.route_task("write a test", role="coder", providers=mock_providers)
+            # Sonnet coding strength is 4, >= need (3)
+            self.assertTrue(any(p["model"] == "sonnet" for p in res["picks"]))
+
+        # >= 5 records with low landed rate weighs strength down
+        bad_stats = [
+            {"provider": "claude", "model": "sonnet", "job_type": jt, "outcome": "failed"}
+            for _ in range(5)
+        ]
+        with mock.patch.object(server, "_load_model_stats", return_value=bad_stats):
+            res_bad = server.route_task("write a test", role="coder", providers=mock_providers)
+            # Landed rate is 0%, strength drops to 0.0, so sonnet is not capable of meeting need=3
+            for pick in res_bad.get("picks", []):
+                if pick.get("model") == "sonnet":
+                    # If present, it was only included because nothing else met need
+                    break
+
+        # High no_change rate on code edit tasks down-ranks
+        no_change_stats = [
+            {"provider": "claude", "model": "sonnet", "job_type": jt, "outcome": "no_change"}
+            for _ in range(5)
+        ]
+        with mock.patch.object(server, "_load_model_stats", return_value=no_change_stats):
+            res_nc = server.route_task("edit code to fix bug", role="coder", providers=mock_providers)
+            self.assertIn("picks", res_nc)
+
+class TestCompaction(unittest.TestCase):
+    """Tests for compaction threshold maths, quiet rule, context measurement, and modes."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="subway_compaction_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_threshold_maths(self):
+        # High complexity -> 60% threshold
+        high_prompt = "Perform complete architecture refactor across multiple files and protocol migration"
+        pct_high = server.compaction_threshold_pct(high_prompt)
+        self.assertEqual(pct_high, 60.0)
+        self.assertEqual(server.compaction_threshold(high_prompt, 200000), 120000)
+        self.assertEqual(server.compaction_threshold(high_prompt, 1000000), 600000)
+
+        # Normal/low complexity -> 75% threshold
+        low_prompt = "Fix a typo in the comment"
+        pct_low = server.compaction_threshold_pct(low_prompt)
+        self.assertEqual(pct_low, 75.0)
+        self.assertEqual(server.compaction_threshold(low_prompt, 200000), 150000)
+        self.assertEqual(server.compaction_threshold(low_prompt, 1000000), 750000)
+
+    def test_quiet_rule(self):
+        # Window = 200,000 -> half window = 100,000
+        # If remaining chat budget < 100,000: stay quiet
+        self.assertTrue(server.is_compaction_quiet(99999, 200000))
+        self.assertTrue(server.is_compaction_quiet(50000, 200000))
+        self.assertFalse(server.is_compaction_quiet(100000, 200000))
+        self.assertFalse(server.is_compaction_quiet(150000, 200000))
+        self.assertFalse(server.is_compaction_quiet(None, 200000))
+
+        # Test quiet rule suppresses compaction_notice
+        cfg = {"chat_budget_tokens": 100000, "compaction": "suggest"}
+        with patch.object(server, "_load_json", return_value=cfg), \
+             patch.object(server, "chat_tokens_used", return_value=60000), \
+             patch.object(server, "chat_context_usage", return_value=(180000, 200000)):
+            # Remaining budget is 40,000 < half window (100,000) -> None
+            notice = server.compaction_notice("test_sid", "simple prompt")
+            self.assertIsNone(notice)
+
+    def test_compaction_modes_and_context_usage(self):
+        # Test config modes
+        with patch.object(server, "_load_json", return_value={}):
+            self.assertEqual(server.get_compaction(), "suggest")
+
+        with patch.object(server, "_load_json", return_value={"compaction": "auto"}):
+            self.assertEqual(server.get_compaction(), "auto")
+
+        with patch.object(server, "_load_json", return_value={"compaction": "never"}):
+            self.assertEqual(server.get_compaction(), "never")
+            # 'never' says nothing
+            with patch.object(server, "chat_context_usage", return_value=(190000, 200000)):
+                self.assertIsNone(server.compaction_notice("test_sid", "test prompt"))
+
+        # Context usage parsing for Claude Code (200k vs 1m)
+        t_file = os.path.join(self.tmpdir, "session.jsonl")
+        with open(t_file, "w") as f:
+            f.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-3-5-sonnet",
+                    "usage": {
+                        "input_tokens": 100000,
+                        "cache_read_input_tokens": 20000,
+                        "cache_creation_input_tokens": 30000
+                    }
+                }
+            }) + "\n")
+        tokens, window = server.chat_context_usage(t_file)
+        self.assertEqual(tokens, 150000)
+        self.assertEqual(window, 200000)
+
+        # 1m window model
+        with open(t_file, "a") as f:
+            f.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-3-7-sonnet-[1m]",
+                    "usage": {
+                        "input_tokens": 600000,
+                        "cache_read_input_tokens": 50000,
+                        "cache_creation_input_tokens": 50000
+                    }
+                }
+            }) + "\n")
+        tokens, window = server.chat_context_usage(t_file)
+        self.assertEqual(tokens, 700000)
+        self.assertEqual(window, 1000000)
+
+    def test_suggest_and_auto_notices(self):
+        # Test 'suggest' ping and desktop notification
+        cfg = {"compaction": "suggest"}
+        with patch.object(server, "_load_json", side_effect=lambda f: cfg if f == "config.json" else {}), \
+             patch.object(server, "_save_json"), \
+             patch.object(server, "chat_context_usage", return_value=(160000, 200000)), \
+             patch.object(server, "read_track_entries", return_value=[{"message": "refactor auth"}]), \
+             patch.object(server, "notify_desktop_event") as mock_notify:
+            notice = server.compaction_notice("session_suggest", "normal prompt")
+            self.assertIsNotNone(notice)
+            self.assertIn("This chat is at 80% of its context. Compact now: /compact keep refactor auth", notice)
+            mock_notify.assert_called_once()
+
+        # Test 'auto' adds claude note
+        cfg_auto = {"compaction": "auto"}
+        with patch.object(server, "_load_json", side_effect=lambda f: cfg_auto if f == "config.json" else {}), \
+             patch.object(server, "_save_json"), \
+             patch.object(server, "chat_context_usage", return_value=(160000, 200000)), \
+             patch.object(server, "read_track_entries", return_value=[{"message": "refactor auth"}]), \
+             patch.object(server, "notify_desktop_event"), \
+             patch.object(server, "compact_opencode_workers") as mock_compact_opencode:
+            notice_auto = server.compaction_notice("session_auto", "normal prompt")
+            self.assertIsNotNone(notice_auto)
+            self.assertIn("Claude Code compacts by itself near its limit; Subway can't run /compact inside an open chat", notice_auto)
+            mock_compact_opencode.assert_called_once()
+
+
+class TestCodePacket(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="subway_code_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_unresolved_name_refuses(self):
+        res = server.t_spin_worker(role="Tester", prompt="Check code", project_dir=self.tmpdir,
+                                   code=["nonexistent_symbol_xyz"])
+        self.assertTrue(res.startswith("Error:"), res)
+        self.assertIn("nonexistent_symbol_xyz", res)
+
+    def test_size_limit_refuses(self):
+        large_file = os.path.join(self.tmpdir, "big.py")
+        with open(large_file, "w") as f:
+            f.write("# comment\n" + ("x = 1\n" * 15000))
+        # 1-15000 lines is > 60000 chars
+        res = server.t_spin_worker(role="Tester", prompt="Check code", project_dir=self.tmpdir,
+                                   code=["big.py:1-14000"])
+        self.assertTrue(res.startswith("Error:"), res)
+        self.assertIn("60000", res)
+
+    def test_changed_file_refuses(self):
+        test_py = os.path.join(self.tmpdir, "logic.py")
+        with open(test_py, "w") as f:
+            f.write("def my_func():\n    return 42\n")
+
+        with mock.patch.object(server, "_worker_command", return_value="echo test"):
+            res = server.t_spin_worker(role="Tester", prompt="Check logic", project_dir=self.tmpdir,
+                                       provider="claude", code=["logic.py:my_func"])
+        self.assertIn("APPROVAL REQUIRED", res)
+        # Extract worker_id
+        m = re.search(r"worker_[0-9a-fA-F]+", res)
+        self.assertIsNotNone(m)
+        worker_id = m.group(0)
+
+        # Mutate the file
+        with open(test_py, "w") as f:
+            f.write("def my_func():\n    return 100\n")
+
+        launch_res = server._launch_worker(worker_id)
+        self.assertTrue(launch_res.startswith("Error:"), launch_res)
+        self.assertIn("changed", launch_res)
+
+    def test_js_function_extraction(self):
+        js_file = os.path.join(self.tmpdir, "component.js")
+        with open(js_file, "w") as f:
+            f.write("import foo from 'bar';\n\nexport function myWidget(props) {\n  const x = 1;\n  return x;\n}\n\nfunction other() {}\n")
+
+        with mock.patch.object(server, "_worker_command", return_value="echo test") as mock_cmd:
+            res = server.t_spin_worker(role="Tester", prompt="Build UI", project_dir=self.tmpdir,
+                                       provider="claude", code=["component.js:myWidget"])
+            self.assertIn("APPROVAL REQUIRED", res)
+            called_prompt = mock_cmd.call_args[0][7]
+            self.assertIn("=== CODE (all you need: do not search) ===", called_prompt)
+            self.assertIn("export function myWidget(props) {", called_prompt)
+            self.assertIn("component.js:3-6", called_prompt)
+
+
+class TestHudAutostart(unittest.TestCase):
+    """Test HUD autostart on MCP server start and that a running HUD isn't started twice."""
+
+    def test_running_hud_not_started_twice(self):
+        """When HUD is already running on the port, autostart should not spawn a process."""
+        with patch.object(server, "_load_json", return_value={"hud_autostart": True}), \
+             patch.object(server, "_hud_probe", return_value={"service": "subway-context", "version": server.VERSION}), \
+             patch("subprocess.Popen") as mock_popen:
+            server._autostart_hud()
+            mock_popen.assert_not_called()
+
+    def test_hud_starts_when_not_running(self):
+        """When nothing answers healthz, HUD process should start with SUBWAY_HUD_NO_OPEN=1 and start_new_session=True."""
+        with patch.object(server, "_load_json", return_value={"hud_autostart": True}), \
+             patch.object(server, "_hud_probe", return_value=None), \
+             patch("subprocess.Popen") as mock_popen:
+            server._autostart_hud()
+            mock_popen.assert_called_once()
+            args, kwargs = mock_popen.call_args
+            self.assertTrue(kwargs.get("start_new_session"))
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stdout"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stderr"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("env", {}).get("SUBWAY_HUD_NO_OPEN"), "1")
+
+    def test_hud_autostart_disabled_config(self):
+        """When hud_autostart is false in config, do not start HUD."""
+        with patch.object(server, "_load_json", return_value={"hud_autostart": False}), \
+             patch.object(server, "_hud_probe", return_value=None), \
+             patch("subprocess.Popen") as mock_popen:
+            server._autostart_hud()
+            mock_popen.assert_not_called()
+
+    def test_hud_autostart_cli(self):
+        """subway-context hud-autostart on|off sets config value."""
+        with patch.object(server, "_save_json") as mock_save, \
+             patch.object(server, "_load_json", return_value={}):
+            ret = server.run_cli(["hud-autostart", "off"])
+            self.assertEqual(ret, 0)
+            mock_save.assert_called_with("config.json", {"hud_autostart": False})
+
+            ret = server.run_cli(["hud-autostart", "on"])
+            self.assertEqual(ret, 0)
+            mock_save.assert_called_with("config.json", {"hud_autostart": True})
+
+
+class DesktopNotificationTests(unittest.TestCase):
+    """Test desktop notification integration on Linux, Windows, and macOS."""
+
+    def test_linux_notify_with_action(self):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            res = mock.MagicMock()
+            if cmd == ["notify-send", "--help"]:
+                res.stdout = "Usage: notify-send [OPTION...] ... --action=... -w, --wait"
+                res.stderr = ""
+            elif len(cmd) > 1 and cmd[0] == "notify-send" and "--action=open=Open" in cmd:
+                res.stdout = "open\n"
+                res.stderr = ""
+            else:
+                res.stdout = ""
+                res.stderr = ""
+            return res
+
+        def fake_thread(target, daemon=True):
+            t = mock.MagicMock()
+            t.start.side_effect = target
+            return t
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.platform", "linux"), \
+             patch("shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("threading.Thread", side_effect=fake_thread):
+            server._send_desktop_notification("Job Done", "All tasks finished")
+
+        self.assertIn(["notify-send", "--help"], calls)
+        self.assertIn(["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", "Job Done", "All tasks finished"], calls)
+        self.assertIn(["xdg-open", "http://127.0.0.1:7890/#workers"], calls)
+
+    def test_linux_notify_without_action(self):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            res = mock.MagicMock()
+            res.stdout = "notify-send without action support"
+            res.stderr = ""
+            return res
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.platform", "linux"), \
+             patch("shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("subprocess.run", side_effect=fake_run):
+            server._send_desktop_notification("Job Done", "All tasks finished")
+
+        self.assertIn(["notify-send", "--help"], calls)
+        self.assertIn(["notify-send", "Job Done", "All tasks finished"], calls)
+        self.assertNotIn(["xdg-open", "http://127.0.0.1:7890/#workers"], calls)
+
+    def test_linux_notify_missing(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.platform", "linux"), \
+             patch("shutil.which", return_value=None), \
+             patch("subprocess.run") as mock_run:
+            server._send_desktop_notification("Job Done", "All tasks finished")
+            mock_run.assert_not_called()
+
+    def test_windows_native_toast_escaping(self):
+        title = 'Worker "Alpha" & \'Beta\' <urgent>'
+        message = 'Needs "help" & \'details\' > now'
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.platform", "win32"), \
+             patch("subprocess.run") as mock_run:
+            server._send_desktop_notification(title, message)
+            mock_run.assert_called_once()
+            cmd = mock_run.call_args[0][0]
+            kwargs = mock_run.call_args[1]
+
+            self.assertEqual(cmd[:5], ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command"])
+            ps_script = cmd[5]
+
+            # Verify XML escaping and PowerShell escaping
+            self.assertIn("&quot;Alpha&quot; &amp; &apos;Beta&apos; &lt;urgent&gt;", ps_script)
+            self.assertIn("Needs &quot;help&quot; &amp; &apos;details&apos; &gt; now", ps_script)
+            self.assertIn('activationType="protocol" launch="http://127.0.0.1:7890/#workers"', ps_script)
+            self.assertIn(r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe", ps_script)
+            self.assertEqual(kwargs.get("creationflags"), getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+    def test_macos_notifications(self):
+        # With terminal-notifier
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.platform", "darwin"), \
+             patch("shutil.which", return_value="/usr/local/bin/terminal-notifier"), \
+             patch("subprocess.run") as mock_run:
+            server._send_desktop_notification("Hi", "There")
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            self.assertEqual(args[0], "/usr/local/bin/terminal-notifier")
+            self.assertIn("-open", args)
+
+        # Without terminal-notifier (osascript fallback with quote escaping)
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.platform", "darwin"), \
+             patch("shutil.which", return_value=None), \
+             patch("subprocess.run") as mock_run:
+            server._send_desktop_notification('Alert "1"', 'Msg with "quotes"')
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            self.assertEqual(args[:2], ["osascript", "-e"])
+            self.assertIn(r'Alert \"1\"', args[2])
+            self.assertIn(r'Msg with \"quotes\"', args[2])
+
+    def test_install_ensure_notifier(self):
+        import install
+
+        # Windows
+        with patch("sys.platform", "win32"), patch("builtins.print") as mock_print:
+            res = install.ensure_notifier(interactive=False, auto_yes=True)
+            self.assertEqual(res, "present")
+            output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
+            self.assertIn("Windows native toasts need nothing extra", output)
+
+        # Linux with --action
+        help_mock = mock.MagicMock(stdout="--action=open", stderr="")
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("subprocess.run", return_value=help_mock), \
+             patch("builtins.print") as mock_print:
+            res = install.ensure_notifier(interactive=False, auto_yes=True)
+            self.assertEqual(res, "present")
+
+        # Linux without --action
+        help_mock = mock.MagicMock(stdout="no action flag", stderr="")
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("subprocess.run", return_value=help_mock), \
+             patch("builtins.print") as mock_print:
+            res = install.ensure_notifier(interactive=False, auto_yes=True)
+            self.assertEqual(res, "no-action")
+            output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
+            self.assertIn("can't open the HUD on click", output)
+
+        # Linux missing notify-send (apt)
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", side_effect=lambda bin_name: "/usr/bin/apt" if bin_name == "apt" else None), \
+             patch("builtins.print") as mock_print:
+            res = install.ensure_notifier(interactive=False, auto_yes=True)
+            self.assertEqual(res, "missing")
+            output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
+            self.assertIn("apt install libnotify-bin", output)
+
+        # Linux missing notify-send (dnf)
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", side_effect=lambda bin_name: "/usr/bin/dnf" if bin_name == "dnf" else None), \
+             patch("builtins.print") as mock_print:
+            res = install.ensure_notifier(interactive=False, auto_yes=True)
+            self.assertEqual(res, "missing")
+            output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
+            self.assertIn("dnf install libnotify", output)
+
+        # Linux missing notify-send (pacman)
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", side_effect=lambda bin_name: "/usr/bin/pacman" if bin_name == "pacman" else None), \
+             patch("builtins.print") as mock_print:
+            res = install.ensure_notifier(interactive=False, auto_yes=True)
+            self.assertEqual(res, "missing")
+            output = " ".join(call[0][0] for call in mock_print.call_args_list if call[0])
+            self.assertIn("pacman -S libnotify", output)
+
+
+

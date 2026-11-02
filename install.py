@@ -226,9 +226,11 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
             npx = "npx.cmd" if sys.platform == "win32" else "npx"
             hook_cmd = f"{shlex.quote(npx)} -y subway-context hook-guard"
             hook_prompt_cmd = f"{shlex.quote(npx)} -y subway-context hook-prompt"
+            hook_precompact_cmd = f"{shlex.quote(npx)} -y subway-context hook-precompact"
         else:
             hook_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-guard"
             hook_prompt_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-prompt"
+            hook_precompact_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-precompact"
 
         # Remove existing subway hooks and drop entries left empty
         for event, entries in list(hooks.items()):
@@ -240,7 +242,7 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
                     remaining_hooks = [
                         h for h in entry["hooks"]
                         if isinstance(h, dict) and not (
-                            "hook-guard" in h.get("command", "") or "hook-prompt" in h.get("command", "")
+                            "hook-guard" in h.get("command", "") or "hook-prompt" in h.get("command", "") or "hook-precompact" in h.get("command", "")
                         )
                     ]
                     if remaining_hooks:
@@ -249,7 +251,7 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
                         cleaned.append(entry_copy)
                 elif isinstance(entry, dict):
                     cmd = entry.get("command", "")
-                    if not ("hook-guard" in cmd or "hook-prompt" in cmd):
+                    if not ("hook-guard" in cmd or "hook-prompt" in cmd or "hook-precompact" in cmd):
                         cleaned.append(entry)
                 else:
                     cleaned.append(entry)
@@ -266,6 +268,12 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
         if isinstance(user_prompt, list):
             user_prompt.append({
                 "hooks": [{"type": "command", "command": hook_prompt_cmd}],
+            })
+
+        pre_compact = hooks.setdefault("PreCompact", [])
+        if isinstance(pre_compact, list):
+            pre_compact.append({
+                "hooks": [{"type": "command", "command": hook_precompact_cmd}],
             })
 
         _atomic_write_json(settings_path, settings_data)
@@ -446,6 +454,28 @@ def remove_target(target: str) -> bool:
                             new_up.append(entry)
                     if up_found:
                         hooks["UserPromptSubmit"] = new_up
+                        _atomic_write_json(s_path, s_data)
+                        removed = True
+
+                pre_compact = hooks.get("PreCompact", [])
+                if isinstance(pre_compact, list):
+                    new_pc = []
+                    pc_found = False
+                    for entry in pre_compact:
+                        if isinstance(entry, dict):
+                            sub_hooks = entry.get("hooks", [])
+                            filtered = [h for h in sub_hooks if isinstance(h, dict) and "hook-precompact" not in h.get("command", "")]
+                            if len(filtered) != len(sub_hooks):
+                                pc_found = True
+                            if filtered:
+                                entry["hooks"] = filtered
+                                new_pc.append(entry)
+                            else:
+                                pc_found = True
+                        else:
+                            new_pc.append(entry)
+                    if pc_found:
+                        hooks["PreCompact"] = new_pc
                         _atomic_write_json(s_path, s_data)
                         removed = True
             except Exception as e:
@@ -764,6 +794,72 @@ def _normalize_selection(raw: str, detected_keys: List[str]) -> List[str]:
     return list(dict.fromkeys(chosen))
 
 
+def ensure_notifier(interactive: bool, auto_yes: bool) -> str:
+    """Offer or verify desktop alert integration so clicking an alert opens the HUD. Always says what it did."""
+    if sys.platform.startswith("win"):
+        print("  ✓ Desktop alerts: Windows native toasts need nothing extra; clicking an alert opens the HUD.")
+        return "present"
+    if sys.platform.startswith("linux"):
+        if shutil.which("notify-send"):
+            has_action = False
+            try:
+                proc = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=2)
+                has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
+            except Exception:
+                has_action = False
+            if has_action:
+                print("  ✓ Desktop alerts: notify-send found with action support; clicking an alert opens the HUD.")
+                return "present"
+            print("  ! Desktop alerts: notify-send found. Alerts work, but can't open the HUD on click.")
+            return "no-action"
+
+        why = ("Subway sends desktop alerts when a worker needs you. "
+               "With action support, clicking one opens the HUD.")
+        pkg_cmd = ""
+        if shutil.which("apt") or shutil.which("apt-get"):
+            pkg_cmd = "sudo apt install libnotify-bin"
+        elif shutil.which("dnf"):
+            pkg_cmd = "sudo dnf install libnotify"
+        elif shutil.which("pacman"):
+            pkg_cmd = "sudo pacman -S libnotify"
+
+        if pkg_cmd:
+            print(f"\n  Optional: {why}\n  To add desktop alerts, run: {pkg_cmd}")
+        else:
+            print(f"\n  Optional: {why}\n  To add desktop alerts, install libnotify (notify-send).")
+        return "missing"
+    if sys.platform != "darwin":
+        return "skipped"
+    if shutil.which("terminal-notifier"):
+        print("  ✓ Desktop alerts: terminal-notifier found, so clicking an alert opens the HUD.")
+        return "present"
+    why = ("Subway sends desktop alerts when a worker needs you. With terminal-notifier, clicking one opens the HUD; "
+           "without it alerts still show, but macOS opens Script Editor when you click them.")
+    brew = shutil.which("brew")
+    if not brew:
+        print(f"\n  Optional: {why}\n  Install Homebrew, then run: brew install terminal-notifier")
+        return "no-brew"
+    if not interactive and not auto_yes:
+        print(f"\n  Optional: {why}\n  To add it: brew install terminal-notifier")
+        return "hint"
+    if interactive and not auto_yes:
+        print(f"\n  {why}")
+        answer = input("  Install terminal-notifier with Homebrew now? [Y/n]: ").strip().lower()
+        if answer not in ("", "y", "yes"):
+            print("  Skipped. You can add it any time: brew install terminal-notifier")
+            return "declined"
+    print("  Installing terminal-notifier with Homebrew (brew install terminal-notifier)...")
+    try:
+        done = subprocess.run([brew, "install", "terminal-notifier"], timeout=600).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        done = False
+    if done:
+        print("  ✓ terminal-notifier installed: clicking a Subway alert now opens the HUD.")
+        return "installed"
+    print("  ✗ Couldn't install it. Alerts still work. To try again: brew install terminal-notifier")
+    return "failed"
+
+
 def main() -> None:
     args = sys.argv[1:]
 
@@ -857,6 +953,7 @@ def main() -> None:
         sys.exit(1)
     print(f"\n✓ Completed. {connected_count} agent line(s) connected.")
     print("You can now bridge chats across your selected windows.")
+    ensure_notifier(interactive=sys.stdin.isatty(), auto_yes=auto_yes)
 
 
 if __name__ == "__main__":

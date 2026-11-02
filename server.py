@@ -916,13 +916,60 @@ def claude_read(path: str, mode: str = "full", n: int = 0) -> List[Dict[str, Any
         nbytes *= 4
 
 
-def chat_turns(chat: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """All turns of a chat, from any provider, in stable order."""
+def claude_read_segments(path: str, is_sub: bool = False) -> List[List[Dict[str, Any]]]:
+    """Read a transcript and split turns into segments at compact_boundary lines."""
+    segments_raw: List[List[str]] = [[]]
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            for raw in f:
+                if b'"compact_boundary"' in raw:
+                    try:
+                        o = json.loads(raw.decode("utf-8", "replace"))
+                        if o.get("type") == "system" and o.get("subtype") == "compact_boundary":
+                            segments_raw.append([])
+                            continue
+                    except Exception:
+                        pass
+                if b'"type":"assistant"' in raw or (b'"type":"user"' in raw and b'"tool_result"' not in raw[:3000]):
+                    segments_raw[-1].append(raw.decode("utf-8", "replace"))
+    parsed = [claude_parse_lines(s_lines, is_subagent=is_sub) for s_lines in segments_raw]
+    return parsed if parsed else [[]]
+
+
+def chat_segments_info(chat: Dict[str, Any], segment: Union[str, int] = "all") -> Tuple[List[Dict[str, Any]], str, int]:
     if chat["source"] == "claude":
-        return claude_read(chat["path"])
-    if chat["source"] == "opencode":
-        return opencode_read(chat["id"])
-    return agy_read(chat["id"])
+        is_sub = "/subagents/" in chat.get("path", "")
+        segs = claude_read_segments(chat["path"], is_sub=is_sub)
+        total = len(segs)
+        seg_str = str(segment).strip().lower()
+        if seg_str == "all":
+            all_turns: List[Dict[str, Any]] = []
+            for s in segs:
+                all_turns.extend(s)
+            return all_turns, "all", total
+        elif seg_str == "latest":
+            idx = total - 1
+            return segs[idx], str(idx), total
+        else:
+            try:
+                idx = int(segment)
+            except ValueError:
+                idx = total - 1
+            idx = max(0, min(idx, total - 1))
+            return segs[idx], str(idx), total
+    elif chat["source"] == "opencode":
+        turns = opencode_read(chat["id"])
+        seg_str = "all" if str(segment).strip().lower() == "all" else "0"
+        return turns, seg_str, 1
+    else:
+        turns = agy_read(chat["id"])
+        seg_str = "all" if str(segment).strip().lower() == "all" else "0"
+        return turns, seg_str, 1
+
+
+def chat_turns(chat: Dict[str, Any], segment: Union[str, int] = "all") -> List[Dict[str, Any]]:
+    """All turns of a chat, from any provider, in stable order."""
+    return chat_segments_info(chat, segment)[0]
 
 
 # --------------------------------------------------------------------------
@@ -944,6 +991,9 @@ def _agy_db() -> Optional[sqlite3.Connection]:
 
 
 def _agy_transcript_path(cid: str) -> str:
+    full = os.path.join(AGY_DIR, "brain", cid, ".system_generated", "logs", "transcript_full.jsonl")
+    if os.path.exists(full):
+        return full
     return os.path.join(AGY_DIR, "brain", cid, ".system_generated", "logs", "transcript.jsonl")
 
 
@@ -1503,7 +1553,7 @@ def _file_may_contain(path: str, needles: List[bytes]) -> bool:
 
 
 def t_search_chat(quote: str = "", query: str = "", source: str = "all", project: str = "", limit: int = 5,
-                  include_subagents: bool = True) -> str:
+                  include_subagents: bool = True, segment: Union[str, int] = "all") -> str:
     target = (quote or query or "").strip()
     if not target:
         return "Please provide a quote or snippet to search for."
@@ -1520,7 +1570,8 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
         try:
             if c["source"] == "claude" and not _file_may_contain(c["path"], needles):
                 continue
-            ex = to_exchanges(chat_turns(c))
+            data, seg_label, total_segments = chat_segments_info(c, segment)
+            ex = to_exchanges(data)
         except OSError as e:
             log("search skipped", c.get("id"), e)
             continue
@@ -1531,6 +1582,8 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
                     "chat": c,
                     "exchange_index": i,
                     "total_exchanges": len(ex),
+                    "segment": seg_label,
+                    "total_segments": total_segments,
                     "ts": e.get("ts"),
                     "sample": one_line(e["user"] or (e["assistant"][0] if e["assistant"] else ""), 120),
                 })
@@ -1547,8 +1600,9 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
         idx = m["exchange_index"]
         rem = m["total_exchanges"] - idx
         sub_tag = f" [Subagent of `{c['parent'][:8]}`]" if c.get("subagent") else ""
+        seg_tag = f" [Segment {m['segment']} of {m['total_segments']}]"
         lines.append(
-            f"- **{c['source'].upper()}** `{c['id'][:8]}`{sub_tag} ({c.get('title')})\n"
+            f"- **{c['source'].upper()}** `{c['id'][:8]}`{sub_tag}{seg_tag} ({c.get('title')})\n"
             f"  Matched at Station `[{idx}]` of {m['total_exchanges']} ({fmt_ts(m['ts'])})\n"
             f"  Snippet: \"{m['sample']}\"\n"
             f"  -> Transit forward: `read_chat(chat_id='{c['id'][:8]}', start={idx})` ({rem} stops left)"
@@ -1570,7 +1624,8 @@ def t_tag_chat(alias: str, chat_id: str = "") -> str:
 def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optional[int] = None,
                 since: str = "", anchor_text: str = "",
                 max_chars: int = DEFAULT_MAX_CHARS, include_tools: bool = False,
-                include_thoughts: bool = True, source: str = "all", project: str = "") -> str:
+                include_thoughts: bool = True, source: str = "all", project: str = "",
+                segment: Union[str, int] = "all") -> str:
     if mode not in ("recent", "outline", "full", "decisions"):
         raise ValueError("mode must be 'recent', 'outline', 'full', or 'decisions'")
     since_spec = (since or "").strip().lower()
@@ -1579,7 +1634,7 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
         raise ValueError("since must be 'last' or 'bridge -N'")
 
     c = resolve(chat_id, source, project)
-    data = chat_turns(c)
+    data, seg_label, total_segments = chat_segments_info(c, segment)
     ex = to_exchanges(data)
     explicit_start = start is not None
     start_idx = max(0, int(start or 0))
@@ -1622,7 +1677,11 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
             anchor_info = f"Transit delta since watermark ({fmt_ts(last_cp.get('ts'))}); boarding at station [{start_idx}]"
             if start_idx >= len(ex):
                 return (f"# subway-context: {c['source'].upper()} `{target_id}`\n"
+                        f"Segment: {seg_label} of {total_segments}\n"
                         f"No new stations since your last transit ({len(ex)} stations, watermark {fmt_ts(last_cp.get('ts'))}).")
+
+    seg_notice = f"Segment {seg_label} of {total_segments}"
+    anchor_info = f"[{seg_notice}] {anchor_info}" if anchor_info else f"[{seg_notice}]"
 
     delivery: Dict[str, Any] = {}
     text = render_chat(c, data, mode, int(turns), start_idx, int(max_chars),
@@ -2035,7 +2094,7 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                                        "permissionDecisionReason": "Budgets are the user's to change. Ask them to run it, or use the HUD."}}
     cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
     if (tool_name == "Bash" or cmd is not None) and isinstance(cmd, str):
-        if (re.search(r"(subway-context|server\.py)\s+budget\s+\S+\s+\d", cmd)
+        if (re.search(r"(subway-context|server\.py)\s+(budget|compaction)\b", cmd)
                 or any(k in cmd for k in ("/api/budget", "/api/chat_budget", "/api/settings", "X-Subway-Token"))):
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -2060,15 +2119,19 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not filepath:
         return None
     lease = load_locks()["locks"].get(_canon_path(filepath, event.get("cwd") or ""))
-    if not lease or lease.get("holder_id") == event.get("session_id"):
-        return None
-    rem = max(0, int(lease.get("expires_at", 0) - time.time()))
-    return {"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": (f"Subway lease: {filepath} is held by {lease.get('holder')} for "
-                                     f"'{lease.get('purpose')}' ({rem}s left). Wait, or coordinate through send_note."),
-    }}
+    if lease and lease.get("holder_id") != event.get("session_id") and lease.get("holder") != event.get("session_id"):
+        rem = max(0, int(lease.get("expires_at", 0) - time.time()))
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (f"Subway lease: {filepath} is held by {lease.get('holder')} for "
+                                         f"'{lease.get('purpose')}' ({rem}s left). Wait, or coordinate through send_note."),
+        }}
+    if not lease and tool_name in ("Edit", "Write"):
+        sid = event.get("session_id") or ""
+        t_claim_file(filepath=filepath, holder=sid, duration_seconds=300,
+                     purpose="auto-claimed on first edit", project_dir=event.get("cwd") or "")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -2277,6 +2340,84 @@ def _log_tail(log_file: Optional[str], n: int = 25) -> str:
     return ""
 
 
+def _job_type(tier: str, role: str = "") -> str:
+    r = (role or "").strip().lower()
+    return f"{tier}:{r}" if r else tier
+
+
+def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
+    if "outcome" in result:
+        return result["outcome"]
+    if "outcome" in meta:
+        return meta["outcome"]
+    status = result.get("status") or meta.get("status", "")
+    reason = str(result.get("reason") or meta.get("report") or "")
+    if status == "budget_stopped" or "budget" in reason.lower():
+        return "budget_stopped"
+    if "no files changed" in reason.lower() or reason == "Reported work, but no files changed.":
+        return "no_change"
+    if status == "completed" or "patch applied" in reason.lower():
+        return "landed"
+    return "failed"
+
+
+def _record_worker_stat(meta: Dict[str, Any], result: Dict[str, Any]) -> None:
+    provider = meta.get("provider") or ""
+    model = meta.get("model") or ""
+    if not provider and not model:
+        return
+    role = meta.get("role") or ""
+    prompt = meta.get("prompt") or ""
+    c = estimate_complexity(prompt, role=role)
+    tier = c.get("tier", "medium")
+    jt = _job_type(tier, role)
+    outcome = _determine_outcome(meta, result)
+    entry = {
+        "provider": provider,
+        "model": model,
+        "job_type": jt,
+        "tier": tier,
+        "role": role,
+        "outcome": outcome,
+        "timestamp": time.time(),
+    }
+    stats_file = os.path.join(SUBWAY_DIR, "model_stats.json")
+    with _state_lock("model_stats"):
+        stats = []
+        if os.path.exists(stats_file):
+            with contextlib.suppress(Exception):
+                with open(stats_file, "r", encoding="utf-8") as f:
+                    stats = json.load(f)
+        if not isinstance(stats, list):
+            stats = []
+        stats.append(entry)
+        _write_json_atomic(stats_file, stats)
+
+
+def _load_model_stats() -> List[Dict[str, Any]]:
+    stats_file = os.path.join(SUBWAY_DIR, "model_stats.json")
+    if not os.path.exists(stats_file):
+        return []
+    with contextlib.suppress(Exception):
+        with open(stats_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    return []
+
+
+def _matches_job_type(record: Dict[str, Any], tier: str, role: str) -> bool:
+    rec_jt = record.get("job_type")
+    jt = _job_type(tier, role)
+    if rec_jt and rec_jt == jt:
+        return True
+    if record.get("tier") == tier and (record.get("role") or "").lower() == (role or "").lower():
+        return True
+    if rec_jt and (rec_jt == f"{tier}:{role}" or rec_jt == f"{tier}_{role}" or rec_jt == tier):
+        return True
+    return False
+
+
 def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
     """Settle a running worker from its supervisor's exit record, the only reliable result."""
     if meta.get("status") not in ("running", "stopping"):
@@ -2291,6 +2432,7 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
             return meta
         result = {"status": "failed", "exit_code": None, "reason": "supervisor disappeared before reporting"}
 
+    should_record = False
     with _state_lock("workers"):
         current = _load_worker(wid) or meta
         if current.get("status") in ("running", "stopping"):
@@ -2301,6 +2443,9 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
                 "report": result.get("reason") or _log_tail(current.get("log_file"), 10),
             })
             _save_worker(current)
+            should_record = True
+    if should_record and result is not None:
+        _record_worker_stat(current, result)
     return current
 
 
@@ -2387,6 +2532,22 @@ def estimate_complexity(prompt: str, role: str = "") -> Dict[str, Any]:
         tier, effort, mode = "medium", "medium", "standard"
         rationale = "General task with moderate scope."
         recommended_provider = "auto"
+
+    role_lower = (role or "").lower()
+    raise_keywords = ["reviewer", "review", "architect", "architecture", "security"]
+    if _has_any(role_lower, raise_keywords):
+        tier_up = {"low": "medium", "medium": "high", "high": "frontier", "frontier": "frontier"}
+        old_tier = tier
+        tier = tier_up.get(tier, tier)
+        if tier != old_tier:
+            rationale += f" Role '{role}' raises tier from {old_tier} to {tier}."
+            if tier == "high" and effort == "medium":
+                effort = "high"
+            elif tier == "medium" and effort == "low":
+                effort = "medium"
+            elif tier == "frontier":
+                effort, mode = "max", "god"
+                recommended_provider = "claude"
 
     return {
         "tier": tier,
@@ -2780,27 +2941,69 @@ def _pool_left(providers: List[Dict[str, Any]], provider: str, model: str) -> Op
     return min(values) if values else None
 
 
-def _mark_model_bad(model: str, reason: str = "") -> None:
+def _parse_reset_seconds(text: str) -> float:
+    m = re.search(r'Resets in\s+([0-9a-zA-Z\s]+)', text, re.IGNORECASE)
+    if m:
+        dur_str = m.group(1)
+        days = re.search(r'(\d+)\s*d', dur_str)
+        hours = re.search(r'(\d+)\s*h', dur_str)
+        mins = re.search(r'(\d+)\s*m', dur_str)
+        secs = re.search(r'(\d+)\s*s', dur_str)
+        total = (int(days.group(1)) * 86400 if days else 0) + \
+                (int(hours.group(1)) * 3600 if hours else 0) + \
+                (int(mins.group(1)) * 60 if mins else 0) + \
+                (int(secs.group(1)) if secs else 0)
+        if total > 0:
+            return float(total)
+    return 3600.0
+
+
+def _mark_model_bad(model: str, reason: str = "", reset_time: Optional[float] = None) -> None:
     if not model:
         return
     with _state_lock("bad_models"):
         bad = _load_json("bad_models.json")
-        bad[model] = {"timestamp": time.time(), "reason": str(reason or "")}
+        entry: Dict[str, Any] = {"timestamp": time.time(), "reason": str(reason or "")}
+        if reset_time is not None:
+            ts = float(reset_time) if float(reset_time) > 1000000000 else time.time() + float(reset_time)
+            entry["reset_time"] = ts
+            entry["resets_at"] = ts
+        bad[model] = entry
         _save_json("bad_models.json", bad)
+
+
+def _match_bad_entry(bad: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+    if not model:
+        return None
+    if model in bad:
+        return bad[model]
+    clean = model.split("/", 1)[1] if "/" in model else model
+    if clean in bad:
+        return bad[clean]
+    for k, v in bad.items():
+        k_clean = k.split("/", 1)[1] if "/" in k else k
+        if k_clean == clean:
+            return v
+        base_k = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', k_clean)
+        base_m = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', clean)
+        if base_k and base_m and base_k == base_m:
+            return v
+    return None
 
 
 def _model_is_bad(model: str) -> bool:
     if not model:
         return False
     bad = _load_json("bad_models.json")
-    entry = bad.get(model)
-    if not entry:
-        if "/" in model:
-            entry = bad.get(model.split("/", 1)[1])
-        else:
-            entry = next((v for k, v in bad.items() if k.endswith("/" + model)), None)
+    entry = _match_bad_entry(bad, model)
     if not entry:
         return False
+    if isinstance(entry, dict) and ("reset_time" in entry or "resets_at" in entry):
+        rt = entry.get("reset_time") or entry.get("resets_at")
+        try:
+            return time.time() < float(rt)
+        except (TypeError, ValueError):
+            pass
     ts = entry.get("timestamp") if isinstance(entry, dict) else entry
     try:
         ts_val = float(ts)
@@ -2809,13 +3012,28 @@ def _model_is_bad(model: str) -> bool:
     return (time.time() - ts_val) < 24 * 3600
 
 
+def _resolve_agy_model(model: str = "") -> str:
+    m = (model or "").strip()
+    if m and m != "inherit":
+        return m
+    env_m = os.environ.get("ANTIGRAVITY_MODEL") or os.environ.get("AGY_MODEL")
+    if env_m:
+        return env_m.strip()
+    for entry in DEFAULT_MODELS:
+        if entry.get("provider") == "antigravity":
+            cand = entry.get("model", "")
+            if cand and not _model_is_bad(cand):
+                return cand
+    return "gemini-4-argon"
+
+
 def route_task(prompt: str, role: str = "", private: bool = False, god: bool = False,
                providers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Pick models using all three signals:
     the task sets hard rules and how strong the model must be, the role sets which strength counts,
     and remaining allowance chooses among models that are good enough.
     """
-    c = estimate_complexity(prompt)
+    c = estimate_complexity(prompt, role=role)
     text = prompt.lower()
     scale = _scale_of(text)
     bulk = scale >= 100 and _has_any(text, BULK_WORDS)
@@ -2831,12 +3049,16 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
         need = 1
     providers = providers if providers is not None else discover_connected_providers()
     usable = {p["id"] for p in providers if (p.get("client") or {}).get("dispatchable")}
+    stats = _load_model_stats()
+    is_code_edit = (skill == "coding" and not _has_any(text, ["review", "audit"]))
     ranked = []
     for m in model_catalog():
         if m["provider"] not in usable:
             continue
         model_name = (m.get("model") or "").strip()
-        if not model_name:
+        if m["provider"] == "antigravity" and (not model_name or model_name == "inherit"):
+            model_name = _resolve_agy_model(model_name)
+        elif not model_name:
             if m["provider"] == "local":
                 model_name = choose_local_model(need_tools=False) or "local"
             elif m["provider"] == "opencode":
@@ -2847,22 +3069,38 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
         if not model_name or _model_is_bad(model_name):
             continue
         m_entry = dict(m, model=model_name)
-        strength = int(m_entry.get(skill, 1))
+        strength = float(m_entry.get(skill, 1))
         left = _pool_left(providers, m_entry["provider"], m_entry["model"])
         if left is not None and left <= 0:
             continue
-        ranked.append((strength, left if left is not None else 50.0, m_entry))
+
+        # Weigh recent landed rate for this job type (if >= 5 records; benchmarks stay as prior otherwise)
+        m_recs = [r for r in stats if r.get("provider") == m_entry["provider"]
+                  and (not r.get("model") or r.get("model") == m_entry["model"])
+                  and _matches_job_type(r, tier, role)]
+        if len(m_recs) >= 5:
+            landed = sum(1 for r in m_recs if r.get("outcome") == "landed")
+            no_change = sum(1 for r in m_recs if r.get("outcome") == "no_change")
+            landed_rate = landed / len(m_recs)
+            no_change_rate = no_change / len(m_recs)
+            strength = round(strength * landed_rate, 2)
+            m_entry["landed_rate"] = landed_rate
+            m_entry["no_change_rate"] = no_change_rate
+            if is_code_edit and no_change_rate >= 0.2:
+                m_entry["high_no_change"] = True
+
+        ranked.append((strength, left if left is not None else 25.0, m_entry))
     enough = [r for r in ranked if r[0] >= need]
     if not enough:
         enough = sorted(ranked, key=lambda r: -r[0])[:3]  # Nothing is strong enough: offer the strongest available.
-
-    is_code_edit = (skill == "coding" and not _has_any(text, ["review", "audit"]))
 
     def _pref(m_info: Dict[str, Any]) -> int:
         prov = m_info.get("provider", "")
         m_name = m_info.get("model", "")
         is_free = bool(m_info.get("free") or m_name.endswith("-free") or prov == "local")
         if is_code_edit:
+            if m_info.get("high_no_change"):
+                return 4
             if is_free or prov == "local":
                 return 3
             if prov == "antigravity":
@@ -2879,10 +3117,17 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
                 return 3
             return 2
 
-    if need >= 4:
+    if god:
+        # God mode: prefer the strongest model that still has quota, reaching for frontier models
+        enough.sort(key=lambda r: (-r[0], bool(r[2].get("scarce")), -r[1]))
+    elif need >= 4:
         # Hard work: the strongest model, and a scarce one only if nothing else is as strong. Free models last on code edits.
-        enough.sort(key=lambda r: (1 if is_code_edit and (r[2].get("free") or r[2]["model"].endswith("-free") or r[2]["provider"] == "local") else 0,
-                                   -r[0], bool(r[2].get("scarce")), -r[1]))
+        enough.sort(key=lambda r: (
+            2 if is_code_edit and r[2].get("high_no_change") else (1 if is_code_edit and (r[2].get("free") or r[2]["model"].endswith("-free") or r[2]["provider"] == "local") else 0),
+            -r[0],
+            bool(r[2].get("scarce")),
+            -r[1]
+        ))
     else:
         # Everyday work: prefer provider tier according to task type, then weakest good enough, saving strong allowances.
         enough.sort(key=lambda r: (_pref(r[2]), r[0], -r[1]))
@@ -3137,6 +3382,212 @@ def _provider_5h_tokens(provider: str) -> int:
         pass
     return total
 
+def get_compaction() -> str:
+    cfg = _load_json("config.json")
+    val = (cfg.get("compaction") or "suggest").lower().strip()
+    return val if val in ("suggest", "auto", "never") else "suggest"
+
+
+def set_compaction(mode: str) -> str:
+    m = (mode or "").lower().strip()
+    if m not in ("suggest", "auto", "never"):
+        return f"Error: compaction mode must be one of 'suggest', 'auto', 'never', got '{mode}'."
+    with _state_lock("config"):
+        data = _load_json("config.json")
+        data["compaction"] = m
+        _save_json("config.json", data)
+    return f"[COMPACTION] Compaction mode set to '{m}'."
+
+
+def chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[int], int]:
+    """Measure the chat's context: for Claude Code, the last assistant message's
+    input_tokens + cache_read_input_tokens + cache_creation_input_tokens in the transcript;
+    window 200000 unless the model name has [1m]."""
+    path = None
+    if session_id:
+        if os.path.isfile(session_id):
+            path = session_id
+        else:
+            matches = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{session_id}.jsonl"))
+            if matches:
+                path = matches[0]
+    if not path:
+        ident = detect_self()
+        if ident and ident.get("source") == "claude" and ident.get("id"):
+            matches = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{ident['id']}.jsonl"))
+            if matches:
+                path = matches[0]
+
+    if not path or not os.path.exists(path):
+        return None, 200000
+
+    last_tokens: Optional[int] = None
+    window = 200000
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"assistant"' not in line and '"type":"assistant"' not in line:
+                    continue
+                try:
+                    ent = json.loads(line)
+                except Exception:
+                    continue
+                if ent.get("type") != "assistant":
+                    continue
+                msg = ent.get("message") if isinstance(ent.get("message"), dict) else ent
+                usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else ent.get("usage")
+                if isinstance(usage, dict):
+                    inp = int(usage.get("input_tokens") or 0)
+                    cread = int(usage.get("cache_read_input_tokens") or 0)
+                    ccreate = int(usage.get("cache_creation_input_tokens") or 0)
+                    last_tokens = inp + cread + ccreate
+                model = str(msg.get("model") or ent.get("model") or "")
+                if "[1m]" in model.lower() or "1m" in model.lower():
+                    window = 1000000
+                elif model:
+                    window = 200000
+    except Exception:
+        pass
+    if last_tokens and last_tokens > window:
+        window = 1000000  # A context bigger than 200K proves the larger window, whatever the name says.
+    return last_tokens, window
+
+
+def compaction_threshold_pct(prompt: str) -> float:
+    """Threshold: 60% of window when estimate_complexity on latest user prompt is high, else 75%."""
+    est = estimate_complexity(prompt)
+    if est.get("tier") in ("high", "frontier") or est.get("effort") in ("high", "max"):
+        return 60.0
+    return 75.0
+
+
+def compaction_threshold(prompt: str, window: int = 200000) -> int:
+    return int((compaction_threshold_pct(prompt) / 100.0) * window)
+
+
+def is_compaction_quiet(remaining_chat_budget: Optional[int], window: int = 200000) -> bool:
+    """Stay quiet when the remaining chat budget is below half a window,
+    because a fresh start would cost more than it saves."""
+    if remaining_chat_budget is None:
+        return False
+    return remaining_chat_budget < (window / 2)
+
+
+def compact_focus_line(track: str = "main", limit: int = 5) -> str:
+    """Build a focus line from the latest ledger entries."""
+    entries = read_track_entries(track, limit=limit)
+    items: List[str] = []
+    for e in reversed(entries):
+        decs = e.get("decisions")
+        if isinstance(decs, list):
+            for d in decs:
+                s = str(d).strip()
+                if s and s not in items:
+                    items.append(s)
+        elif isinstance(decs, str) and decs.strip():
+            s = decs.strip()
+            if s not in items:
+                items.append(s)
+        msg = (e.get("message") or "").strip()
+        if msg and not msg.startswith("[PERMISSION") and msg not in items:  # Permission records aren't decisions.
+            items.append(msg[:120])
+        if len(items) >= 3:
+            break
+    return "keep " + "; ".join(items[:3]) if items else "keep the current task, its decisions and open items"
+
+
+def compact_opencode_workers() -> bool:
+    """Call OpenCode server's compact endpoint when present."""
+    service_path = os.path.join(HOME, ".local", "state", "opencode", "service.json")
+    if not os.path.exists(service_path):
+        return False
+    try:
+        with open(service_path, "r", encoding="utf-8") as f:
+            service = json.load(f)
+        url = service.get("url")
+        pwd = service.get("password")
+        if not url:
+            return False
+        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode() if pwd else ""
+        headers = {"Content-Type": "application/json"}
+        if auth:
+            headers["Authorization"] = f"Basic {auth}"
+        compacted = False
+        for w in _all_workers():
+            if w.get("status") == "running" and (w.get("provider") or "").lower() == "opencode":
+                sess_id = w.get("session_id") or w.get("id")
+                wdir = w.get("worktree") or w.get("project_dir") or HOME
+                h = dict(headers)
+                if wdir:
+                    h["x-opencode-directory"] = wdir
+                req_url = f"{url.rstrip('/')}/session/{sess_id}/compact" if sess_id else f"{url.rstrip('/')}/compact"
+                req = urllib.request.Request(req_url, method="POST", data=b"{}", headers=h)
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                try:
+                    with opener.open(req, timeout=5):
+                        compacted = True
+                except Exception:
+                    pass
+        if not compacted:
+            req = urllib.request.Request(f"{url.rstrip('/')}/compact", method="POST", data=b"{}", headers=headers)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                with opener.open(req, timeout=5):
+                    compacted = True
+            except Exception:
+                pass
+        return compacted
+    except Exception:
+        return False
+
+
+def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Optional[str]:
+    mode = get_compaction()
+    if mode == "never":
+        return None
+
+    usage, window = chat_context_usage(session_id)
+    if usage is None or window <= 0:
+        return None
+
+    thresh_pct = compaction_threshold_pct(prompt)
+    thresh_tokens = int((thresh_pct / 100.0) * window)
+
+    cfg = _load_json("config.json")
+    chat_limit = cfg.get("chat_budget_tokens")
+    if chat_limit:
+        used_tokens = chat_tokens_used(session_id) or 0
+        rem_budget = int(chat_limit) - used_tokens
+        if is_compaction_quiet(rem_budget, window):
+            return None
+
+    if usage < thresh_tokens:
+        return None
+
+    pct = (usage / window) * 100.0
+    level = 90 if pct >= 90 else (80 if pct >= 80 else (75 if (pct >= 75 and thresh_pct <= 75) else 60))
+    sid = session_id or _self_id()
+    key = f"compaction_warning|{sid}|{level}"
+    now = time.time()
+    with _state_lock("pings"):
+        sent = _load_json("limit_pings.json")
+        if key in sent:
+            return None
+        sent[key] = now
+        _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+
+    focus = compact_focus_line()
+    x_pct = int(round(pct))
+    msg = f"This chat is at {x_pct}% of its context. Compact now: /compact {focus}"
+    notify_desktop_event(key, "Subway Context", msg)
+
+    if mode == "auto":
+        msg += ". Claude Code compacts by itself near its limit; Subway can't run /compact inside an open chat"
+        compact_opencode_workers()
+
+    return msg
+
+
 def set_budget(scope: str, tokens: int) -> str:
     tokens = max(0, int(tokens))
     scope = (scope or "").lower().strip()
@@ -3341,6 +3792,116 @@ def approval_code(worker_id: str) -> str:
     return hmac.new(hud_token().encode(), worker_id.encode(), hashlib.sha256).hexdigest()[:6].upper()
 
 
+def _file_sha256(filepath: str) -> str:
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _extract_code_item(item: str, cwd: str) -> Optional[Tuple[str, int, int, str, str]]:
+    """Resolve an item specification to (display_path, start_line, end_line, content, abs_path)."""
+    import ast
+    if ":" in item:
+        file_part, target = item.rsplit(":", 1)
+        abs_path = os.path.realpath(os.path.join(cwd, file_part)) if not os.path.isabs(file_part) else os.path.realpath(file_part)
+        if not os.path.isfile(abs_path):
+            return None
+        display_path = os.path.relpath(abs_path, cwd) if abs_path.startswith(cwd) else file_part
+
+        range_match = re.match(r"^(\d+)-(\d+)$", target)
+        if range_match:
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                start_l, end_l = int(range_match.group(1)), int(range_match.group(2))
+                if start_l < 1 or end_l < start_l or start_l > len(lines):
+                    return None
+                end_l = min(end_l, len(lines))
+                content = "".join(lines[start_l - 1 : end_l])
+                return (display_path, start_l, end_l, content, abs_path)
+            except Exception:
+                return None
+
+        if file_part.endswith((".js", ".mjs", ".jsx", ".ts", ".tsx")):
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                pattern = re.compile(r'\bfunction\s+' + re.escape(target) + r'\b')
+                for i, line in enumerate(lines):
+                    if pattern.search(line):
+                        start_l = i + 1
+                        indent_len = len(line) - len(line.lstrip())
+                        end_l = None
+                        if line.rstrip().endswith("}") and "{" in line and line.count("{") == line.count("}"):
+                            end_l = start_l
+                        else:
+                            for j in range(i + 1, len(lines)):
+                                cand = lines[j]
+                                cand_indent = len(cand) - len(cand.lstrip())
+                                if cand_indent == indent_len and cand.strip().startswith("}"):
+                                    end_l = j + 1
+                                    break
+                        if end_l is not None:
+                            content = "".join(lines[start_l - 1 : end_l])
+                            return (display_path, start_l, end_l, content, abs_path)
+                return None
+            except Exception:
+                return None
+
+        if file_part.endswith(".py"):
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    source = f.read()
+                    lines = source.splitlines(keepends=True)
+                tree = ast.parse(source, filename=abs_path)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == target:
+                        start_l = min([d.lineno for d in getattr(node, "decorator_list", [])] + [node.lineno])
+                        end_l = getattr(node, "end_lineno", start_l)
+                        content = "".join(lines[start_l - 1 : end_l])
+                        return (display_path, start_l, end_l, content, abs_path)
+                return None
+            except Exception:
+                return None
+        return None
+    else:
+        target = item
+        candidates = []
+        server_py = os.path.join(cwd, "server.py")
+        if os.path.isfile(server_py):
+            candidates.append(server_py)
+        try:
+            for entry in sorted(os.listdir(cwd)):
+                if entry.endswith(".py") and entry != "server.py":
+                    p = os.path.join(cwd, entry)
+                    if os.path.isfile(p):
+                        candidates.append(p)
+        except Exception:
+            pass
+        this_file = os.path.realpath(__file__)
+        if this_file not in candidates and os.path.isfile(this_file):
+            candidates.append(this_file)
+
+        for abs_path in candidates:
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    source = f.read()
+                    lines = source.splitlines(keepends=True)
+                tree = ast.parse(source, filename=abs_path)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == target:
+                        start_l = min([d.lineno for d in getattr(node, "decorator_list", [])] + [node.lineno])
+                        end_l = getattr(node, "end_lineno", start_l)
+                        display_path = os.path.relpath(abs_path, cwd) if abs_path.startswith(cwd) else os.path.basename(abs_path)
+                        content = "".join(lines[start_l - 1 : end_l])
+                        return (display_path, start_l, end_l, content, abs_path)
+            except Exception:
+                continue
+        return None
+
+
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
                   project_dir: str = "", timeout_seconds: int = DEFAULT_WORKER_TIMEOUT, effort: str = "auto",
                   mode: str = "standard", model: str = "", permission_mode: str = "",
@@ -3348,7 +3909,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
                   budget_session_pct: Optional[float] = None, budget_weekly_pct: Optional[float] = None,
                   max_budget_usd: Optional[float] = None, thread: str = "", private: bool = False,
                   max_tokens: int = 0, max_seconds: int = 0, swarm_id: str = "", isolate: bool = False, route_reason: str = "",
-                  priority: str = "normal") -> str:
+                  priority: str = "normal", code: Optional[List[str]] = None) -> str:
     """Queue a worker for user approval. Agents can request workers, but only the user can launch them."""
     if not role or not prompt:
         return "Error: role and prompt are required."
@@ -3360,6 +3921,29 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     cwd = os.path.realpath(os.path.expanduser(project_dir)) if project_dir else os.getcwd()
     if not os.path.isdir(cwd):
         return f"Error: project_dir '{project_dir}' does not exist."
+
+    file_hashes: Dict[str, str] = {}
+    if code is not None:
+        packet_pieces = []
+        failed_names = []
+        for item in code:
+            resolved = _extract_code_item(item, cwd) if item else None
+            if not resolved:
+                failed_names.append(item)
+            else:
+                rel_path, start_l, end_l, content, abs_path = resolved
+                packet_pieces.append(f"--- {rel_path}:{start_l}-{end_l} ---\n{content.rstrip()}\n")
+                if abs_path not in file_hashes:
+                    file_hashes[abs_path] = _file_sha256(abs_path)
+
+        if failed_names:
+            return f"Error: could not resolve code names: {', '.join(str(f) for f in failed_names)}."
+
+        if packet_pieces:
+            packet_text = "\n".join(packet_pieces).strip()
+            if len(packet_text) > 60000:
+                return f"Error: code packet exceeds 60000 characters ({len(packet_text)} chars)."
+            prompt = f"{prompt}\n\n=== CODE (all you need: do not search) ===\n\n{packet_text}"
 
     permission_mode = _MODE_ALIASES.get(permission_mode, permission_mode) or get_permission_mode()
     if permission_mode not in PERMISSION_MODES:
@@ -3495,6 +4079,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "swarm_id": swarm_id,
         "isolate": bool(isolate),
         "priority": priority,
+        "code_hashes": file_hashes,
         "route": route_reason or (route["reason"] if provider in ("auto", "god") else f"You chose {selected_provider}."),
         "usage": {"input": 0, "output": 0, "cache_read": 0},
         "status": "pending_approval",
@@ -3516,6 +4101,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         f"[PENDING APPROVAL] Worker `{worker_id}` queued ({role}, {selected_provider.upper()} "
         f"model:{target_model} effort:{chosen_effort}). User authorization required.",
         track=track, station_id="guard")
+    notify_if_still_waiting(f"worker_waiting|{worker_id}", f"Worker {worker_id} waiting on your approval ({role})",
+                            lambda: (_load_worker(worker_id) or {}).get("status") == "pending_approval")
     budget_line = "" if (budget_session_pct or budget_weekly_pct or max_budget_usd or max_tokens) else (
         "No budget set for this worker. Ask your user whether they want one before it starts.\n")
     return (f"{god_warning}[APPROVAL REQUIRED] Worker `{worker_id}` is queued in PENDING APPROVAL state.\n"
@@ -3581,7 +4168,10 @@ def _prepare_worktree(meta: Dict[str, Any]) -> None:
     meta.update({"repo": repo, "base": base, "worktree": path})
 
 
-def _collect_worktree(meta: Dict[str, Any]) -> str:
+OPENCODE_WATCHDOG_TIMEOUT = 120
+
+
+def _collect_worktree(meta: Dict[str, Any], partial: bool = False) -> str:
     """Bring a worker's change back as a patch. A clash is left for review instead of overwriting anything."""
     repo, path, base = meta["repo"], meta["worktree"], meta["base"]
     _git(path, "add", "-A")
@@ -3591,11 +4181,278 @@ def _collect_worktree(meta: Dict[str, Any]) -> str:
         patch = os.path.join(WORKERS_DIR, f"{meta['id']}.patch")
         with open(patch, "w", encoding="utf-8") as f:
             f.write(diff)
-        applied = subprocess.run(["git", "-C", repo, "apply", "--whitespace=nowarn", patch], capture_output=True, text=True, timeout=60)
-        note = "Patch applied to the working tree." if applied.returncode == 0 else f"Patch clashes, not applied: {patch}. {one_line(applied.stderr, 160)}"
+        if partial:
+            note = f"Partial patch kept: {patch}."
+        else:
+            applied = subprocess.run(["git", "-C", repo, "apply", "--whitespace=nowarn", patch], capture_output=True, text=True, timeout=60)
+            note = "Patch applied to the working tree." if applied.returncode == 0 else f"Patch clashes, not applied: {patch}. {one_line(applied.stderr, 160)}"
     with contextlib.suppress(Exception):
         _git(repo, "worktree", "remove", "--force", path)
     return note
+
+
+def _verify_result(status: str, reasons: List[str]) -> Dict[str, Any]:
+    if status == "PASS":
+        line = "PASS"
+    else:
+        line = f"{status}: {'; '.join(reasons)}"
+    line = line.replace("\n", " ").strip()
+    return {
+        "status": status,
+        "reasons": reasons,
+        "line": line,
+        "ok": status == "PASS",
+    }
+
+
+def verify_worker(worker_id: Any) -> Dict[str, Any]:
+    """Fail-closed checklist for worker patch verification."""
+    if isinstance(worker_id, dict):
+        meta = dict(worker_id)
+        wid = str(meta.get("id") or "worker")
+    else:
+        wid = str(worker_id)
+        meta_file = os.path.join(WORKERS_DIR, f"{wid}.json")
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception as e:
+                return _verify_result("FAIL", [f"failed to read worker metadata: {e}"])
+        else:
+            meta = {"id": wid}
+
+    repo = meta.get("repo") or os.getcwd()
+    base = meta.get("base") or "HEAD"
+    patch_file = meta.get("patch_path") or os.path.join(WORKERS_DIR, f"{wid}.patch")
+    if not os.path.exists(patch_file) and os.path.isfile(wid):
+        patch_file = wid
+
+    if not os.path.exists(patch_file):
+        return _verify_result("FAIL", [f"patch file not found: {patch_file}"])
+
+    try:
+        with open(patch_file, "r", encoding="utf-8", errors="replace") as f:
+            patch_text = f.read()
+    except Exception as e:
+        return _verify_result("FAIL", [f"cannot read patch: {e}"])
+
+    if not patch_text.strip():
+        return _verify_result("FAIL", ["empty patch"])
+
+    # 1) Patch applies (git apply --check)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "apply", "--check", "--whitespace=nowarn", patch_file],
+            capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode != 0:
+            err = proc.stderr.strip() or proc.stdout.strip() or "git apply --check failed"
+            return _verify_result("FAIL", [f"patch does not apply: {one_line(err, 120)}"])
+    except subprocess.TimeoutExpired:
+        return _verify_result("FAIL", ["timeout running git apply --check"])
+    except Exception as e:
+        return _verify_result("FAIL", [f"git apply --check failed: {e}"])
+
+    # Parse changed files, deleted lines, and added python lines
+    changed_files: List[str] = []
+    deleted_lines: List[str] = []
+    added_py_lines: Dict[str, Set[int]] = {}
+    current_file: Optional[str] = None
+    current_new_line = 0
+
+    def is_exec_line(s: str) -> bool:
+        t = s.strip()
+        if not t or t.startswith("#"):
+            return False
+        if t in ('"""', "'''", '):', ']:', '}', ']', ')'):
+            return False
+        return True
+
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith("diff --git "):
+            parts = raw_line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+                if current_file not in changed_files:
+                    changed_files.append(current_file)
+        elif raw_line.startswith("+++ b/"):
+            current_file = raw_line[6:].strip()
+            if current_file and current_file != "/dev/null" and current_file not in changed_files:
+                changed_files.append(current_file)
+        elif raw_line.startswith("@@ "):
+            m = re.search(r"\+(\d+)(?:,(\d+))?", raw_line)
+            if m:
+                current_new_line = int(m.group(1))
+        elif raw_line.startswith("+") and not raw_line.startswith("+++"):
+            if current_file and current_file.endswith(".py"):
+                if is_exec_line(raw_line[1:]):
+                    added_py_lines.setdefault(current_file, set()).add(current_new_line)
+            current_new_line += 1
+        elif raw_line.startswith("-") and not raw_line.startswith("---"):
+            deleted_lines.append(raw_line[1:])
+        else:
+            if not raw_line.startswith("\\"):
+                current_new_line += 1
+
+    fail_reasons: List[str] = []
+    flag_reasons: List[str] = []
+
+    # 4) Flag, never pass, if the patch deletes tests or removes assert lines
+    for dl in deleted_lines:
+        s = dl.strip()
+        if re.search(r"^\s*assert\b", s) or "self.assert" in s:
+            if "patch removes assert line" not in flag_reasons:
+                flag_reasons.append("patch removes assert line")
+        if re.search(r"^\s*def\s+test_", s) or re.search(r"^\s*class\s+Test", s):
+            if "patch deletes test" not in flag_reasons:
+                flag_reasons.append("patch deletes test")
+
+    # 5) Flag files outside the brief's files when meta lists them
+    brief_files = meta.get("files")
+    if brief_files is not None:
+        brief_set = {os.path.normpath(f) for f in brief_files}
+        for cf in changed_files:
+            if os.path.normpath(cf) not in brief_set:
+                flag_reasons.append(f"file outside brief: {cf}")
+
+    # Set up isolated worktree for compilation and test execution
+    tmp_worktree = tempfile.mkdtemp(prefix="subway_verify_")
+    worktree_created = False
+    try:
+        wt_cmd = subprocess.run(
+            ["git", "-C", repo, "worktree", "add", "--detach", tmp_worktree, base],
+            capture_output=True, text=True, timeout=30
+        )
+        if wt_cmd.returncode != 0:
+            return _verify_result("FAIL", [f"failed to create temporary worktree: {one_line(wt_cmd.stderr, 120)}"])
+        worktree_created = True
+
+        app_cmd = subprocess.run(
+            ["git", "-C", tmp_worktree, "apply", "--whitespace=nowarn", patch_file],
+            capture_output=True, text=True, timeout=30
+        )
+        if app_cmd.returncode != 0:
+            return _verify_result("FAIL", [f"failed to apply patch in worktree: {one_line(app_cmd.stderr, 120)}"])
+
+        # 2) Every changed .py compiles and every changed .js passes node --check if node exists
+        import py_compile
+        for cf in changed_files:
+            target_path = os.path.join(tmp_worktree, cf)
+            if not os.path.exists(target_path):
+                continue
+            if cf.endswith(".py"):
+                try:
+                    py_compile.compile(target_path, doraise=True)
+                except py_compile.PyCompileError as e:
+                    fail_reasons.append(f"compilation error in {cf}: {e}")
+            elif cf.endswith(".js") and shutil.which("node"):
+                nproc = subprocess.run(["node", "--check", target_path], capture_output=True, text=True, timeout=15)
+                if nproc.returncode != 0:
+                    fail_reasons.append(f"node --check failed for {cf}: {one_line(nproc.stderr, 120)}")
+
+        if fail_reasons:
+            return _verify_result("FAIL", fail_reasons)
+
+        # 3) Both test suites run, and pass only if tests ran > 0, none failed, and the count is not lower than the base commit's
+        test_suites = meta.get("test_suites") or ["tests.test_subway", "tests.test_budgets"]
+
+        # Base commit test count
+        base_cmd = [
+            sys.executable, "-c",
+            f"import unittest; suites={json.dumps(test_suites)}; s=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromName(t) for t in suites]); print(s.countTestCases())"
+        ]
+        base_proc = subprocess.run(base_cmd, cwd=repo, capture_output=True, text=True, timeout=30)
+        base_count = int(base_proc.stdout.strip()) if (base_proc.returncode == 0 and base_proc.stdout.strip().isdigit()) else 0
+
+        # Run test suites in worktree with stdlib trace
+        runner_code = (
+            "import sys, unittest, trace, json, os\n"
+            f"test_suites = {json.dumps(test_suites)}\n"
+            "loader = unittest.defaultTestLoader\n"
+            "suite = unittest.TestSuite()\n"
+            "for s in test_suites:\n"
+            "    try:\n"
+            "        suite.addTests(loader.loadTestsFromName(s))\n"
+            "    except Exception as e:\n"
+            "        print(json.dumps({'error': f'Failed loading {s}: {e}'}))\n"
+            "        sys.exit(2)\n"
+            "total_loaded = suite.countTestCases()\n"
+            "tracer = trace.Trace(count=1, trace=0)\n"
+            "runner = unittest.TextTestRunner(stream=open(os.devnull, 'w'), verbosity=0)\n"
+            "res = tracer.runfunc(runner.run, suite)\n"
+            "traced = tracer.results().counts\n"
+            "executed = {}\n"
+            "for (fname, lineno), cnt in traced.items():\n"
+            "    if cnt > 0:\n"
+            "        executed.setdefault(fname, []).append(lineno)\n"
+            "print(json.dumps({\n"
+            "    'tests_run': res.testsRun,\n"
+            "    'failures': len(res.failures),\n"
+            "    'errors': len(res.errors),\n"
+            "    'total_loaded': total_loaded,\n"
+            "    'was_successful': res.wasSuccessful(),\n"
+            "    'executed': executed\n"
+            "}))\n"
+        )
+
+        test_run = subprocess.run(
+            [sys.executable, "-c", runner_code],
+            cwd=tmp_worktree, capture_output=True, text=True, timeout=120
+        )
+        if test_run.returncode != 0:
+            err = test_run.stderr.strip() or test_run.stdout.strip()
+            return _verify_result("FAIL", [f"test runner crashed: {one_line(err, 120)}"])
+
+        try:
+            test_data = json.loads(test_run.stdout.strip())
+        except Exception as e:
+            return _verify_result("FAIL", [f"invalid test runner output: {e}"])
+
+        if "error" in test_data:
+            return _verify_result("FAIL", [test_data["error"]])
+
+        tests_run = test_data.get("tests_run", 0)
+        failures = test_data.get("failures", 0)
+        errors = test_data.get("errors", 0)
+        successful = test_data.get("was_successful", False)
+
+        if tests_run <= 0:
+            fail_reasons.append("tests ran <= 0")
+        if failures > 0 or errors > 0 or not successful:
+            fail_reasons.append(f"tests failed ({failures} failures, {errors} errors)")
+        if base_count > 0 and tests_run < base_count:
+            fail_reasons.append(f"test count lower than base ({tests_run} < {base_count})")
+
+        if fail_reasons:
+            return _verify_result("FAIL", fail_reasons)
+
+        # 6) Flag 'untested change' when changed Python lines never execute during tests
+        executed_map = test_data.get("executed", {})
+        for cf, added_lines in added_py_lines.items():
+            full_cf = os.path.realpath(os.path.join(tmp_worktree, cf))
+            exec_set: Set[int] = set()
+            for fname, lnos in executed_map.items():
+                if os.path.realpath(fname) == full_cf or fname.endswith("/" + cf) or fname == cf:
+                    exec_set.update(lnos)
+            untested = added_lines - exec_set
+            if untested:
+                flag_reasons.append(f"untested change in {cf} (lines {sorted(list(untested))[:5]})")
+
+    except subprocess.TimeoutExpired:
+        return _verify_result("FAIL", ["operation timed out during verification"])
+    except Exception as e:
+        return _verify_result("FAIL", [f"unexpected error: {e}"])
+    finally:
+        if worktree_created:
+            subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", tmp_worktree], capture_output=True, timeout=30)
+            shutil.rmtree(tmp_worktree, ignore_errors=True)
+
+    if fail_reasons:
+        return _verify_result("FAIL", fail_reasons)
+    if flag_reasons:
+        return _verify_result("FLAG", flag_reasons)
+    return _verify_result("PASS", [])
 
 
 def start_approved_workers() -> None:
@@ -3617,6 +4474,10 @@ def _launch_worker(worker_id: str) -> str:
             return f"Worker `{worker_id}` is not pending approval (current status: {meta.get('status')})."
         if not meta.get("cmd"):
             return f"Error: no command stored for worker `{worker_id}`."
+        for fpath, expected_hash in (meta.get("code_hashes") or {}).items():
+            current_hash = _file_sha256(fpath) if os.path.exists(fpath) else None
+            if current_hash != expected_hash:
+                return f"Error: source file '{fpath}' has changed since worker was queued."
         blocked = _capacity_block(meta)
         if blocked:
             meta["approved"] = True  # The user said yes: it starts by itself when a slot opens.
@@ -3682,6 +4543,116 @@ def _pending_permissions(worker_id: str = "", station: str = "") -> List[Dict[st
     return sorted(out, key=lambda r: r.get("created_at", 0))
 
 
+def _hud_port() -> int:
+    with contextlib.suppress(Exception):
+        return int((_load_json("hud.json") or {}).get("port") or 7890)
+    return 7890
+
+
+def _escape_xml(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _send_desktop_notification(title: str, message: str) -> None:
+    """Send a desktop notification: macOS via terminal-notifier/osascript, Linux via notify-send, Windows via native toast."""
+    if os.environ.get("SUBWAY_NO_NOTIFY"):  # Tests and sandboxes must never reach the real desktop.
+        return
+    try:
+        if sys.platform == "darwin":
+            notifier = shutil.which("terminal-notifier")
+            if notifier:  # Unlike osascript, it can open the HUD when the alert is clicked.
+                subprocess.run([notifier, "-title", title, "-message", message, "-group", "subway-context",
+                                "-open", f"http://127.0.0.1:{_hud_port()}/#workers"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            else:
+                safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+                safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+                script = f'display notification "{safe_msg}" with title "{safe_title}"'
+                subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        elif sys.platform.startswith("linux"):
+            if not shutil.which("notify-send"):
+                return
+            has_action = False
+            try:
+                proc = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=2)
+                has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
+            except Exception:
+                has_action = False
+            if has_action:
+                url = f"http://127.0.0.1:{_hud_port()}/#workers"
+                def _linux_wait() -> None:
+                    try:
+                        res = subprocess.run(
+                            ["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
+                            capture_output=True, text=True
+                        )
+                        if res.stdout and res.stdout.strip() == "open":
+                            subprocess.run(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
+                threading.Thread(target=_linux_wait, daemon=True).start()
+            else:
+                subprocess.run(["notify-send", title, message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        elif sys.platform.startswith("win"):
+            url = f"http://127.0.0.1:{_hud_port()}/#workers"
+            xml_url = _escape_xml(url)
+            safe_title = _escape_xml(title).replace("'", "''")
+            safe_msg = _escape_xml(message).replace("'", "''")
+            xml = (
+                f'<toast activationType="protocol" launch="{xml_url}">'
+                f'<visual><binding template="ToastGeneric">'
+                f'<text>{safe_title}</text><text>{safe_msg}</text>'
+                f'</binding></visual></toast>'
+            )
+            app_id = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+            cmd = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+                "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
+                f"$xml = [Windows.Data.Xml.Dom.XmlDocument]::new(); $xml.LoadXml('{xml}'); "
+                f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+                f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast)"
+            )
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
+                creationflags=creationflags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+    except Exception:
+        pass
+
+
+def notify_if_still_waiting(key: str, message: str, still_waiting: Callable[[], bool], delay: float = 20.0) -> None:
+    """Alert only for what's really waiting on the user: most requests are answered or launched within seconds."""
+    def later() -> None:
+        time.sleep(delay)
+        with contextlib.suppress(Exception):
+            if still_waiting():
+                notify_desktop_event(key, "Subway Context", message)
+    threading.Thread(target=later, daemon=True).start()
+
+
+def notify_desktop_event(key: str, title: str, message: str) -> bool:
+    """Send one desktop notification per event, keyed in limit_pings.json so each event notifies once."""
+    now = time.time()
+    with _state_lock("pings"):
+        sent = _load_json("limit_pings.json")
+        if key in sent:
+            return False
+        sent[key] = now
+        _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+    _send_desktop_notification(title, message)
+    return True
+
+
 def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Optional[List[str]] = None) -> str:
     """Queue a question for the user, and tell the window that launched this worker."""
     rid = f"perm_{uuid.uuid4().hex[:8]}"
@@ -3699,6 +4670,8 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
                                         "text": f"Permission needed ({rid}): {tool}: {detail}"}) + "\n")
     t_broadcast_track(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
                       track=meta.get("track", "main"), station_id=meta["id"])
+    notify_if_still_waiting(f"permission_request|{rid}", f"Permission needed ({meta['id']}): {tool}",
+                            lambda: rid in {r["id"] for r in _pending_permissions()})
     return rid
 
 
@@ -3787,6 +4760,13 @@ def t_permission_requests(worker_id: str = "") -> str:
 
 def t_watch_workers(wait_seconds: int = 50) -> str:
     """Wait for something that needs attention: a permission request, or a worker finishing."""
+    for w in _all_workers():
+        if w.get("status") == "pending_approval" and not w.get("approved"):
+            created = float(w.get("created_ts") or 0)
+            if created and time.time() - created < 20:
+                continue  # Just queued: give it the same grace as notify_if_still_waiting.
+            notify_desktop_event(f"worker_waiting|{w['id']}", "Subway Context",
+                                 f"Worker {w['id']} waiting on your approval")
     before = {w["id"]: w.get("status") for w in _all_workers()}
     deadline = time.time() + max(1, min(int(wait_seconds), 55))
     while time.time() < deadline:
@@ -4243,7 +5223,7 @@ def supervise_worker(worker_id: str) -> int:
     wt_note = ""
     if fresh.get("worktree"):
         try:
-            wt_note = _collect_worktree(fresh)
+            wt_note = _collect_worktree(fresh, partial=result.get("status") != "completed")
             result["reason"] = f"{result.get('reason') or ''} {wt_note}".strip()
         except (OSError, subprocess.SubprocessError) as exc:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
@@ -4529,12 +5509,27 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
     response_chunks: List[str] = []
     stop_monitor = threading.Event()
     cancel_sent = False
+    last_msg_time = time.time()
+    had_tool_call = False
 
     def send_cancel() -> None:
         nonlocal cancel_sent
         if not cancel_sent and session_id and proc.poll() is None:
             cancel_sent = True
             send_rpc({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
+
+    def watchdog() -> None:
+        while not stop_monitor.is_set() and not stopped["flag"]:
+            timeout = OPENCODE_WATCHDOG_TIMEOUT
+            if had_tool_call and session_id and (time.time() - last_msg_time) >= timeout:
+                write("[stalled] no reply from OpenCode for 120s")
+                send_cancel()
+                run["finished"] = True
+                proc.terminate()
+                return
+            stop_monitor.wait(0.05 if timeout < 5 else 1.0)
+
+    threading.Thread(target=watchdog, daemon=True).start()
 
     def monitor_tokens(sid: str) -> None:
         nonlocal cancel_sent
@@ -4569,6 +5564,7 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
             line = raw.decode("utf-8", "replace").strip()
             if not line:
                 continue
+            last_msg_time = time.time()
             try:
                 msg = json.loads(line)
             except ValueError:
@@ -4664,6 +5660,7 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 s_up = up.get("sessionUpdate")
 
                 if s_up in ("tool_call", "tool_call_update"):
+                    had_tool_call = True
                     tool_call = up.get("toolCall") if isinstance(up.get("toolCall"), dict) else up
                     title = tool_call.get("title") or tool_call.get("name") or tool_call.get("kind") or "tool"
                     raw = tool_call.get("rawInput") or tool_call.get("input") or ""
@@ -4679,6 +5676,7 @@ def _pump_opencode(proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: 
                 continue
 
             if msg_id is not None and method == "session/request_permission":
+                had_tool_call = True
                 params = msg.get("params") or {}
                 tool_call = params.get("toolCall") or {}
                 title = tool_call.get("title") or tool_call.get("kind") or "tool"
@@ -6302,6 +7300,7 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
         "settings": {"permission_mode": get_permission_mode(), "permission_modes": PERMISSION_MODES,
                      "capacity": capacity(), "models": model_catalog(), "benchmarks": benchmarks_meta,
                      "chat_budget": cfg_data.get("chat_budget_tokens", 0),
+                     "compaction": get_compaction(),
                      "low_limits": low_limits, "budgets": budget_rows()},
         "tracks": tracks_summary,
         "quotas": load_quotas(refresh=not _sampler_running),
@@ -6397,9 +7396,37 @@ def _hud_probe(port: int) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _autostart_hud(port: int = HUD_PORT) -> None:
+    """Start the Live HUD on stdio server start if hud_autostart is not false and HUD is not running."""
+    if os.environ.get("SUBWAY_HUD_AUTOSTART") in ("0", "false", "off"):
+        return
+    cfg = _load_json("config.json")
+    val = cfg.get("hud_autostart")
+    if val is False or str(val).lower() in ("false", "off", "0"):
+        return
+    with _state_lock("hud_autostart"):
+        if _hud_probe(port) is not None:
+            return
+        env = dict(os.environ, SUBWAY_HUD_NO_OPEN="1")
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "hud", str(port)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=HOME,
+            env=env,
+        )
+
+
 def _open_hud(port: int) -> None:
     """Open the dashboard as soon as it's up. Set SUBWAY_HUD_NO_OPEN=1 to skip this."""
+    with contextlib.suppress(Exception):
+        _write_json_atomic(os.path.join(SUBWAY_DIR, "hud.json"), {"port": port, "url": _hud_url(port)})
     if os.environ.get("SUBWAY_HUD_NO_OPEN") != "1":
+        if os.environ.get("TERM_PROGRAM") == "vscode":
+            print("Open it in the editor: Cmd+Shift+P, Subway: Open HUD")
+            return
         import webbrowser
         with contextlib.suppress(Exception):
             webbrowser.open(_hud_url(port))
@@ -6703,7 +7730,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/budget":
             res = set_budget(str(payload.get("scope", "")), int(payload.get("tokens") or 0))
         elif path == "/api/settings":
-            res = set_permission_mode(str(payload.get("permission_mode", "")))
+            res = ""
+            if "permission_mode" in payload:
+                res = set_permission_mode(str(payload.get("permission_mode", "")))
+            if "compaction" in payload:
+                res = set_compaction(str(payload.get("compaction", "")))
         elif path == "/api/models":
             res = set_model_rankings(payload.get("models"))
         elif path == "/api/answer_permission":
@@ -6801,6 +7832,7 @@ TOOLS = {
             "query": {"type": "string", "description": "Alias for quote."},
             "source": READ_SOURCE,
             "project": {"type": "string"},
+            "segment": {"type": "string", "description": "'all' (default), 'latest', or a segment number, split at each compaction."},
             "limit": {"type": "integer", "default": 5},
             "include_subagents": {"type": "boolean", "default": True, "description": "Search across spun worker subagents as well."},
         }},
@@ -6821,6 +7853,7 @@ TOOLS = {
                        "since='last' returns what you haven't seen, and continues where a truncated read stopped. "
                        "anchor_text='phrase' boards at an exact quote.",
         "inputSchema": {"type": "object", "required": ["chat_id"], "properties": {
+            "segment": {"type": "string", "description": "'all' (default), 'latest', or a segment number, split at each compaction."},
             "chat_id": {"type": "string", "description": "Chat ID, prefix, open tab name, or @alias."},
             "mode": {"type": "string", "enum": ["recent", "outline", "full", "decisions"], "default": "recent"},
             "turns": {"type": "integer", "default": 6, "description": "Number of exchanges for recent/outline."},
@@ -6898,6 +7931,7 @@ TOOLS = {
         "inputSchema": {"type": "object", "required": ["role", "prompt"], "properties": {
             "role": {"type": "string", "description": "Brief 2-5 word job title for the worker (e.g. 'Unit Tester')."},
             "prompt": {"type": "string", "description": "Clear actionable instruction for the subagent."},
+            "code": {"type": "array", "items": {"type": "string"}, "description": "Deterministic code packet items to include with prompt."},
             "provider": {"type": "string", "default": "auto",
                          "description": "'auto' picks the agent from what the task needs. 'local' uses Ollama through OpenCode."},
             "model": {"type": "string", "description": "Claude: 'opus', 'sonnet', 'haiku'. Antigravity: an id from `agy models`, e.g. 'gemini-3.8-flash-medium'. OpenCode: 'provider/model'. Local: an Ollama model name."},
@@ -7304,6 +8338,15 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         prompt_text = str(event.get("prompt") or "")
         for line in prompt_text.splitlines():
             line_str = line.strip()
+            m_comp = re.match(r"^!?\s*subway-context\s+compaction\s+(\S+)\s*$", line_str, re.IGNORECASE)
+            if m_comp:
+                res = set_compaction(m_comp.group(1).lower().strip())
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": res
+                    }
+                }
             m = re.match(r"^!?\s*subway-context\s+budget\s+(\S+)\s+(?:<([^>]+)>|(\S+))\s*$", line_str, re.IGNORECASE)
             if m:
                 scope = m.group(1).lower().strip()
@@ -7338,6 +8381,8 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         limit = int(limit)
         used = chat_tokens_used(sid)
         if used is not None and used >= limit:
+            notify_desktop_event(f"chat_budget_blocked|{sid}|{limit}", "Subway Context",
+                                 f"Budget reached: {used:,} of {limit:,} tokens.")
             return {
                 "decision": "block",
                 "reason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
@@ -7349,16 +8394,25 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pings = pending_worker_pings(_self_id())
     pings_text = "\n\n".join(pings) if pings else ""
 
+    notices = []
     if limit:
         notice = budget_ping_notice("chat", used, limit)
         if notice:
-            ctx = f"{notice}\n\n{pings_text}".strip() if pings_text else notice
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": ctx
-                }
+            notices.append(notice)
+
+    prompt_text = str(event.get("prompt") or "")
+    c_notice = compaction_notice(sid, prompt_text)
+    if c_notice:
+        notices.append(c_notice)
+
+    if notices:
+        ctx = f"{chr(10).join(notices)}\n\n{pings_text}".strip() if pings_text else "\n\n".join(notices)
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": ctx
             }
+        }
 
     if pings_text:
         return {
@@ -7368,6 +8422,61 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             }
         }
     return None
+
+def _track_for_session(sid: str) -> str:
+    if os.path.isdir(TRACKS_DIR):
+        for fname in os.listdir(TRACKS_DIR):
+            if fname.endswith(".subscribers.json"):
+                tname = fname[:-len(".subscribers.json")]
+                try:
+                    with open(os.path.join(TRACKS_DIR, fname), "r", encoding="utf-8") as f:
+                        subs = json.load(f)
+                    if sid in subs or sid[:8] in subs:
+                        return tname
+                except Exception:
+                    pass
+    return "main"
+
+
+def hook_precompact(event: Dict[str, Any]) -> None:
+    trigger = event.get("trigger", "auto")
+    tpath = event.get("transcript_path", "")
+    sid = event.get("session_id", "")
+    if not sid and tpath:
+        sid = os.path.splitext(os.path.basename(tpath))[0]
+
+    seg_num = 0
+    if tpath and os.path.exists(tpath):
+        try:
+            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"compact_boundary"' in line:
+                        try:
+                            o = json.loads(line)
+                            if o.get("type") == "system" and o.get("subtype") == "compact_boundary":
+                                seg_num += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    time_str = fmt_ts(time.time())
+    msg = f"Compacted ({trigger}) at {time_str}. Full history: read_chat({sid}, segment={seg_num})"
+    track = _track_for_session(sid) if sid else "main"
+    t_broadcast_track(message=msg, track=track, session_id=sid)
+
+
+def run_hook_precompact() -> int:
+    """Claude Code PreCompact hook entry. Fails open."""
+    try:
+        raw = sys.stdin.read()
+        if raw.strip():
+            event = json.loads(raw)
+            hook_precompact(event)
+    except Exception as e:
+        log("hook precompact error:", e)
+    return 0
+
 
 def run_hook_prompt() -> int:
     """Claude Code UserPromptSubmit hook entry. Fails open."""
@@ -7422,6 +8531,13 @@ def run_cli(argv: List[str]) -> int:
         except KeyboardInterrupt:
             print("\nHUD stopped.")
         return 0
+    if arg in ("verify", "--verify"):
+        if not rest:
+            print("Usage: subway-context verify <worker_id>")
+            return 2
+        res = verify_worker(rest[0])
+        print(res.get("line") if isinstance(res, dict) else str(res))
+        return 0 if (isinstance(res, dict) and res.get("status") == "PASS") else 1
     if arg in ("approve", "--approve"):
         if not rest:
             print("Usage: subway-context approve <worker_id>")
@@ -7476,6 +8592,12 @@ def run_cli(argv: List[str]) -> int:
     if arg in ("quota", "--quota", "quotas", "--quotas"):
         print(t_quota_status(source=rest[0] if rest else "all"))
         return 0
+    if arg in ("compaction", "--compaction"):
+        if not rest:
+            print(f"Compaction mode: {get_compaction()}")
+            return 0
+        print(set_compaction(rest[0]))
+        return 0
     if arg in ("budget", "--budget"):
         if not rest:
             states = budget_state()
@@ -7497,6 +8619,17 @@ def run_cli(argv: List[str]) -> int:
         msg = set_budget(scope, tokens)
         print(msg)
         return 0
+    if arg in ("hud-autostart", "--hud-autostart"):
+        if not rest or rest[0].lower() not in ("on", "off"):
+            print("Usage: subway-context hud-autostart on|off")
+            return 2
+        enabled = rest[0].lower() == "on"
+        with _state_lock("config"):
+            cfg = _load_json("config.json")
+            cfg["hud_autostart"] = enabled
+            _save_json("config.json", cfg)
+        print(f"HUD autostart turned {'on' if enabled else 'off'}.")
+        return 0
     if arg not in TOOLS:
         print(USAGE.format(version=VERSION, host=HUD_HOST), file=sys.stderr)
         return 2
@@ -7514,14 +8647,15 @@ def main() -> None:
         sys.exit(run_hook_guard())
     if argv and argv[0] == "hook-prompt":
         sys.exit(run_hook_prompt())
+    if argv and argv[0] == "hook-precompact":
+        sys.exit(run_hook_precompact())
     if argv and argv[0] != "--stdio":
         sys.exit(run_cli(argv))
 
     with contextlib.suppress(Exception):
         _sync_opencode_agent_stubs(force=True)
-    if os.environ.get("SUBWAY_HUD_AUTOSTART") == "1":
-        with contextlib.suppress(Exception):
-            log(t_start_hud())
+    with contextlib.suppress(Exception):
+        _autostart_hud()
     threading.Thread(target=_worker_ping_loop, daemon=True).start()
     log(f"v{VERSION} ready")
     for line in sys.stdin:
