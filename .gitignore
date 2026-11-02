@@ -4,3 +4,8 @@ __pycache__/
 *.tmp
 
 .subway/
+
+# Built by npm run build:vsix; packaged at publish time
+vscode/subway-context.vsix
+# Private planning notes; kept local
+docs/ROADMAP.md
