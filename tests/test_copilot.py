@@ -220,6 +220,32 @@ class TestCopilotIntegration(unittest.TestCase):
                 server._copilot_view(client, refresh=True)
             self.assertFalse(client["dispatchable"])
 
+    def test_copilot_view_no_raw_dispatchable_follows_cli(self):
+        client = {"id": "copilot", "installed": True, "dispatchable": True}
+        with patch.object(server, "_copilot_raw", return_value=None), \
+             patch.object(server, "_copilot_models", return_value=[]), \
+             patch.object(server, "_copilot_cli_usage", return_value=None), \
+             patch.object(server, "find_copilot_binary", return_value="/usr/local/bin/copilot"):
+            server._copilot_view(client, refresh=True)
+        self.assertTrue(client["dispatchable"])
+
+        client = {"id": "copilot", "installed": True, "dispatchable": True}
+        with patch.object(server, "_copilot_raw", return_value=None), \
+             patch.object(server, "_copilot_models", return_value=[]), \
+             patch.object(server, "_copilot_cli_usage", return_value=None), \
+             patch.object(server, "find_copilot_binary", return_value=None):
+            server._copilot_view(client, refresh=True)
+        self.assertFalse(client["dispatchable"])
+
+    def test_copilot_catalog_carries_aliases(self):
+        server._model_catalog.clear()
+        with patch.object(server, "_copilot_models",
+                           return_value=[{"model": "gpt-5", "name": "GPT-5", "aliases": ["gpt-5-chat"]}]), \
+             patch.object(server, "find_copilot_binary", return_value=None):
+            catalog = server.model_catalog()
+        entry = next(m for m in catalog if m.get("provider") == "copilot" and m.get("model") == "gpt-5")
+        self.assertEqual(entry["aliases"], ["gpt-5-chat"])
+
     def test_review_step_prompt_carries_builder_task(self):
         meta = {"id": "worker_abc123", "status": "completed", "provider": "claude", "role": "Builder",
                 "track": "main", "report": "changed two files",

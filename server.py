@@ -3200,6 +3200,8 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
                 entry["name"] = cp_m["name"]
             if cp_m.get("vendor"):
                 entry["vendor"] = cp_m["vendor"]
+            if cp_m.get("aliases"):
+                entry["aliases"] = cp_m["aliases"]
             if m_id in b_strengths:
                 s = b_strengths[m_id]
                 entry["coding"] = s
@@ -8145,9 +8147,9 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     source_label = "Tokens from Copilot CLI sessions on this Mac; VS Code chat use is counted only in the chat allowance."
     no_models_note = "Open Copilot Chat in VS Code once to list its models."
     if not raw or not isinstance(raw, dict):
-        base_note = "Doesn't expose usage locally, and Subway can't dispatch workers to it yet."
+        base_note = "Copilot's allowance could not be read (is gh signed in?); workers still run through the Copilot CLI when it is installed."
         note = f"{base_note} {no_models_note}" if not models else base_note
-        client["dispatchable"] = False
+        client["dispatchable"] = bool(client.get("dispatchable")) and bool(find_copilot_binary())
         return {
             "plan": "", "state": "live" if tokens else "detected", "source": source_label,
             "fetched_at": time.time() if tokens else None, "latency_ms": None,
