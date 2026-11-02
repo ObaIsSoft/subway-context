@@ -165,6 +165,17 @@ class TestStallAndReroute(unittest.TestCase):
     def test_quota_matcher_requires_an_error_shape_or_provider_phrase(self):
         self.assertIsNone(server.check_quota_error("claude", "The quota and insufficient balance are discussed."))
         self.assertIsNone(server.check_quota_error("claude", "Usage limit reached", source="assistant"))
+        self.assertIsNone(server.check_quota_error(
+            "claude", "The docs say usage limit reached errors happen when...",
+        ))
+        self.assertEqual(
+            server.check_quota_error("claude", "Claude AI usage limit reached|1793650000"),
+            "usage limit reached",
+        )
+        self.assertEqual(
+            server.check_quota_error("claude", "Error: Free usage limit reached."),
+            "usage limit reached",
+        )
         self.assertEqual(
             server.check_quota_error("claude", "Error: Usage limit reached"),
             "Usage limit reached",

@@ -6495,8 +6495,17 @@ def check_quota_error(provider: str, text: str, source: str = "stdout") -> Optio
         )
         for pat in patterns:
             match = re.search(pat, stripped, re.IGNORECASE)
-            if match and (is_error_shape or source == "stdout"):
-                return match.group(0)
+            if match:
+                stdout_prefix = re.fullmatch(
+                    r"(?:\s*(?:\[(?:error|warning)\]\s*|(?:api\s+)?error\b\s*:?\s*|[!✗]\s*|"
+                    r"(?:claude(?:\s+ai)?|copilot|antigravity|opencode)\b\s*[:,\-]?\s*))*",
+                    stripped[:match.start()],
+                    re.IGNORECASE,
+                )
+                if is_error_shape or (
+                    source == "stdout" and len(stripped) <= 300 and stdout_prefix is not None
+                ):
+                    return match.group(0)
         if source == "error_event":
             match = re.search(r"\b(?:status|code)[\"']?\s*[:=]\s*[\"']?429\b", stripped, re.IGNORECASE)
             if match:
