@@ -3743,9 +3743,19 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
     if provider == "copilot":
         m = model if (model and model != "inherit") else "auto"
         wd = workdir or os.getcwd()
-        cmd = [bin_path or "copilot", "-p", text, "--model", m, "--output-format", "json", "--add-dir", wd]
-        if isolate or isolated or skip_permissions:
+        cmd = [bin_path or "copilot", "--model", m, "--add-dir", wd, "--sync-session=off", "--no-ask-user"]
+        if permission_mode == "ask":
+            cmd.append("--acp")
+        else:
+            cmd.extend(["-p", text, "--output-format", "json"])
+        if permission_mode == "auto_approve":
             cmd.append("--allow-all-tools")
+        elif safe:
+            if "files:write" in caps:
+                safe_workdir = os.path.join(SUBWAY_DIR, "worktrees", worker_id) if (isolate or isolated) and worker_id else wd
+                cmd.append(f"--allow-tool=write({os.path.realpath(safe_workdir)})")
+            if "terminal:safe" in caps:
+                cmd.extend(f"--allow-tool=shell({command}:*)" for command in AGY_SAFE_COMMANDS)
         return cmd
 
     if provider == "claude":
@@ -6842,8 +6852,10 @@ def supervise_worker(worker_id: str) -> int:
     is_claude = meta.get("provider") == "claude"
     is_copilot = meta.get("provider") == "copilot"
     is_local = meta.get("provider") == "local"
-    is_acp = meta.get("provider") in ("opencode", "local")
     cmd = list(meta["cmd"])
+    is_acp = meta.get("provider") in ("opencode", "local") or (
+        meta.get("provider") == "copilot" and "--acp" in cmd
+    )
     budget = meta.get("budget") or {}
     shared_spent: Dict[str, Any] = {"spent": sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output"))}
     run: Dict[str, Any] = shared_spent
@@ -6942,7 +6954,7 @@ def supervise_worker(worker_id: str) -> int:
                 run = shared_spent
                 workdir = meta.get("worktree") or meta.get("project_dir") or HOME
                 env = dict(os.environ, PWD=workdir)
-                if is_acp and not meta.get("skip_permissions"):
+                if meta.get("provider") in ("opencode", "local") and is_acp and not meta.get("skip_permissions"):
                     env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
                 env["SUBWAY_WORKER"] = "1"
                 proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
@@ -7537,15 +7549,16 @@ def _pump_opencode(
     session_id = None
     config_ops: List[Tuple[str, str]] = []
 
+    is_opencode = meta.get("provider") in ("opencode", "local")
     model_val = meta.get("model")
     if meta.get("provider") == "local":
         if model_val and not str(model_val).startswith("ollama/"):
             model_val = f"ollama/{model_val}"
-    if model_val and model_val != "default":
+    if model_val and model_val != "default" and is_opencode:
         config_ops.append(("model", str(model_val)))
 
     effort = meta.get("effort")
-    if effort and effort != "auto":
+    if effort and effort != "auto" and is_opencode:
         config_ops.append(("effort", str(effort)))
 
     curr_config_id = None
@@ -7642,7 +7655,7 @@ def _pump_opencode(
                 res = msg.get("result") or {}
                 session_id = res.get("sessionId")
                 run["conversation"] = session_id
-                if session_id:
+                if session_id and is_opencode:
                     monitor_thread = threading.Thread(
                         target=monitor_tokens, args=(session_id,), name="opencode-token-poller", daemon=True,
                     )
@@ -7702,7 +7715,7 @@ def _pump_opencode(
                     continue
                 reply = (res.get("response") or res.get("text") or "".join(response_chunks)).strip()
 
-                if session_id:
+                if session_id and is_opencode:
                     toks = _opencode_session_tokens(session_id)
                     if toks:
                         run["usage"] = toks
@@ -7741,7 +7754,7 @@ def _pump_opencode(
                 if reply:
                     write(reply)
                 stop_monitor.set()
-                if session_id:
+                if session_id and is_opencode:
                     final_toks = _opencode_session_tokens(session_id)
                     if final_toks:
                         run["usage"] = final_toks
@@ -7818,7 +7831,7 @@ def _pump_opencode(
         for monitor_thread in monitor_threads:
             if monitor_thread is not threading.current_thread():
                 monitor_thread.join(timeout=3)
-        if session_id and not run.get("usage"):
+        if session_id and is_opencode and not run.get("usage"):
             final_toks = _opencode_session_tokens(session_id)
             if final_toks:
                 run["usage"] = final_toks

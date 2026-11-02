@@ -35,18 +35,46 @@ class TestCopilotWorkers(unittest.TestCase):
         self.assertEqual(meta["usage"]["requests"], 1)
         self.assertAlmostEqual(meta["usage"]["credits"], 0.28194, places=5)
 
-    def test_worker_command_isolate(self):
-        cmd_plain = server._worker_command("copilot", "/usr/bin/copilot", "auto", "low", False,
-                                           [], "normal", "hello", None, "", isolate=False)
-        self.assertNotIn("--allow-all-tools", cmd_plain)
-
-        cmd_iso = server._worker_command("copilot", "/usr/bin/copilot", "auto", "low", False,
-                                         [], "normal", "hello", None, "", isolate=True)
-        self.assertIn("--allow-all-tools", cmd_iso)
-
-        cmd_skip = server._worker_command("copilot", "/usr/bin/copilot", "auto", "low", False,
-                                          [], "auto_approve", "hello", None, "", isolate=False)
-        self.assertIn("--allow-all-tools", cmd_skip)
+    def test_worker_command_respects_permission_mode_with_or_without_isolation(self):
+        worker_id = "worker_deadbeef"
+        with tempfile.TemporaryDirectory() as workdir:
+            for mode in ("ask", "auto_safe", "auto_approve"):
+                for isolation in ({}, {"isolate": True}, {"isolated": True}):
+                    with self.subTest(mode=mode, isolation=isolation):
+                        cmd = server._worker_command(
+                            "copilot", "/usr/bin/copilot", "auto", "low", False,
+                            ["files:write", "terminal:safe"], mode, "hello", None, "",
+                            worker_id=worker_id, workdir=workdir, **isolation,
+                        )
+                        self.assertIn("--sync-session=off", cmd)
+                        self.assertIn("--no-ask-user", cmd)
+                        self.assertIn("--add-dir", cmd)
+                        self.assertIn(workdir, cmd)
+                        if mode == "ask":
+                            self.assertIn("--acp", cmd)
+                            self.assertNotIn("-p", cmd)
+                            self.assertNotIn("--allow-all-tools", cmd)
+                        elif mode == "auto_safe":
+                            self.assertIn("-p", cmd)
+                            self.assertNotIn("--acp", cmd)
+                            self.assertNotIn("--allow-all-tools", cmd)
+                            write_rules = [arg for arg in cmd if arg.startswith("--allow-tool=write(")]
+                            expected_dir = (
+                                os.path.join(server.SUBWAY_DIR, "worktrees", worker_id)
+                                if isolation else workdir
+                            )
+                            self.assertEqual(
+                                write_rules,
+                                [f"--allow-tool=write({os.path.realpath(expected_dir)})"],
+                            )
+                            shell_rules = {arg for arg in cmd if arg.startswith("--allow-tool=shell(")}
+                            self.assertEqual(
+                                shell_rules,
+                                {f"--allow-tool=shell({command}:*)" for command in server.AGY_SAFE_COMMANDS},
+                            )
+                        else:
+                            self.assertIn("--allow-all-tools", cmd)
+                            self.assertNotIn("--acp", cmd)
 
     def test_preflight_budget_names_chat_pool(self):
         mock_raw = {
