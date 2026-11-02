@@ -6441,7 +6441,7 @@ _notification_log_lock = threading.Lock()
 
 def _log_notification_failure(mechanism: str, error: Any) -> None:
     """Keep the notification failure log bounded without making alerts fatal."""
-    path = os.path.expanduser("~/.subway-context/notify.log")
+    path = os.path.join(SUBWAY_DIR, "notify.log")  # follows SUBWAY_DIR so tests and sandboxes never touch the real log
     entry = f"{_dt.datetime.now().astimezone().isoformat(timespec='seconds')} [{mechanism}] {error}\n"
     try:
         with _notification_log_lock:
