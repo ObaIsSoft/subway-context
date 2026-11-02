@@ -6172,6 +6172,93 @@ def get_stall_timeout(meta: Dict[str, Any]) -> float:
     return timeout
 
 
+def _poll_opencode_worker_retry(
+    meta: Dict[str, Any],
+    started_at: float,
+    seen: Optional[Set[Tuple[str, str]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read an OpenCode worker's latest retry error without waiting on its database."""
+    db_path = os.path.join(OPENCODE_DIR, "opencode.db")
+    if not os.path.exists(db_path):
+        return None
+    worker_dir = meta.get("worktree") or meta.get("project_dir") or HOME
+    directory = os.path.abspath(worker_dir)
+    real_directory = os.path.realpath(directory)
+    uri_path = urllib.parse.quote(db_path, safe="/")
+    try:
+        con = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=0.1)
+        try:
+            con.execute("PRAGMA busy_timeout=100")
+            session = con.execute(
+                "select id from session_v2 where directory in (?, ?) and time_created>=? "
+                "order by time_created desc limit 1",
+                (directory, real_directory, int(started_at * 1000)),
+            ).fetchone()
+            if not session:
+                return None
+            message = con.execute(
+                "select seq, data from session_message where session_id=? and type='assistant' "
+                "order by seq desc limit 1",
+                (session[0],),
+            ).fetchone()
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if not message:
+        return None
+    seq, raw_data = message
+    try:
+        data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+    except (TypeError, ValueError):
+        return None
+    retry = data.get("retry") if isinstance(data, dict) else None
+    error = retry.get("error") if isinstance(retry, dict) else None
+    if not isinstance(error, dict):
+        return None
+
+    session_id = str(session[0])
+    error_type = one_line(str(error.get("type") or "unknown"), 120)
+    message_text = one_line(str(error.get("message") or ""), 500)
+    attempt = retry.get("attempt", "?")
+    retry_at = retry.get("at")
+    retry_key = (session_id, f"{seq}:{attempt}:{retry_at}:{error_type}:{message_text}")
+    if seen is not None and retry_key in seen:
+        return None
+    if seen is not None:
+        seen.add(retry_key)
+
+    try:
+        retry_clock = _dt.datetime.fromtimestamp(float(retry_at) / 1000).strftime("%H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        retry_clock = "--:--"
+    line = f"[opencode] {error_type}: {message_text} (retry {attempt} at {retry_clock})"
+    log_path = meta.get("log_file")
+    if log_path:
+        with contextlib.suppress(OSError):
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(line + "\n")
+
+    reason = f"{error_type}: {message_text}".strip(": ")
+    with _state_lock("workers"):
+        current = _load_worker(meta.get("id")) or meta
+        current["status_reason"] = reason
+        _save_worker(current)
+
+    quota_error = error_type.lower() == "provider.rate-limit" or bool(check_quota_error("opencode", message_text))
+    result = None
+    if quota_error:
+        try:
+            reset_time = float(retry_at) / 1000
+        except (TypeError, ValueError):
+            reset_time = None
+        handler_reason = f"Quota/usage limit error: {reason}"
+        result = _handle_worker_exhaustion_or_stall(
+            str(meta.get("id") or ""), meta, handler_reason, is_stall=False, reset_time=reset_time,
+        )
+    return {"reason": reason, "quota": quota_error, "result": result}
+
+
 def _ping_launcher(launcher: str, text: str, from_id: str = "") -> None:
     if not launcher:
         return
@@ -6442,6 +6529,7 @@ def supervise_worker(worker_id: str) -> int:
         return 0
     try:
         with open(meta["log_file"], "ab") as out:
+            worker_started_at = time.time()
             while True:
                 run = shared_spent
                 workdir = meta.get("worktree") or meta.get("project_dir") or HOME
@@ -6456,11 +6544,29 @@ def supervise_worker(worker_id: str) -> int:
                 stall_timeout = get_stall_timeout(meta)
                 stall_event = threading.Event()
                 start_time = time.time()
+                next_opencode_check = start_time
+                opencode_retries_seen: Set[Tuple[str, str]] = set()
                 has_output = {"seen": False}
                 run["has_output"] = has_output
 
                 def stall_watchdog() -> None:
+                    nonlocal next_opencode_check
                     while not stall_event.is_set() and not stopped["flag"]:
+                        if is_acp and meta.get("provider") == "opencode" and time.time() >= next_opencode_check:
+                            next_opencode_check = time.time() + 20
+                            retry = _poll_opencode_worker_retry(meta, worker_started_at, opencode_retries_seen)
+                            if retry and retry.get("quota"):
+                                stopped["quota_error"] = f"Quota/usage limit error: {retry['reason']}"
+                                stopped["quota_result"] = retry.get("result")
+                                stopped["quota_handled"] = True
+                                stopped["flag"] = True
+                                if run.get("conversation") and proc.poll() is None:
+                                    with contextlib.suppress(Exception):
+                                        proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                                        proc.stdin.flush()
+                                if proc.poll() is None:
+                                    proc.terminate()
+                                return
                         if not has_output["seen"]:
                             log_p = meta.get("log_file")
                             if log_p and os.path.exists(log_p) and os.path.getsize(log_p) > 0:
@@ -6533,7 +6639,10 @@ def supervise_worker(worker_id: str) -> int:
 
                 if stopped.get("stall") or stopped.get("quota_error"):
                     reason = str(stopped.get("stall") or stopped.get("quota_error"))
-                    result = _handle_worker_exhaustion_or_stall(worker_id, meta, reason, is_stall=bool(stopped.get("stall")))
+                    if stopped.get("quota_handled"):
+                        result = stopped.get("quota_result") or {"status": "failed", "exit_code": code, "reason": reason}
+                    else:
+                        result = _handle_worker_exhaustion_or_stall(worker_id, meta, reason, is_stall=bool(stopped.get("stall")))
                     break
 
                 if stopped["flag"]:
@@ -7348,6 +7457,7 @@ def _worker_detail(m: Dict[str, Any]) -> str:
         f"- **Mode**: {m.get('mode', 'standard').upper()}",
         f"- **Effort**: {m.get('effort', 'auto')}",
         f"- **Status**: [{m.get('status', 'unknown').upper()}]",
+        *([f"- **Reason**: {m.get('status_reason')}"] if m.get("status_reason") else []),
         f"- **Exit code**: {code}",
         f"- **PID**: {m.get('pid')}",
         f"- **Track**: {m.get('track')}",
@@ -7384,7 +7494,8 @@ def worker_listing(track: str = "", show_codes: bool = False) -> str:
         arch = ", archived" if r.get("archived") else ""
         ticket = f" | approval code: {approval_code(r['id'])}" if show_codes and r.get("status") == "pending_approval" else ""
         lines.append(f"- `{r.get('id')}` [{r.get('provider', '').upper()}{god}] **{r.get('role')}** :: "
-                     f"[{r.get('status', '').upper()}] (PID {r.get('pid')}{code}, track: {r.get('track')}{arch}){ticket}")
+                     f"[{r.get('status', '').upper()}] (PID {r.get('pid')}{code}, track: {r.get('track')}{arch})"
+                     f"{' :: ' + str(r.get('status_reason')) if r.get('status_reason') else ''}{ticket}")
     for wid in orphan_logs:
         lines.append(f"- `{wid}` :: log only, metadata was deleted. Read `{_log_file(wid)}`.")
     for wid, tr in sorted(remembered.items()):
@@ -9311,7 +9422,8 @@ def t_hud_status(project: str = "") -> str:
         lines.append(f"  (No active workers.{hist_note})")
     for w in workers[:6]:
         lines.append(f"  [*] {w['id']:<14} [{w.get('provider', '').upper():<11}] [{w.get('status', '').upper()}] "
-                     f"Track: {w.get('track', 'main')} Role: {w.get('role')}")
+                     f"Track: {w.get('track', 'main')} Role: {w.get('role')}"
+                     f"{' :: ' + str(w.get('status_reason')) if w.get('status_reason') else ''}")
 
     lines.extend([subsep, "[SHARED CONTEXT TRACKS]"])
     if not tracks:

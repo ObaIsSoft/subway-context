@@ -475,6 +475,7 @@ function workerRow(w, past) {
     h("div", {}, h("div", { class: "row-title" }, w.role || "Worker"),
       h("div", { class: "row-sub" }, h("span", { class: "mono" }, w.id), w.project_dir ? ` · ${w.project_dir}` : ""),
       textEl,
+      w.status_reason ? h("div", { class: "row-sub" }, `Reason: ${w.status_reason}`) : null,
       verifyLineEl,
       h("div", {}, logToggleBtn),
       w.route ? h("div", { class: "row-sub" }, `Why this agent: ${w.route}`) : null,

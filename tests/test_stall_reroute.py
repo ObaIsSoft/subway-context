@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -15,8 +16,10 @@ class TestStallAndReroute(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
         self.orig_subway_dir = server.SUBWAY_DIR
         self.orig_workers_dir = server.WORKERS_DIR
+        self.orig_opencode_dir = server.OPENCODE_DIR
         server.SUBWAY_DIR = self.temp_dir
         server.WORKERS_DIR = os.path.join(self.temp_dir, "workers")
+        server.OPENCODE_DIR = os.path.join(self.temp_dir, ".local", "share", "opencode")
         os.makedirs(server.WORKERS_DIR, exist_ok=True)
         os.makedirs(os.path.join(self.temp_dir, "inbox"), exist_ok=True)
         server._model_catalog.clear()
@@ -24,8 +27,111 @@ class TestStallAndReroute(unittest.TestCase):
     def tearDown(self):
         server.SUBWAY_DIR = self.orig_subway_dir
         server.WORKERS_DIR = self.orig_workers_dir
+        server.OPENCODE_DIR = self.orig_opencode_dir
         server._model_catalog.clear()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _create_opencode_retry_db(self, directory, data, created_at):
+        os.makedirs(server.OPENCODE_DIR, exist_ok=True)
+        db_path = os.path.join(server.OPENCODE_DIR, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER)")
+            con.execute(
+                "CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, "
+                "time_created INTEGER, time_updated INTEGER, data TEXT)"
+            )
+            con.execute("INSERT INTO session_v2 VALUES (?, ?, ?)", ("opencode-session", directory, created_at))
+            con.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("message-1", "opencode-session", "assistant", 1, created_at, created_at, json.dumps(data)),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def test_opencode_retry_error_is_logged_and_rerouted_immediately(self):
+        worker_id = "worker_444444"
+        worker_dir = os.path.join(self.temp_dir, "worktree")
+        os.makedirs(worker_dir)
+        started_at = time.time() - 2
+        retry_at = int((time.time() + 900) * 1000)
+        data = {
+            "retry": {
+                "attempt": 2,
+                "at": retry_at,
+                "error": {
+                    "type": "provider.rate-limit",
+                    "message": "Free usage limit reached. Retry after 15 minutes.",
+                },
+            },
+        }
+        meta = {
+            "id": worker_id,
+            "provider": "opencode",
+            "model": "opencode/flint-40b-free",
+            "project_dir": worker_dir,
+            "log_file": server._log_file(worker_id),
+            "status": "running",
+        }
+        self._create_opencode_retry_db(worker_dir, data, int((started_at + 1) * 1000))
+        server._save_worker(meta)
+
+        with mock.patch.object(server, "_handle_worker_exhaustion_or_stall", return_value={"status": "failed"}) as handler:
+            poll = server._poll_opencode_worker_retry(meta, started_at, set())
+
+        self.assertTrue(poll["quota"])
+        self.assertEqual(poll["reason"], "provider.rate-limit: Free usage limit reached. Retry after 15 minutes.")
+        handler.assert_called_once()
+        args, kwargs = handler.call_args
+        self.assertEqual(args[:2], (worker_id, meta))
+        self.assertEqual(args[2], f"Quota/usage limit error: {poll['reason']}")
+        self.assertEqual(kwargs["reset_time"], retry_at / 1000)
+        with open(meta["log_file"], encoding="utf-8") as log:
+            line = log.read().strip()
+        expected_clock = time.strftime("%H:%M", time.localtime(retry_at / 1000))
+        self.assertEqual(
+            line,
+            f"[opencode] provider.rate-limit: Free usage limit reached. Retry after 15 minutes. "
+            f"(retry 2 at {expected_clock})",
+        )
+        self.assertIn(poll["reason"], server.t_worker_status(worker_id))
+        self.assertIn(poll["reason"], server.worker_listing())
+
+    def test_opencode_retry_poller_ignores_messages_without_retry(self):
+        worker_dir = os.path.join(self.temp_dir, "worktree")
+        os.makedirs(worker_dir)
+        started_at = time.time() - 2
+        meta = {
+            "id": "worker_555555",
+            "provider": "opencode",
+            "model": "opencode/flint-40b-free",
+            "project_dir": worker_dir,
+            "log_file": server._log_file("worker_555555"),
+            "status": "running",
+        }
+        self._create_opencode_retry_db(worker_dir, {"tokens": {"input": 1}}, int((started_at + 1) * 1000))
+        server._save_worker(meta)
+
+        with mock.patch.object(server, "_handle_worker_exhaustion_or_stall") as handler:
+            self.assertIsNone(server._poll_opencode_worker_retry(meta, started_at, set()))
+
+        handler.assert_not_called()
+        self.assertFalse(os.path.exists(meta["log_file"]))
+        self.assertNotIn("status_reason", server._load_worker(meta["id"]))
+
+    def test_opencode_retry_poller_ignores_missing_database(self):
+        meta = {
+            "id": "worker_666666",
+            "provider": "opencode",
+            "model": "opencode/flint-40b-free",
+            "project_dir": self.temp_dir,
+            "log_file": server._log_file("worker_666666"),
+        }
+        with mock.patch.object(server, "_handle_worker_exhaustion_or_stall") as handler:
+            self.assertIsNone(server._poll_opencode_worker_retry(meta, time.time(), set()))
+        handler.assert_not_called()
+        self.assertFalse(os.path.exists(meta["log_file"]))
 
     def test_quota_error_worker_stops_marks_exhausted_and_reroutes(self):
         """A fake worker whose output contains a quota error is stopped, the model marked exhausted,
