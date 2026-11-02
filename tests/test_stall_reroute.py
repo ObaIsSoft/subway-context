@@ -230,7 +230,7 @@ class TestStallAndReroute(unittest.TestCase):
         captured = {}
         spin_args = {
             "role": "Worker", "prompt": "Do work", "provider": "copilot",
-            "model": "gpt-6-luna", "project_dir": self.temp_dir,
+            "model": "gpt-6-luna", "project_dir": self.temp_dir, "permission_mode": "auto_approve",
         }
 
         def capture_meta(meta):

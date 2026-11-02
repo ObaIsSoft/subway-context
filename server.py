@@ -39,6 +39,7 @@ import hashlib
 import hmac
 import http.server
 import json
+import math
 import os
 import re
 import secrets
@@ -4628,12 +4629,25 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
     if provider == "copilot":
         m = model if (model and model != "inherit") else "auto"
         wd = workdir or os.getcwd()
-        cmd = [bin_path or "copilot", "-p", text, "--model", m, "--output-format", "json",
-               "--stream", "on", "--add-dir", wd]
-        if session_id:
-            cmd.extend(["--session-id", session_id])
-        if isolate or isolated or skip_permissions:
+        cmd = [bin_path or "copilot", "--model", m, "--add-dir", wd, "--sync-session=off", "--no-ask-user"]
+        if max_budget_usd is not None:
+            # Copilot AI credits are cent-denominated (1 credit = $0.01); round up so a fractional USD cap is not weakened.
+            cmd.extend(["--max-ai-credits", str(math.ceil(max_budget_usd * 100))])
+        if permission_mode == "ask":
+            cmd.append("--acp")
+        else:
+            # --stream on keeps -p output flowing; the session id lets the stall watchdog follow the events file.
+            cmd.extend(["-p", text, "--output-format", "json", "--stream", "on"])
+            if session_id:
+                cmd.extend(["--session-id", session_id])
+        if skip_permissions:
             cmd.append("--allow-all-tools")
+        elif safe:
+            if "files:write" in caps:
+                safe_workdir = os.path.join(SUBWAY_DIR, "worktrees", worker_id) if (isolate or isolated) and worker_id else wd
+                cmd.append(f"--allow-tool=write({os.path.realpath(safe_workdir)})")
+            if "terminal:safe" in caps:
+                cmd.extend(f"--allow-tool=shell({command}:*)" for command in AGY_SAFE_COMMANDS)
         return cmd
 
     if provider == "claude":
@@ -6021,6 +6035,30 @@ def _prepare_worktree(meta: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _git(repo, "worktree", "add", "--detach", path, base)
     meta.update({"repo": repo, "base": base, "worktree": path})
+
+
+def _fallback_copilot_acp(meta: Dict[str, Any], workdir: str) -> bool:
+    """Replace a failed Copilot ask-mode ACP start with the safe-command allow list."""
+    if (meta.get("provider") != "copilot" or meta.get("permission_mode") != "ask"
+            or "--acp" not in (meta.get("cmd") or [])):
+        return False
+
+    budget = meta.get("budget") or {}
+    cmd = _worker_command(
+        "copilot", (meta.get("cmd") or ["copilot"])[0], str(meta.get("model") or "auto"),
+        str(meta.get("effort") or "auto"), meta.get("mode") == "god",
+        list(meta.get("capabilities") or []), "auto_safe", str(meta.get("prompt") or ""),
+        budget.get("max_usd"), str(meta.get("thread") or ""), str(meta.get("id") or ""),
+        workdir=workdir, isolate=bool(meta.get("isolate")), session_id=str(meta.get("copilot_session_id") or ""),
+    )
+    note = "Copilot ACP unavailable; running with safe-command auto-approval"
+    with _state_lock("workers"):
+        current = _load_worker(str(meta.get("id") or "")) or meta
+        current.update({"cmd": cmd, "start_note": note})
+        _save_worker(current)
+    meta.update({"cmd": cmd, "start_note": note})
+    _ping_launcher(str(meta.get("launched_by") or ""), f"[WORKER START NOTE] {note}.", from_id=str(meta.get("id") or ""))
+    return True
 
 
 OPENCODE_WATCHDOG_TIMEOUT = 120
@@ -7603,6 +7641,14 @@ def _opencode_worker_session_activity(meta: Dict[str, Any], started_at: float) -
 
 
 def _worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at: float) -> Dict[str, Any]:
+    """Activity readings are advisory: one that fails is skipped, never fatal to the supervisor."""
+    try:
+        return _collect_worker_activity_signals(meta, proc, started_at)
+    except Exception:
+        return {}
+
+
+def _collect_worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at: float) -> Dict[str, Any]:
     signals: Dict[str, Any] = {}
     log_path = meta.get("log_file")
     if log_path:
@@ -7942,8 +7988,10 @@ def supervise_worker(worker_id: str) -> int:
     is_claude = meta.get("provider") == "claude"
     is_copilot = meta.get("provider") == "copilot"
     is_local = meta.get("provider") == "local"
-    is_acp = meta.get("provider") in ("opencode", "local")
     cmd = list(meta["cmd"])
+    is_acp = meta.get("provider") in ("opencode", "local") or (
+        meta.get("provider") == "copilot" and "--acp" in cmd
+    )
     budget = meta.get("budget") or {}
     shared_spent: Dict[str, Any] = {"spent": sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output"))}
     run: Dict[str, Any] = shared_spent
@@ -8017,6 +8065,7 @@ def supervise_worker(worker_id: str) -> int:
 
     result: Dict[str, Any] = {}
     retries = 0
+    copilot_acp_fallback = False
     wrapped_up = False
     turn_cap = 0
     final_reason = ""
@@ -8040,15 +8089,25 @@ def supervise_worker(worker_id: str) -> int:
             worker_started_at = time.time()
             while True:
                 run = shared_spent
+                run.pop("acp_unavailable", None)
+                run.pop("acp_handshake_complete", None)
                 workdir = meta.get("worktree") or meta.get("project_dir") or HOME
                 env = dict(os.environ, PWD=workdir)
-                if is_acp and not meta.get("skip_permissions"):
+                if meta.get("provider") in ("opencode", "local") and is_acp and not meta.get("skip_permissions"):
                     env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permissions": [{"action": "*", "resource": "*", "effect": "ask"}]})
                 env["SUBWAY_WORKER"] = "1"
                 env["SUBWAY_WORKER_ID"] = meta["id"]
                 env["SUBWAY_STATION_ID"] = meta["id"]
-                proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except OSError:
+                    if not copilot_acp_fallback and _fallback_copilot_acp(meta, workdir):
+                        copilot_acp_fallback = True
+                        cmd = list(meta["cmd"])
+                        is_acp = False
+                        continue
+                    raise
                 current["proc"] = proc
                 pump = None
                 stall_timeout = get_stall_timeout(meta)
@@ -8058,6 +8117,7 @@ def supervise_worker(worker_id: str) -> int:
                 opencode_retries_seen: Set[Tuple[str, str]] = set()
                 previous_activity = _worker_activity_signals(meta, proc, worker_started_at)
                 last_activity = {signal: start_time for signal in previous_activity}
+                last_activity["start"] = start_time  # Never refreshes: with no other signal, quiet since start is a stall.
                 signal_interval = min(5.0, max(0.05, stall_timeout / 20))
                 next_signal_check = start_time + signal_interval
 
@@ -8182,6 +8242,16 @@ def supervise_worker(worker_id: str) -> int:
                     if callable(getattr(stream, "close", None)):
                         with contextlib.suppress(OSError):
                             stream.close()
+                handshake_stalled = bool(stopped.get("stall") and not stopped.get("quota_error"))
+                if (is_copilot and is_acp and run.get("acp_unavailable")
+                        and (not stopped["flag"] or handshake_stalled)
+                        and not copilot_acp_fallback and _fallback_copilot_acp(meta, workdir)):
+                    copilot_acp_fallback = True
+                    stopped["flag"] = False
+                    stopped.pop("stall", None)
+                    cmd = list(meta["cmd"])
+                    is_acp = False
+                    continue
                 if pump:
                     save_kwargs = {}
                     if run.get("model_used"):
@@ -8644,15 +8714,16 @@ def _pump_opencode(
     session_id = None
     config_ops: List[Tuple[str, str]] = []
 
+    is_opencode = meta.get("provider") in ("opencode", "local")
     model_val = meta.get("model")
     if meta.get("provider") == "local":
         if model_val and not str(model_val).startswith("ollama/"):
             model_val = f"ollama/{model_val}"
-    if model_val and model_val != "default":
+    if model_val and model_val != "default" and is_opencode:
         config_ops.append(("model", str(model_val)))
 
     effort = meta.get("effort")
-    if effort and effort != "auto":
+    if effort and effort != "auto" and is_opencode:
         config_ops.append(("effort", str(effort)))
 
     curr_config_id = None
@@ -8739,6 +8810,11 @@ def _pump_opencode(
             is_reply = method is None
 
             if is_reply and msg_id == init_id and msg_id is not None:
+                if msg.get("error"):
+                    run["acp_unavailable"] = True
+                    if proc.poll() is None:
+                        proc.terminate()
+                    return
                 msg_counter += 1
                 session_new_id = msg_counter
                 send_rpc({"jsonrpc": "2.0", "id": session_new_id, "method": "session/new",
@@ -8748,8 +8824,14 @@ def _pump_opencode(
             if is_reply and msg_id is not None and msg_id == session_new_id:
                 res = msg.get("result") or {}
                 session_id = res.get("sessionId")
+                if msg.get("error") or not session_id:
+                    run["acp_unavailable"] = True
+                    if proc.poll() is None:
+                        proc.terminate()
+                    return
+                run["acp_handshake_complete"] = True
                 run["conversation"] = session_id
-                if session_id:
+                if session_id and is_opencode:
                     monitor_thread = threading.Thread(
                         target=monitor_tokens, args=(session_id,), name="opencode-token-poller", daemon=True,
                     )
@@ -8809,7 +8891,7 @@ def _pump_opencode(
                     continue
                 reply = (res.get("response") or res.get("text") or "".join(response_chunks)).strip()
 
-                if session_id:
+                if session_id and is_opencode:
                     toks = _opencode_session_tokens(session_id)
                     if toks:
                         run["usage"] = toks
@@ -8848,7 +8930,7 @@ def _pump_opencode(
                 if reply:
                     write(reply)
                 stop_monitor.set()
-                if session_id:
+                if session_id and is_opencode:
                     final_toks = _opencode_session_tokens(session_id)
                     if final_toks:
                         run["usage"] = final_toks
@@ -8921,11 +9003,13 @@ def _pump_opencode(
                 })
                 continue
     finally:
+        if meta.get("provider") == "copilot" and not run.get("acp_handshake_complete"):
+            run["acp_unavailable"] = True
         stop_monitor.set()
         for monitor_thread in monitor_threads:
             if monitor_thread is not threading.current_thread():
                 monitor_thread.join(timeout=3)
-        if session_id and not run.get("usage"):
+        if session_id and is_opencode and not run.get("usage"):
             final_toks = _opencode_session_tokens(session_id)
             if final_toks:
                 run["usage"] = final_toks
@@ -9046,6 +9130,7 @@ def _worker_detail(m: Dict[str, Any]) -> str:
         f"- **Mode**: {m.get('mode', 'standard').upper()}",
         f"- **Effort**: {m.get('effort', 'auto')}",
         f"- **Status**: [{m.get('status', 'unknown').upper()}]",
+        *([f"- **Start note**: {m.get('start_note')}"] if m.get("start_note") else []),
         *([f"- **Reason**: {m.get('status_reason')}"] if m.get("status_reason") else []),
         f"- **Exit code**: {code}",
         f"- **PID**: {m.get('pid')}",
@@ -9084,6 +9169,7 @@ def worker_listing(track: str = "", show_codes: bool = False) -> str:
         ticket = f" | approval code: {approval_code(r['id'])}" if show_codes and r.get("status") == "pending_approval" else ""
         lines.append(f"- `{r.get('id')}` [{r.get('provider', '').upper()}{god}] **{r.get('role')}** :: "
                      f"[{r.get('status', '').upper()}] (PID {r.get('pid')}{code}, track: {r.get('track')}{arch})"
+                     f"{' :: ' + str(r.get('start_note')) if r.get('start_note') else ''}"
                      f"{' :: ' + str(r.get('status_reason')) if r.get('status_reason') else ''}{ticket}")
     for wid in orphan_logs:
         lines.append(f"- `{wid}` :: log only, metadata was deleted. Read `{_log_file(wid)}`.")
@@ -10806,9 +10892,9 @@ def check_budget_preflight(model: str = "", provider: str = "auto",
             return False, "[MEMORY GUARD] No installed local model fits in the memory that's free right now."
         ok, msg = local_fit(model_name)
         return ok, msg if ok else f"[MEMORY GUARD] {msg}"
-    if max_budget_usd is not None and provider != "claude":
+    if max_budget_usd is not None and provider not in ("claude", "copilot"):
         return False, (f"[BUDGET GUARD ALERT] {provider} can't enforce a USD cap (max_budget_usd). "
-                       f"Remove the cap or use provider='claude'.")
+                       f"Remove the cap or use provider='claude' or 'copilot'.")
     record = next((p for p in discover_connected_providers() if p["id"] == provider), None)
     if record is None:
         return True, f"Budget unknown: {provider} isn't detected on this machine."
@@ -12023,7 +12109,7 @@ TOOLS = {
             "capabilities": {"type": "array", "items": {"type": "string", "enum": sorted(VALID_CAPABILITIES)}, "description": "Default: files:read, files:write, terminal:safe."},
             "budget_session_pct": {"type": "number", "description": "Most of the 5-hour limit this worker may use, in points. Checked before it starts, and it's stopped when reached."},
             "budget_weekly_pct": {"type": "number", "description": "Most of the weekly limit this worker may use, in points. Checked before it starts, and it's stopped when reached."},
-            "max_budget_usd": {"type": "number", "description": "Hard USD spend cap. Claude workers only."},
+            "max_budget_usd": {"type": "number", "description": "Hard USD spend cap. Enforced by Claude and Copilot workers."},
             "thread": {"type": "string", "description": "Continue an existing chat of that agent, by @alias or ID, instead of starting fresh."},
             "then": {"type": "string", "description": "Optional JSON list of follow-up steps. Each step: role, prompt, provider, model, when, include, other_provider, max_tokens, verdict, then. The next worker starts when this one finishes."},
             "review": {"type": "string", "description": "Preset follow-up: '' (none), 'auto', or 'provider/model'. Appends a read-only Reviewer step that replies APPROVE or REJECT."},
