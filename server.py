@@ -2991,6 +2991,7 @@ def _all_workers(include_archive: bool = False) -> List[Dict[str, Any]]:
             continue
         if isinstance(meta, dict) and WORKER_ID_RE.match(str(meta.get("id", ""))):
             meta = _update_worker_status(meta)
+            meta = _normalise_copilot_worker_record(meta)
             meta["archived"] = os.path.dirname(fp) != WORKERS_DIR
             records.append(meta)
     records.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
@@ -5308,6 +5309,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "log_file": _log_file(worker_id),
         "report": "Awaiting user approval before launching.",
     }
+    if selected_provider == "copilot":
+        meta["input_excludes_cache"] = True
     _save_worker(meta)
 
     god_warning = ("[WARNING: GOD MODE] This worker runs with permission prompts off and maximum effort.\n"
@@ -6206,10 +6209,32 @@ def _add_usage(meta: Dict[str, Any], u: Dict[str, Any]) -> None:
     usage["input"] += int(u.get("input_tokens") or 0)
     usage["output"] += int(u.get("output_tokens") or 0) + int(u.get("thinking_tokens") or 0)
     usage["cache_read"] += int(u.get("cache_read_tokens") or 0)
+    if meta.get("provider") == "copilot":
+        meta["input_excludes_cache"] = True
     if "credits" in u and u["credits"] is not None:
         usage["credits"] = round(float(usage.get("credits", 0.0)) + float(u["credits"]), 5)
     if "requests" in u and u["requests"] is not None:
         usage["requests"] = int(usage.get("requests", 0)) + int(u["requests"])
+
+
+def _copilot_fresh_input(input_tokens: Any, cache_read_tokens: Any) -> int:
+    return max(0, int(input_tokens or 0) - int(cache_read_tokens or 0))
+
+
+def _normalise_copilot_worker_record(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a display-only normalized copy of legacy Copilot usage."""
+    usage = meta.get("usage")
+    if (str(meta.get("provider") or "").lower() != "copilot"
+            or meta.get("input_excludes_cache") is True
+            or not isinstance(usage, dict)):
+        return meta
+    normalized = dict(meta)
+    normalized_usage = dict(usage)
+    normalized_usage["input"] = _copilot_fresh_input(
+        normalized_usage.get("input"), normalized_usage.get("cache_read"))
+    normalized["usage"] = normalized_usage
+    normalized["input_excludes_cache"] = True
+    return normalized
 
 
 def _check_cap(run: Dict[str, Any]) -> None:
@@ -6423,10 +6448,11 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
         inp = int((td.get("input") or {}).get("tokenCount", 0))
         out_tok = int((td.get("output") or {}).get("tokenCount", 0))
         cache_read = int((td.get("cache_read") or {}).get("tokenCount", 0))
-        cache_write = int((td.get("cache_write") or td.get("cache_creation") or {}).get("tokenCount", 0))
+        td_inp = inp
+        td_write = int((td.get("cache_write") or td.get("cache_creation") or {}).get("tokenCount", 0))
 
         mm = data.get("modelMetrics") or snap.get("modelMetrics") or {}
-        mm_inp = mm_out = mm_cache = mm_write = mm_reasoning = 0
+        mm_inp = mm_out = mm_cache = mm_reasoning = 0
         for m_name, m_info in mm.items():
             if m_name and not run.get("model_used"):
                 run["model_used"] = m_name
@@ -6434,21 +6460,17 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             mm_inp += int(mu.get("inputTokens") or 0)
             mm_out += int(mu.get("outputTokens") or 0)
             mm_cache += int(mu.get("cacheReadTokens") or 0)
-            mm_write += int(mu.get("cacheWriteTokens") or mu.get("cacheCreationTokens") or 0)
             mm_reasoning += int(mu.get("reasoningTokens") or 0)
 
         if mm_inp > inp:
             inp = mm_inp
         if mm_cache > cache_read:
             cache_read = mm_cache
-        if mm_write > cache_write:
-            cache_write = mm_write
 
         if not inp and not out_tok:
             inp = mm_inp
             out_tok = mm_out + mm_reasoning
             cache_read = mm_cache
-            cache_write = mm_write
         elif mm_reasoning:
             out_tok += mm_reasoning
 
@@ -6457,11 +6479,18 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             u["credits"] = credits_val
         if reqs_val is not None:
             u["requests"] = int(reqs_val)
-        u["input_tokens"] = inp + cache_write
+        # Checked against live events: tokenDetails.input already excludes cache reads and writes, while
+        # modelMetrics inputTokens = uncached input + cache reads + cache writes. Fresh input = uncached + cache writes.
+        if mm_inp:
+            fresh_inp = _copilot_fresh_input(mm_inp, mm_cache)
+        else:
+            fresh_inp = td_inp + td_write
+        u["input_tokens"] = fresh_inp
         u["output_tokens"] = out_tok
         u["cache_read_tokens"] = cache_read
+        run["input_excludes_cache"] = True
 
-        step_cost = inp + cache_write + out_tok
+        step_cost = fresh_inp + out_tok
         new_cost = max(0, step_cost - run.get("seen_tokens", 0))
         run["seen_tokens"] = max(step_cost, run.get("seen_tokens", 0))
         run["spent"] = run.get("spent", 0) + new_cost
@@ -6494,6 +6523,8 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
                                  ("cache_read_tokens", "cache_read_tokens"), ("cache_read", "cache_read_tokens")]:
                 if k_src in u_dict:
                     u[k_dst] = int(u_dict[k_src] or 0)
+            u["input_tokens"] = _copilot_fresh_input(u.get("input_tokens"), u.get("cache_read_tokens"))
+            run["input_excludes_cache"] = True
             step_cost = u.get("input_tokens", 0) + u.get("output_tokens", 0)
             if step_cost:
                 new_cost = max(0, step_cost - run.get("seen_tokens", 0))
@@ -9541,7 +9572,7 @@ def _copilot_cli_usage(base_dir: Optional[str] = None) -> Optional[Dict[str, Any
             return v if v is not None else 0.0
 
         cps.sort(key=_get_ts)
-        prev_inp, prev_out, prev_cache, prev_aiu = 0, 0, 0, 0.0
+        prev_fresh_inp, prev_out, prev_cache, prev_aiu = 0, 0, 0, 0.0
         prev_model_metrics: Dict[str, int] = {}
         for cp in cps:
             ts = _get_ts(cp)
@@ -9551,13 +9582,15 @@ def _copilot_cli_usage(base_dir: Optional[str] = None) -> Optional[Dict[str, Any
             inp = int((td.get("input") or {}).get("tokenCount") or 0)
             out = int((td.get("output") or {}).get("tokenCount") or 0)
             cache = int((td.get("cache_read") or {}).get("tokenCount") or 0)
+            write = int((td.get("cache_write") or td.get("cache_creation") or {}).get("tokenCount") or 0)
             nano_aiu = float(data.get("totalNanoAiu") or 0.0)
 
-            delta_inp = max(0, inp - prev_inp)
+            fresh_inp = inp + write  # tokenDetails.input excludes cache reads and writes
+            delta_inp = max(0, fresh_inp - prev_fresh_inp)
             delta_out = max(0, out - prev_out)
             delta_cache = max(0, cache - prev_cache)
             delta_aiu = max(0.0, nano_aiu - prev_aiu)
-            prev_inp, prev_out, prev_cache, prev_aiu = inp, out, cache, nano_aiu
+            prev_fresh_inp, prev_out, prev_cache, prev_aiu = fresh_inp, out, cache, nano_aiu
 
             events.append((ts, delta_inp, delta_out, delta_cache))
             credit_events.append((ts, delta_aiu / 1e9))
@@ -9566,7 +9599,8 @@ def _copilot_cli_usage(base_dir: Optional[str] = None) -> Optional[Dict[str, Any
                 m_usage = (m_info.get("usage") if isinstance(m_info, dict) else {}) or {}
                 m_inp = int(m_usage.get("inputTokens") or 0)
                 m_out = int(m_usage.get("outputTokens") or 0)
-                m_used = m_inp + m_out
+                m_cache = int(m_usage.get("cacheReadTokens") or 0)
+                m_used = _copilot_fresh_input(m_inp, m_cache) + m_out
                 prev_m = prev_model_metrics.get(m_name, 0)
                 delta_m = max(0, m_used - prev_m)
                 prev_model_metrics[m_name] = m_used

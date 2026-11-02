@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -27,6 +28,8 @@ class TestCopilotWorkers(unittest.TestCase):
         self.assertEqual(u.get("requests"), 1)
         self.assertEqual(u.get("input_tokens"), 14067)
         self.assertEqual(u.get("output_tokens"), 5)
+        self.assertEqual(u.get("cache_read_tokens"), 0)
+        self.assertTrue(run.get("input_excludes_cache"))
 
         meta = {}
         server._add_usage(meta, u)
@@ -92,6 +95,7 @@ class TestCopilotIntegration(unittest.TestCase):
         self.fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "copilot_run.jsonl")
 
     def tearDown(self):
+        server._copilot_cli_usage.clear()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _build_session_state(self):
@@ -147,6 +151,41 @@ class TestCopilotIntegration(unittest.TestCase):
         self.assertGreater(res["credits"]["5h"], 0)
         self.assertGreater(res["5h"]["input"], 0)
         self.assertGreater(sum(res["hourly"]), 0)
+
+    def test_copilot_cli_usage_excludes_cached_input(self):
+        sess_dir = os.path.join(self.temp_dir, "session-cache")
+        os.makedirs(sess_dir)
+        events_path = os.path.join(sess_dir, "events.jsonl")
+        event = {
+            "type": "session.usage_checkpoint",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60)),
+            "data": {
+                "accountingSnapshot": {
+                    "tokenDetails": {
+                        "input": {"tokenCount": 150},
+                        "output": {"tokenCount": 10},
+                        "cache_read": {"tokenCount": 800},
+                        "cache_write": {"tokenCount": 50},
+                    },
+                    "modelMetrics": {
+                        "model-a": {"usage": {
+                            "inputTokens": 1000,
+                            "outputTokens": 10,
+                            "cacheReadTokens": 800,
+                            "cacheWriteTokens": 50,
+                        }}
+                    },
+                }
+            },
+        }
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+
+        res = server._copilot_cli_usage(self.temp_dir)
+        self.assertEqual(res["5h"]["input"], 200)
+        self.assertEqual(res["5h"]["cache_read"], 800)
+        self.assertEqual(res["hourly"][-1], 210)
+        self.assertEqual(res["per_model"]["model-a"], 210)
 
     def test_copilot_view_carries_tokens(self):
         client = {"id": "copilot", "installed": True, "dispatchable": True}
@@ -347,9 +386,120 @@ class TestCopilotIntegration(unittest.TestCase):
         }
         run = {}
         server._process_copilot_event(ev, run, lambda text: None)
-        self.assertEqual(run["usage"]["input_tokens"], 25000)
+        self.assertEqual(run["usage"]["input_tokens"], 24950)
         self.assertEqual(run["usage"]["output_tokens"], 100)
-        self.assertEqual(run["spent"], 25100)
+        self.assertEqual(run["usage"]["cache_read_tokens"], 50)
+        self.assertEqual(run["spent"], 25050)
+        self.assertTrue(run["input_excludes_cache"])
+
+    def test_copilot_input_clamps_cache_and_handles_missing_cache(self):
+        # tokenDetails.input already excludes cache reads (live shape), so it is never reduced by cache_read.
+        for input_tokens, cache_read, expected in ((40, 80, 40), (40, None, 40)):
+            event = {
+                "type": "session.usage_checkpoint",
+                "data": {"tokenDetails": {
+                    "input": {"tokenCount": input_tokens},
+                    "output": {"tokenCount": 5},
+                    **({"cache_read": {"tokenCount": cache_read}} if cache_read is not None else {}),
+                }},
+            }
+            run = {}
+            server._process_copilot_event(event, run, lambda text: None)
+            self.assertEqual(run["usage"]["input_tokens"], expected)
+            self.assertEqual(run["usage"]["cache_read_tokens"], cache_read or 0)
+
+        parsed = server.parse_copilot_jsonl(json.dumps({
+            "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_tokens": 12}
+        }))
+        self.assertEqual(parsed["usage"]["input_tokens"], 0)
+        self.assertEqual(parsed["usage"]["cache_read_tokens"], 12)
+
+        no_cache = server.parse_copilot_jsonl(json.dumps({
+            "usage": {"input_tokens": 10, "output_tokens": 2}
+        }))
+        self.assertEqual(no_cache["usage"]["input_tokens"], 10)
+
+    def test_pump_copilot_records_fresh_input(self):
+        proc = MagicMock()
+        proc.stdout = [json.dumps({
+            "type": "session.usage_checkpoint",
+            "data": {"tokenDetails": {
+                "input": {"tokenCount": 100},
+                "output": {"tokenCount": 5},
+                "cache_read": {"tokenCount": 60},
+            }},
+        }).encode("utf-8")]
+        run = {}
+        server._pump_copilot(proc, io.BytesIO(), run)
+        self.assertEqual(run["usage"]["input_tokens"], 100)
+        self.assertEqual(run["usage"]["cache_read_tokens"], 60)
+
+    def test_copilot_live_checkpoint_shape_counts_cache_once(self):
+        # Numbers from a real 1.3.3 worker checkpoint: modelMetrics input = uncached + cache reads + cache writes.
+        td = {"input": {"tokenCount": 159}, "output": {"tokenCount": 66333},
+              "cache_read": {"tokenCount": 4476250}, "cache_write": {"tokenCount": 126823}}
+        mm = {"gpt-6-luna": {"usage": {"inputTokens": 4603232, "outputTokens": 66333,
+                                        "cacheReadTokens": 4476250, "cacheWriteTokens": 126823}}}
+        for data in ({"accountingSnapshot": {"tokenDetails": td, "modelMetrics": mm}},
+                     {"accountingSnapshot": {"tokenDetails": td}}):
+            run = {}
+            server._process_copilot_event({"type": "session.usage_checkpoint", "data": data}, run, lambda text: None)
+            self.assertEqual(run["usage"]["input_tokens"], 159 + 126823)
+            self.assertEqual(run["usage"]["cache_read_tokens"], 4476250)
+
+    def test_legacy_copilot_worker_usage_normalizes_without_rewriting(self):
+        root = os.path.join(self.temp_dir, "subway")
+        workers_dir = os.path.join(root, "workers")
+        tracks_dir = os.path.join(root, "tracks")
+        os.makedirs(workers_dir)
+        created_at = server._dt.datetime.now().astimezone().isoformat()
+        old_record = {
+            "id": "worker_abcdef", "provider": "copilot", "status": "completed",
+            "created_at": created_at,
+            "usage": {"input": 1500, "output": 50, "cache_read": 1200},
+        }
+        new_record = {
+            "id": "worker_123456", "provider": "copilot", "status": "completed",
+            "created_at": created_at,
+            "usage": {"input": 400, "output": 20, "cache_read": 300},
+            "input_excludes_cache": True,
+        }
+        old_path = os.path.join(workers_dir, "worker_abcdef.json")
+        new_path = os.path.join(workers_dir, "worker_123456.json")
+        with open(old_path, "w", encoding="utf-8") as f:
+            json.dump(old_record, f)
+        with open(new_path, "w", encoding="utf-8") as f:
+            json.dump(new_record, f)
+        with open(old_path, "rb") as f:
+            old_bytes = f.read()
+
+        with patch.object(server, "SUBWAY_DIR", root), \
+             patch.object(server, "WORKERS_DIR", workers_dir), \
+             patch.object(server, "TRACKS_DIR", tracks_dir), \
+             patch.object(server, "_copilot_cli_usage", return_value=None):
+            records = {w["id"]: w for w in server._all_workers()}
+            self.assertEqual(records["worker_abcdef"]["usage"]["input"], 300)
+            self.assertEqual(records["worker_123456"]["usage"]["input"], 400)
+            self.assertTrue(records["worker_abcdef"]["input_excludes_cache"])
+            again = {w["id"]: w for w in server._all_workers()}
+            self.assertEqual(again["worker_abcdef"]["usage"]["input"], 300)
+            self.assertEqual(server._provider_5h_tokens("copilot"), 770)
+
+        with open(old_path, "rb") as f:
+            self.assertEqual(f.read(), old_bytes)
+
+    def test_new_copilot_usage_record_is_marked(self):
+        meta = {"provider": "copilot", "usage": {"input": 0, "output": 0, "cache_read": 0}}
+        server._add_usage(meta, {
+            "input_tokens": 40, "output_tokens": 5, "cache_read_tokens": 60,
+            "credits": 0.25, "requests": 1,
+        })
+        self.assertTrue(meta["input_excludes_cache"])
+        self.assertEqual(meta["usage"]["input"], 40)
+        self.assertEqual(meta["usage"]["cache_read"], 60)
+        self.assertEqual(meta["usage"]["output"], 5)
+        self.assertEqual(meta["usage"]["credits"], 0.25)
+        self.assertEqual(meta["usage"]["requests"], 1)
 
     def test_copilot_models_deduplicate(self):
         raw_models = [
