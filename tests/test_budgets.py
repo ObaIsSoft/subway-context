@@ -94,6 +94,104 @@ class TestBudgetState(unittest.TestCase):
                 self.assertEqual(p_entry["status"], expected_status)
 
 
+class TestPerChatBudgets(unittest.TestCase):
+    """Chat budgets belong to the chat that set them; a universal default covers chats without one."""
+
+    def _cfg_io(self, initial=None):
+        store = {"config.json": dict(initial or {})}
+
+        def load(fn):
+            return dict(store.get(fn, {}))
+
+        def save(fn, data):
+            store[fn] = data
+
+        return store, load, save
+
+    def test_chat_a_budget_never_blocks_chat_b(self):
+        store, load, save = self._cfg_io()
+        with patch.object(server, "_load_json", side_effect=load), \
+             patch.object(server, "_save_json", side_effect=save):
+            server.set_budget("chat", 6_000_000, session_id="chat-a")
+        with patch.object(server, "_load_json", side_effect=load):
+            limit, scope = server.chat_budget_for("chat-b")
+            self.assertIsNone(limit)
+            self.assertIsNone(scope)
+
+    def test_universal_default_applies_to_chats_without_their_own(self):
+        store, load, save = self._cfg_io()
+        with patch.object(server, "_load_json", side_effect=load), \
+             patch.object(server, "_save_json", side_effect=save):
+            server.set_budget("chat", 1000)  # no session_id -> universal default
+        with patch.object(server, "_load_json", side_effect=load):
+            limit, scope = server.chat_budget_for("any-chat")
+            self.assertEqual(limit, 1000)
+            self.assertEqual(scope, "universal")
+
+    def test_own_budget_overrides_universal(self):
+        store, load, save = self._cfg_io()
+        with patch.object(server, "_load_json", side_effect=load), \
+             patch.object(server, "_save_json", side_effect=save):
+            server.set_budget("chat", 1000)
+            server.set_budget("chat", 5000, session_id="chat-a")
+        with patch.object(server, "_load_json", side_effect=load):
+            limit, scope = server.chat_budget_for("chat-a")
+            self.assertEqual((limit, scope), (5000, "chat"))
+            limit2, scope2 = server.chat_budget_for("chat-b")
+            self.assertEqual((limit2, scope2), (1000, "universal"))
+
+    def test_chat_line_sets_the_right_chat(self):
+        store, load, save = self._cfg_io()
+        chat_line = "subway-context " + "budget chat 5000"
+        with patch.object(server, "_load_json", side_effect=load), \
+             patch.object(server, "_save_json", side_effect=save), \
+             patch.dict(os.environ, {"SUBWAY_WORKER": ""}):
+            server.hook_prompt({"prompt": chat_line, "session_id": "chat-a"})
+            limit, scope = server.chat_budget_for("chat-a")
+            self.assertEqual((limit, scope), (5000, "chat"))
+            limit_b, _ = server.chat_budget_for("chat-b")
+            self.assertIsNone(limit_b)
+
+    def test_cli_budget_chat_sets_universal_and_dash_chat_sets_one(self):
+        store, load, save = self._cfg_io()
+        with patch.object(server, "_load_json", side_effect=load), \
+             patch.object(server, "_save_json", side_effect=save):
+            msg = server.set_budget("chat", 2000)
+            self.assertIn("universal", msg.lower())
+            self.assertEqual(server.chat_budget_for("any-chat"), (2000, "universal"))
+
+            msg2 = server.set_budget("chat", 3000, session_id="chat-z")
+            self.assertIn("this chat", msg2.lower())
+            self.assertEqual(server.chat_budget_for("chat-z"), (3000, "chat"))
+
+    def test_migration_both_ways(self):
+        store, load, save = self._cfg_io({"chat_budget_tokens": 7000})
+        with patch.object(server, "_load_json", side_effect=load):
+            limit, scope = server.chat_budget_for("any-chat")
+            self.assertEqual((limit, scope), (7000, "universal"))
+        with patch.object(server, "_load_json", side_effect=load), \
+             patch.object(server, "_save_json", side_effect=save):
+            server.set_budget("claude", 10)  # any save migrates the legacy key
+            self.assertNotIn("chat_budget_tokens", store["config.json"])
+            self.assertEqual(store["config.json"].get("chat_budget_default"), 7000)
+
+    def test_messages_name_the_scope(self):
+        with patch.object(server, "_load_json", side_effect=lambda fn: {"chat_budget_default": 100} if fn == "config.json" else {}), \
+             patch.object(server, "chat_tokens_used", return_value=150):
+            res = server.hook_prompt({"session_id": "any-chat"})
+            reason = res.get("reason", "")
+            self.assertIn("universal chat budget is reached", reason.lower())
+            self.assertIn("subway-context budget chat <tokens>", reason)
+            self.assertNotIn("--chat", reason)
+
+        with patch.object(server, "_load_json", side_effect=lambda fn: {"chat_budgets": {"sid1": 100}} if fn == "config.json" else {}), \
+             patch.object(server, "chat_tokens_used", return_value=150):
+            res2 = server.hook_prompt({"session_id": "sid1"})
+            reason2 = res2.get("reason", "")
+            self.assertIn("this chat's budget is reached", reason2.lower())
+            self.assertIn("subway-context budget chat <tokens> --chat sid1", reason2)
+
+
 class TestHookPrompt(unittest.TestCase):
     """Tests for hook_prompt: returns additionalContext when warning, decision block when reached.
 
@@ -104,7 +202,7 @@ class TestHookPrompt(unittest.TestCase):
         # Mock budget_ping_notice to show once (return text first time, None second time)
         ping_calls = []
 
-        def mock_ping(scope, used, limit):
+        def mock_ping(scope, used, limit, **kwargs):
             ping_calls.append((scope, used, limit))
             if len(ping_calls) == 1:
                 return "Warning: chat budget at 80%"
@@ -136,13 +234,13 @@ class TestHookPrompt(unittest.TestCase):
                 res_block1 = server.hook_prompt(event)
                 self.assertIsNotNone(res_block1)
                 self.assertEqual(res_block1.get("decision"), "block")
-                self.assertIn("Budget reached", res_block1.get("reason", ""))
+                self.assertIn("budget is reached", res_block1.get("reason", "").lower())
 
                 # Second time: block shows ALWAYS
                 res_block2 = server.hook_prompt(event)
                 self.assertIsNotNone(res_block2)
                 self.assertEqual(res_block2.get("decision"), "block")
-                self.assertIn("Budget reached", res_block2.get("reason", ""))
+                self.assertIn("budget is reached", res_block2.get("reason", "").lower())
 
 
 class TestEnforceBudgets(unittest.TestCase):
@@ -266,7 +364,29 @@ class TestHandleToolsCallBudget(unittest.TestCase):
             self.assertIsNotNone(resp)
             self.assertTrue(resp.get("result", {}).get("isError"))
             content = resp.get("result", {}).get("content", [])
-            self.assertTrue(any("Budget reached" in c.get("text", "") for c in content))
+            texts = [c.get("text", "") for c in content]
+            self.assertTrue(any("budget is reached" in t.lower() for t in texts))
+            self.assertTrue(any("subway-context budget chat <tokens>" in t and "--chat" not in t for t in texts))
+
+    def test_blocked_tools_show_own_chat_flag(self):
+        cfg = {"chat_budgets": {"sidX": 1000}}
+        req = {
+            "jsonrpc": "2.0",
+            "id": "call-2",
+            "method": "tools/call",
+            "params": {
+                "name": "list_chats",
+                "arguments": {}
+            }
+        }
+        with patch.object(server, "_load_json", return_value=cfg), \
+             patch.object(server, "_self_id", return_value="sidX"), \
+             patch.object(server, "chat_tokens_used", return_value=1000), \
+             patch.object(server, "enforce_budgets"):
+            resp = server.handle(req)
+            content = resp.get("result", {}).get("content", [])
+            texts = [c.get("text", "") for c in content]
+            self.assertTrue(any("subway-context budget chat <tokens> --chat sidX" in t for t in texts))
 
     def test_exempt_tools_allowed_when_budget_reached(self):
         cfg = {"chat_budget_tokens": 1000}
@@ -317,6 +437,22 @@ class TestHandleToolsCallBudget(unittest.TestCase):
             self.assertEqual(mock_p5h.call_count, mock_calls)
             by_scope2 = {r["scope"]: r for r in rows2}
             self.assertEqual(by_scope2["claude"]["used"], 150)
+
+    def test_hud_data_includes_chat_budget_rows(self):
+        cfg = {"chat_budgets": {"chat-a": 1000, "chat-b": 2000}}
+        with patch.object(server, "_load_json", return_value=cfg), \
+             patch.object(server, "all_chats", return_value=[
+                 {"id": "chat-a", "title": "Chat A"},
+             ]), \
+             patch.object(server, "chat_tokens_used", side_effect=lambda sid=None: {"chat-a": 900, "chat-b": 200}.get(sid)):
+            data = server.get_hud_data()
+            chats = data["settings"]["chat_budgets"]["chats"]
+            by_id = {c["session_id"]: c for c in chats}
+            self.assertEqual(set(by_id), {"chat-a", "chat-b"})
+            self.assertEqual(by_id["chat-a"]["label"], "Chat A")
+            self.assertEqual(by_id["chat-a"]["status"], "warning")
+            self.assertEqual(by_id["chat-b"]["label"], server._short_id("chat-b"))
+            self.assertEqual(chats[0]["session_id"], "chat-a")
 
 
 class TestStreamPumps(unittest.TestCase):
@@ -435,6 +571,29 @@ class TestBudgetOriginAndHookGuard(unittest.TestCase):
                 out.get("permissionDecisionReason"),
                 "Budgets are the user's to change. Ask them to run it, or use the HUD.",
             )
+
+    def test_hook_guard_allows_worktree_read_but_denies_state_path(self):
+        sdir = tempfile.mkdtemp()
+        orig = server.SUBWAY_DIR
+        server.SUBWAY_DIR = sdir
+        try:
+            wt_file = os.path.join(sdir, "worktrees", "x", "server.py")
+            os.makedirs(os.path.dirname(wt_file), exist_ok=True)
+            with open(wt_file, "w") as f:
+                f.write("# test")
+            res = server.hook_guard({"tool_name": "Read", "tool_input": {"file_path": wt_file}})
+            self.assertIsNone(res)
+
+            cfg_file = os.path.join(sdir, "config.json")
+            res2 = server.hook_guard({"tool_name": "Read", "tool_input": {"file_path": cfg_file}})
+            self.assertIsNotNone(res2)
+            self.assertEqual(
+                res2["hookSpecificOutput"]["permissionDecisionReason"],
+                "Subway's state files are the user's to change.",
+            )
+        finally:
+            server.SUBWAY_DIR = orig
+            shutil.rmtree(sdir, ignore_errors=True)
 
     def test_hud_post_budget_routes_require_matching_origin_or_referer(self):
         routes = ["/api/budget", "/api/chat_budget", "/api/settings"]

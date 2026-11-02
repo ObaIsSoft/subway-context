@@ -46,7 +46,7 @@ export function helpPage() {
         { term: "swarm and god mode", desc: "Running many workers at once with no count limit, constrained only by free memory." },
         { term: "priority", desc: "Worker queue urgency levels: urgent, normal, and low." },
         { term: "permission modes", desc: "How actions are authorized: Approve everything, Auto-approve safe commands, or Auto-approve everything." },
-        { term: "budgets", desc: "Token limits set per chat and per provider, with a warning at 80% and a hard block at 100%." },
+        { term: "budgets", desc: "Token limits per provider, plus chat budgets: each chat can have its own limit, and a universal default applies to any chat without one. Warns at 80%, hard-blocks at 100%." },
         { term: "token cap and wrap-up", desc: "Workers are told to wrap up at two thirds of their cap, and no tool call is started that would pass the cap." },
         { term: "verifier", desc: "Automated check returning PASS, FLAG, or FAIL; proves changes are mechanically sound, not proof of correctness." },
         { term: "compaction and segments", desc: "Context trimming modes (Suggest, Auto, Never); keeps active context compact while full history stays readable." },
