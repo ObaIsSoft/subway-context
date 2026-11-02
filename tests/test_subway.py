@@ -1480,3 +1480,22 @@ class TestHistoryApi(SubwayTestCase):
         self.assertEqual(res2["total"], 15)
         self.assertEqual(len(res2["entries"]), 5)
 
+
+
+class TestPrecompactSegment(unittest.TestCase):
+    def test_marker_names_the_segment_being_compacted(self):
+        import tempfile, json as _j
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        tp = os.path.join(d, "abc.jsonl")
+        with open(tp, "w") as f:
+            f.write(_j.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+            f.write(_j.dumps({"type": "system", "subtype": "compact_boundary"}) + "\n")
+        sent = []
+        with mock.patch.object(server, "t_broadcast_track", side_effect=lambda **k: sent.append(k["message"])):
+            server.hook_precompact({"trigger": "manual", "transcript_path": tp, "session_id": "abc"})
+        self.assertIn("segment=2", sent[0])
+        os.remove(tp)
+        with mock.patch.object(server, "t_broadcast_track", side_effect=lambda **k: sent.append(k["message"])):
+            server.hook_precompact({"trigger": "auto", "transcript_path": tp, "session_id": "abc"})
+        self.assertIn("segment=1", sent[1])

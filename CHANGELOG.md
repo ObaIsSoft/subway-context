@@ -28,9 +28,11 @@
 - Auto-approve never asks.
 - OpenCode workers continue when they stop early.
 - Copilot usage gauges.
+- Kimi usage gauges (experimental, from an undocumented endpoint).
+- Compaction markers name the right segment.
 - Help page.
 - Recommended companion tools in the README.
-- Known gaps: Windows untested; no Kimi or OpenCode Go gauges; free OpenCode models unreliable for edits; a call already running can pass a token cap.
+- Known gaps: Windows untested; no OpenCode Go gauges; a call already running can pass a token cap.
 
 ## 1.2.0 - 2026-11-02
 

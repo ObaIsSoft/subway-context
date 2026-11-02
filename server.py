@@ -7256,6 +7256,97 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
         "error": None, "note": ""
     }
 
+_KIMI_TOKEN_DIR = ".kimi-code/credentials"
+
+def _kimi_token() -> Optional[str]:
+    """Access token from the freshest ~/.kimi-code/credentials file that hasn't expired."""
+    now = time.time()
+    candidates = []
+    for path in glob.glob(_home(".kimi-code", "credentials") + "/*.json"):
+        try:
+            with open(path) as f:
+                expires_at = json.load(f).get("expires_at")
+            if not isinstance(expires_at, (int, float)):
+                continue
+            if expires_at > 1e12:  # Milliseconds on some releases.
+                expires_at /= 1000.0
+            if expires_at <= now:
+                continue
+            candidates.append((os.path.getmtime(path), path))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    _, path = max(candidates)
+    try:
+        with open(path) as f:
+            return json.load(f).get("access_token")
+    except Exception:
+        return None
+
+class _KimiUsageError(Exception):
+    """Other failure, distinct from an expired sign-in."""
+
+@ttl_cached(120.0)
+def _kimi_raw() -> Dict[str, Any]:
+    """GET the undocumented Kimi usages endpoint. None when the sign-in is stale (no token or 401)."""
+    token = _kimi_token()
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.kimi.com/coding/v1/usages",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=6) as res:
+            body = res.read()
+            if res.status != 200:
+                raise _KimiUsageError(f"HTTP {res.status}")
+        return json.loads(body or "{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return None
+        raise _KimiUsageError(f"HTTP {e.code}")
+
+def _kimi_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
+    try:
+        raw = _kimi_raw()
+        if raw is None or not isinstance(raw, dict):
+            return {
+                "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
+                "pools": [], "tokens": None, "error": None,
+                "note": "Open Kimi Code to refresh your sign-in."
+            }
+        usages = raw.get("usages") or {}
+        pools = []
+        for key, name in (("limit_5h", "5-hour"), ("limit_7d", "Weekly"),
+                          ("limit_month_total", "Monthly total"), ("limit_month_code", "Monthly code")):
+            window = usages.get(key)
+            if not isinstance(window, dict) or window.get("used_ratio") is None:
+                continue
+            left_pct = round((1.0 - window["used_ratio"]) * 100.0, 2)
+            resets_at = window.get("reset_time")
+            if isinstance(resets_at, str) and resets_at:
+                try:
+                    resets_at = _dt.datetime.fromisoformat(resets_at).timestamp()
+                except ValueError:
+                    pass
+            pools.append({"key": key, "name": name, "windows": [{
+                "key": "rolling", "label": name, "used_pct": round(100.0 - left_pct, 2),
+                "left_pct": left_pct, "resets_at": resets_at, "disabled": False, "note": ""}]})
+        return {
+            "plan": "Kimi Code", "state": "live", "source": "Kimi usages endpoint (undocumented, api.kimi.com)",
+            "fetched_at": time.time(), "latency_ms": None,
+            "pools": pools, "tokens": None, "other_sessions": _other_sessions("kimi"),
+            "error": None,
+            "note": "" if pools else "Signed in. Kimi reported no plan limits for this account."
+        }
+    except Exception:
+        return {
+            "plan": "", "state": "detected", "source": "", "fetched_at": None, "latency_ms": None,
+            "pools": [], "tokens": None, "error": None,
+            "note": "Doesn't expose usage locally, and Subway can't dispatch workers to it yet."
+        }
+
 def _opencode_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     rec = _source("opencode", 5.0 if refresh else None)
     data = rec.get("data") or {}
@@ -7293,7 +7384,8 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
     names = {"claude": "Claude Code", "antigravity": "Antigravity", "opencode": "OpenCode", "local": "Local models",
              "kimi": "Kimi", "copilot": "GitHub Copilot"}
     views: Dict[str, Callable[[Dict[str, Any], bool], Dict[str, Any]]] = {
-        "claude": _claude_view, "antigravity": _agy_view, "opencode": _opencode_view, "local": _local_view}
+        "claude": _claude_view, "antigravity": _agy_view, "opencode": _opencode_view, "local": _local_view,
+        "kimi": _kimi_view}
     manual = _load_json("quotas.json").get("manual") or {}
 
     custom_providers = load_custom_providers()
@@ -9062,7 +9154,7 @@ def hook_precompact(event: Dict[str, Any]) -> None:
     if not sid and tpath:
         sid = os.path.splitext(os.path.basename(tpath))[0]
 
-    seg_num = 0
+    seg_num = 1  # segments count from 1; the one being compacted follows every earlier boundary
     if tpath and os.path.exists(tpath):
         try:
             with open(tpath, "r", encoding="utf-8", errors="replace") as f:

@@ -1331,6 +1331,84 @@ class TestCopilotBudgets(unittest.TestCase):
             self.assertIn("Doesn't expose usage locally", view["note"])
 
 
+class TestKimiBudgets(unittest.TestCase):
+    def setUp(self):
+        import server
+        server._kimi_raw.clear()  # Each test needs its own reply, not a cached one.
+
+    def _cred(self, expires_in):  # expires_in seconds from now; returns temp token-file path.
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"access_token": "sk-kimi-test", "refresh_token": "r", "expires_at": time.time() + expires_in,
+                       "scope": "", "token_type": "bearer", "expires_in": expires_in}, f)
+        return path
+
+    def _request(self, reply, status=200):
+        resp = mock.MagicMock()
+        resp.status = status
+        resp.read.return_value = json.dumps(reply).encode()
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = lambda s, a, b, c: False
+        return mock.MagicMock(return_value=resp)
+
+    def test_kimi_view_mocked_limits(self):
+        reply = {"usages": {
+            "limit_5h": {"used_ratio": 0.5, "reset_time": "2026-11-02T18:00:00+00:00"},
+            "limit_7d": {"used_ratio": 0.25, "reset_time": "2026-11-08T00:00:00+00:00"},
+            "limit_month_total": {"used_ratio": 0.9, "reset_time": "2026-12-01T00:00:00+00:00"},
+            "limit_month_code": {"used_ratio": 0.4, "reset_time": "2026-12-01T00:00:00+00:00"},
+        }, "boosterWallet": {"id": "w1"}}
+        path = self._cred(expires_in=3600)
+        with mock.patch.object(server.glob, "glob", return_value=[path]), \
+             mock.patch("urllib.request.urlopen", self._request(reply)):
+            view = server._kimi_view({}, refresh=True)
+        os.remove(path)
+        self.assertEqual(view["state"], "live")
+        self.assertEqual(view["plan"], "Kimi Code")
+        pool_map = {p["name"]: p for p in view["pools"]}
+        self.assertEqual(set(pool_map), {"5-hour", "Weekly", "Monthly total", "Monthly code"})
+        self.assertEqual(pool_map["5-hour"]["windows"][0]["left_pct"], 50.0)
+        self.assertEqual(pool_map["Weekly"]["windows"][0]["left_pct"], 75.0)
+        self.assertEqual(view["pools"][0]["key"], "limit_5h")
+        reset = server._dt.datetime.fromisoformat("2026-11-02T18:00:00+00:00").timestamp()
+        self.assertEqual(pool_map["5-hour"]["windows"][0]["resets_at"], reset)
+        self.assertNotIn("sk-kimi-test", json.dumps(view))  # Never leak the token.
+
+    def test_kimi_view_empty_reply_signed_in(self):
+        path = self._cred(expires_in=3600)
+        opener = self._request({})
+        with mock.patch.object(server.glob, "glob", return_value=[path]), \
+             mock.patch("urllib.request.urlopen", opener):
+            view = server._kimi_view({}, refresh=True)
+        os.remove(path)
+        self.assertEqual(view["state"], "live")
+        self.assertEqual(view["pools"], [])
+        self.assertEqual(view["note"], "Signed in. Kimi reported no plan limits for this account.")
+
+    def test_kimi_view_expired_token(self):
+        path = self._cred(expires_in=-3600)
+        opener = self._request({"usages": {}})
+        with mock.patch.object(server.glob, "glob", return_value=[path]), \
+             mock.patch("urllib.request.urlopen", opener):
+            view = server._kimi_view({}, refresh=True)
+        os.remove(path)
+        self.assertEqual(view["state"], "detected")
+        self.assertEqual(view["pools"], [])
+        self.assertEqual(view["note"], "Open Kimi Code to refresh your sign-in.")
+        opener.assert_not_called()  # Expired token: never hit the endpoint.
+
+    def test_kimi_view_other_failure_keeps_card(self):
+        path = self._cred(expires_in=3600)
+        with mock.patch.object(server.glob, "glob", return_value=[path]), \
+             mock.patch("urllib.request.urlopen", side_effect=server.urllib.error.URLError("dns down")), \
+             mock.patch.object(server.time, "sleep"):
+            view = server._kimi_view({}, refresh=True)
+        os.remove(path)
+        self.assertEqual(view["note"], "Doesn't expose usage locally, and Subway can't dispatch workers to it yet.")
+        self.assertEqual(view["pools"], [])
+
+
 class TestHostEditor(unittest.TestCase):
     """The HUD opens in the editor hosting this chat, never in a different installed editor."""
     ENV_VSCODE = {"__CFBundleIdentifier": "com.microsoft.VSCode", "VSCODE_IPC_HOOK": "", "VSCODE_IPC_HOOK_CLI": ""}
