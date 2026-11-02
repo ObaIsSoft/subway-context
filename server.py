@@ -2211,17 +2211,16 @@ def _writes_subway_state(command: str) -> bool:
 
 def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Claude Code PreToolUse hook: deny an edit to a file another agent holds a lease on, or stop if chat budget reached."""
-    cfg = _load_json("config.json")
-    limit = cfg.get("chat_budget_tokens")
+    sid = event.get("session_id")
+    limit, scope = chat_budget_for(sid)
     if limit:
-        limit = int(limit)
-        sid = event.get("session_id")
         used = chat_tokens_used(sid)
         if used is not None and used >= limit:
+            label = "This chat's budget" if scope == "chat" else "The universal chat budget"
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"Budget reached: {used:,} of {limit:,} tokens. Ask the user to raise it.",
+                "permissionDecisionReason": f"{label} is reached: {used:,} of {limit:,} tokens. Ask the user to raise it.",
             }}
 
     tool_name = event.get("tool_name") or ""
@@ -2245,12 +2244,16 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         sdir = os.path.abspath(os.path.expanduser(SUBWAY_DIR))
         sreal = os.path.realpath(sdir)
         creal = os.path.realpath(cpath)
-        if (cpath == sdir or cpath.startswith(sdir + os.sep)
+        wdir = os.path.join(sdir, "worktrees")
+        wreal = os.path.join(sreal, "worktrees")
+        in_worktrees = (cpath == wdir or cpath.startswith(wdir + os.sep)
+                        or creal == wreal or creal.startswith(wreal + os.sep))
+        if not in_worktrees and (cpath == sdir or cpath.startswith(sdir + os.sep)
                 or creal == sreal or creal.startswith(sreal + os.sep)):
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": "Budgets are the user's to change. Ask them to run it, or use the HUD.",
+                "permissionDecisionReason": "Subway's state files are the user's to change.",
             }}
 
     if not filepath:
@@ -3772,7 +3775,7 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
     thresh_tokens = compaction_threshold(prompt, window)
 
     cfg = _load_json("config.json")
-    chat_limit = cfg.get("chat_budget_tokens")
+    chat_limit, _scope = chat_budget_for(session_id, cfg)
     if chat_limit:
         used_tokens = chat_tokens_used(session_id) or 0
         rem_budget = int(chat_limit) - used_tokens
@@ -3809,16 +3812,77 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
     return msg
 
 
-def set_budget(scope: str, tokens: int) -> str:
+def _chat_budget_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, int], Optional[int]]:
+    """(per-chat budgets, universal default) from a loaded config, honoring the legacy global key."""
+    chat_budgets = cfg.get("chat_budgets") or {}
+    default = cfg.get("chat_budget_default")
+    if default is None:
+        default = cfg.get("chat_budget_tokens")
+    return chat_budgets, (int(default) if default else None)
+
+
+def chat_budget_for(session_id: Optional[str], cfg: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], Optional[str]]:
+    """This chat's own budget if set, else the universal default, else (None, None). Scope is 'chat' or 'universal'."""
+    cfg = cfg if cfg is not None else _load_json("config.json")
+    chat_budgets, default = _chat_budget_cfg(cfg)
+    if session_id and session_id in chat_budgets:
+        v = int(chat_budgets[session_id] or 0)
+        if v > 0:
+            return v, "chat"
+    if default:
+        return default, "universal"
+    return None, None
+
+
+def chat_budget_rows(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One row per chat with its own budget, for the HUD's per-chat budget list."""
+    cfg = cfg if cfg is not None else _load_json("config.json")
+    chat_budgets, _default = _chat_budget_cfg(cfg)
+    if not chat_budgets:
+        return {"chats": []}
+    titles = {}
+    with contextlib.suppress(Exception):
+        titles = {c["id"]: c.get("title") for c in all_chats("all") if c.get("id")}
+    rows = []
+    for session_id, limit in chat_budgets.items():
+        limit = int(limit or 0)
+        if limit <= 0:
+            continue
+        used = chat_tokens_used(session_id) or 0
+        pct = round((used / limit) * 100, 1) if limit > 0 else 0.0
+        status = "reached" if used >= limit else "warning" if used >= 0.8 * limit else "ok"
+        rows.append({
+            "session_id": session_id,
+            "label": titles.get(session_id) or _short_id(session_id),
+            "used": used,
+            "limit": limit,
+            "pct": pct,
+            "status": status,
+        })
+    rows.sort(key=lambda r: r["pct"], reverse=True)
+    return {"chats": rows}
+
+
+def set_budget(scope: str, tokens: int, session_id: Optional[str] = None) -> str:
     tokens = max(0, int(tokens))
     scope = (scope or "").lower().strip()
     with _state_lock("config"):
         data = _load_json("config.json")
+        legacy = data.pop("chat_budget_tokens", None)
+        if legacy and "chat_budget_default" not in data:
+            data["chat_budget_default"] = legacy
         if scope == "chat":
-            if tokens > 0:
-                data["chat_budget_tokens"] = tokens
+            if session_id:
+                chat_budgets = data.setdefault("chat_budgets", {})
+                if tokens > 0:
+                    chat_budgets[session_id] = tokens
+                else:
+                    chat_budgets.pop(session_id, None)
             else:
-                data.pop("chat_budget_tokens", None)
+                if tokens > 0:
+                    data["chat_budget_default"] = tokens
+                else:
+                    data.pop("chat_budget_default", None)
         else:
             budgets = data.setdefault("budgets", {})
             if tokens > 0:
@@ -3826,18 +3890,20 @@ def set_budget(scope: str, tokens: int) -> str:
             else:
                 budgets.pop(scope, None)
         _save_json("config.json", data)
-    return f"[BUDGET] Set {scope} budget to {tokens:,} tokens." if tokens > 0 else f"[BUDGET] Cleared {scope} budget."
+    label = scope if scope != "chat" else ("this chat's" if session_id else "the universal chat")
+    return f"[BUDGET] Set {label} budget to {tokens:,} tokens." if tokens > 0 else f"[BUDGET] Cleared {label} budget."
 
-def set_chat_budget(tokens: int) -> str:
-    return set_budget("chat", tokens)
+def set_chat_budget(tokens: int, session_id: Optional[str] = None) -> str:
+    return set_budget("chat", tokens, session_id=session_id)
 
 def budget_state() -> List[Dict[str, Any]]:
     cfg = _load_json("config.json")
     res = []
-    chat_limit = cfg.get("chat_budget_tokens")
+    sid = _self_id() if "_self_id" in globals() else None
+    chat_limit, _scope = chat_budget_for(sid, cfg)
     if chat_limit:
         limit = int(chat_limit)
-        used = chat_tokens_used() or 0
+        used = chat_tokens_used(sid) or 0
         pct = round((used / limit) * 100, 1) if limit > 0 else 0.0
         status = "reached" if (limit > 0 and used >= limit) else "warning" if (limit > 0 and used >= 0.8 * limit) else "ok"
         res.append({
@@ -3939,7 +4005,7 @@ def budget_rows() -> List[Dict[str, Any]]:
     return rows + extra
 
 
-def budget_ping_notice(scope: str, used: int, limit: int) -> str:
+def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] = None) -> str:
     if not limit or limit <= 0:
         return ""
     pct = (used / limit) * 100
@@ -3954,7 +4020,8 @@ def budget_ping_notice(scope: str, used: int, limit: int) -> str:
             return ""
         sent[key] = now
         _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
-    return (f"[BUDGET] Warning: {scope} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
+    label = label or scope
+    return (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
             f"Add more with: subway-context budget {scope} <tokens>, or in the HUD.")
 
 def enforce_budgets() -> None:
@@ -8158,7 +8225,8 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
         "exhausted_models": get_exhausted_models(),
         "settings": {"permission_mode": get_permission_mode(), "permission_modes": PERMISSION_MODES,
                      "capacity": capacity(), "models": model_catalog(), "benchmarks": benchmarks_meta,
-                     "chat_budget": cfg_data.get("chat_budget_tokens", 0),
+                     "chat_budget": cfg_data.get("chat_budget_default") or cfg_data.get("chat_budget_tokens", 0),
+                     "chat_budgets": chat_budget_rows(),
                      "compaction": get_compaction(),
                      "compact_at_tokens": compact_at_tokens(),
                      "hud_autostart": bool(cfg_data.get("hud_autostart", True)),
@@ -8677,7 +8745,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/stop_worker":
             res = t_stop_worker(worker_id=str(payload.get("id", "")), reason=str(payload.get("reason", "")))
         elif path == "/api/chat_budget":
-            res = set_chat_budget(int(payload.get("tokens") or 0))
+            res = set_chat_budget(int(payload.get("tokens") or 0), session_id=str(payload.get("session_id") or "") or None)
         elif path == "/api/budget":
             res = set_budget(str(payload.get("scope", "")), int(payload.get("tokens") or 0))
         elif path == "/api/settings":
@@ -9302,13 +9370,14 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             enforce_budgets()
             cfg = _load_json("config.json")
-            limit = cfg.get("chat_budget_tokens")
+            sid = _self_id()
+            limit, c_scope = chat_budget_for(sid, cfg)
             if limit:
-                limit = int(limit)
-                used = chat_tokens_used()
+                used = chat_tokens_used(sid)
                 if used is not None and used >= limit:
                     if name not in ("hud_status", "quota_status", "check_notes", "answer_permission"):
-                        block_msg = f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+                        c_label = "This chat's budget" if c_scope == "chat" else "The universal chat budget"
+                        block_msg = f"{c_label} is reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
                         return {"jsonrpc": "2.0", "id": rid, "result": {
                             "content": [{"type": "text", "text": block_msg}],
                             "isError": True
@@ -9322,9 +9391,9 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 text = f"{text}\n\n{permission_text(waiting)}"
             if name not in ("hud_status", "quota_status"):
                 if limit:
-                    used = chat_tokens_used()
+                    used = chat_tokens_used(sid)
                     if used is not None:
-                        c_ping = budget_ping_notice("chat", used, limit)
+                        c_ping = budget_ping_notice("chat", used, limit, label=("this chat's" if c_scope == "chat" else "the universal chat"))
                         if c_ping:
                             text = f"{text}\n\n{c_ping}"
                 budgets = cfg.get("budgets") or {}
@@ -9415,7 +9484,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 except ValueError:
                     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext":
                             f"[BUDGET] Not changed: '{raw_tok}' isn't a number of tokens. Tell the user to try, say, 3.5M."}}
-                set_budget(scope, num)
+                set_budget(scope, num, session_id=str(event.get("session_id") or "") or None if scope == "chat" else None)
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "UserPromptSubmit",
@@ -9425,17 +9494,17 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     sid = str(event.get("session_id") or "")
     cfg = _load_json("config.json")
-    limit = cfg.get("chat_budget_tokens")
+    limit, scope = chat_budget_for(sid, cfg)
     used = None
     if limit:
-        limit = int(limit)
         used = chat_tokens_used(sid)
         if used is not None and used >= limit:
+            label = "This chat's budget" if scope == "chat" else "The universal chat budget"
             notify_desktop_event(f"chat_budget_blocked|{sid}|{limit}", "Subway Context",
-                                 f"Budget reached: {used:,} of {limit:,} tokens.")
+                                 f"{label} is reached: {used:,} of {limit:,} tokens.")
             return {
                 "decision": "block",
-                "reason": f"Budget reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
+                "reason": f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: subway-context budget chat <tokens>, or in the HUD."
             }
 
     # After the block check: a blocked prompt can't deliver pings, so they must stay pending.
@@ -9446,7 +9515,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     notices = []
     if limit:
-        notice = budget_ping_notice("chat", used, limit)
+        notice = budget_ping_notice("chat", used, limit, label=("this chat's" if scope == "chat" else "the universal chat"))
         if notice:
             notices.append(notice)
 
@@ -9660,7 +9729,7 @@ def run_cli(argv: List[str]) -> int:
                 print(f"[{b['scope']}] {b['used']:,} / {b['limit']:,} tokens ({b['pct']}%) — {b['status']}")
             return 0
         if len(rest) == 1:
-            print("Usage: subway-context budget [scope tokens]")
+            print("Usage: subway-context budget [scope tokens] [--chat <id>]")
             return 2
         scope, tok_str = rest[0], rest[1]
         try:
@@ -9668,7 +9737,13 @@ def run_cli(argv: List[str]) -> int:
         except ValueError:
             print(f"Error: tokens must be an integer, got '{tok_str}'")
             return 1
-        msg = set_budget(scope, tokens)
+        chat_sid = None
+        extra = rest[2:]
+        if "--chat" in extra:
+            idx = extra.index("--chat")
+            if idx + 1 < len(extra):
+                chat_sid = extra[idx + 1]
+        msg = set_budget(scope, tokens, session_id=chat_sid)
         print(msg)
         return 0
     if arg in ("hud-autostart", "--hud-autostart"):

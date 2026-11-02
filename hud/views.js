@@ -877,14 +877,37 @@ export function workersPage(d) {
     },
   }, "Save");
 
+  const chatRows = (d.settings && d.settings.chat_budgets && d.settings.chat_budgets.chats) || [];
+  const chatRowEls = chatRows.map((c) => {
+    const tag = c.status === "warning" ? h("span", { class: "tag gold" }, "Almost gone")
+      : c.status === "reached" ? h("span", { class: "tag bad" }, "Reached, work stopped") : null;
+    const clearBtn = h("button", {
+      class: "btn",
+      type: "button",
+      on: {
+        click: async () => {
+          await act("/api/chat_budget", { tokens: 0, session_id: c.session_id });
+        },
+      },
+    }, "Clear");
+    return h("div", { class: "row budget-row" },
+      h("div", { class: "budget-main" },
+        h("div", { class: "budget-head" }, h("span", { class: "row-title" }, c.label || c.session_id), tag),
+        h("div", { class: "row-sub num" }, `${tokens(c.used)} of ${tokens(c.limit)} tokens`)),
+      clearBtn);
+  });
+
   const chatBudgetCard = h("section", { class: "card" },
     h("div", { class: "card-head" },
       h("div", {},
-        h("h2", { class: "card-title" }, "Chat budget"),
-        h("div", { class: "card-sub" }, "Maximum tokens allowed per chat session")),
-      h("div", { style: "display: flex; gap: 8px; align-items: center;" },
+        h("h2", { class: "card-title" }, "Universal chat budget"),
+        h("div", { class: "card-sub" }, "Default token limit for chats with no budget of their own")),
+      h("div", { style: "display: flex; gap: 8px; align-items: center; flex-wrap: wrap;" },
         budgetInput,
-        budgetSaveBtn)));
+        budgetSaveBtn)),
+    chatRowEls.length ? h("div", { class: "rows" },
+      h("div", { class: "card-sub" }, "Chats with their own budget:"),
+      chatRowEls) : null);
 
   const budgets = d.settings && d.settings.budgets;
   const hasChatScope = Array.isArray(budgets) && budgets.some((b) => b.scope === "chat");
