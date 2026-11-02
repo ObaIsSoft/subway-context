@@ -176,8 +176,8 @@ Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier na
 | :--- | :--- | :--- | :--- |
 | **1. Explicit Pins** | `@<alias>` | `@claude-main`, `@agy-live`, `@opencode-terminal` | **Immutable & sticky** via `tag_chat`. Never drifts when switching tabs or opening side tasks. |
 | **2. Floating Latest** | `@<agent>-latest`, `@latest` | `@agy-latest`, `@claude-latest`, `@latest` | Dynamically resolves to the most recently touched session globally or per-platform. |
-| **3. Workspace Heads** | `@<agent>-<project>` | `@agy-my-project`, `@claude-portfolio` | Dynamically resolves to the **latest active chat in that workspace folder**. |
-| **4. Topic Slugs** | `@<agent>-<topic>` | `@agy-subway`, `@agy-gitignore`, `@agy-previous-chats` | Automatically extracted from conversation titles. Reference chats by **topic** rather than ID. |
+| **3. Workspace Heads** | `@<agent>-<project>` | `@agy-my-project`, `@claude-portfolio`, `@copilot-subway-context` | Dynamically resolves to the **latest active chat in that workspace folder**. |
+| **4. Topic Slugs** | `@<agent>-<topic>` | `@agy-subway`, `@agy-gitignore`, `@copilot-parser` | Automatically extracted from conversation titles. Reference chats by **topic** rather than ID. |
 
 ---
 
@@ -186,13 +186,14 @@ Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier na
 Subway Context exposes 29 MCP tools divided across functional roles:
 
 ### 1. Navigation & Transit
-- **`list_chats(source, project, query, limit, include_subagents)`**: List active stations across agents, highlighting open tabs and sticky `@aliases`.
+- **`list_chats(source, project, query, limit, include_subagents)`**: List active stations across Antigravity, Claude Code, OpenCode, and GitHub Copilot (CLI and VS Code), highlighting open tabs, worker sessions, token usage, and sticky `@aliases`.
 - **`search_chat(quote, query, source, project, limit, include_subagents)`**: Search all transcripts for an exact phrase or snippet; returns station ID and stop index.
 - **`tag_chat(alias, chat_id)`**: Assign a sticky station alias (`tag_chat(alias='claude-main')`). Omit `chat_id` to tag current chat.
 - **`read_chat(chat_id, mode, turns, start, since, anchor_text, max_chars, include_tools, include_thoughts, source, project)`**: Board and read another agent's transcript.
   - `since="last"`: Reads only new turns since previous transit.
   - `mode="decisions"`: Cuts 85-90% token noise by extracting user intent, thought rationale, decisions, and files touched.
   - `anchor_text="phrase"`: Boards at the exact quote.
+  - `segment="latest"` or a segment number: Read history split at provider-reported compaction boundaries. Copilot transcripts without such a marker stay in one segment.
 - **`send_note(to, text, from_chat, share_chat)`**: Send transit dispatch to another agent window's inbox.
 - **`check_notes(my_chat_id, keep)`**: Read and clear incoming dispatches for this window.
 - **`whoami()`**: Reports current station ID, provider, and active tab identity.
