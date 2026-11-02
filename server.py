@@ -2509,16 +2509,100 @@ def _is_read_only_prompt(prompt: str) -> bool:
     return "read-only" in text or "do not edit any file" in text
 
 
-def _settle_isolated_result(result: Dict[str, Any], prompt: str, wt_note: str, reply: str) -> None:
-    """A read-only run that changes nothing is done, not a failure. Editing runs still need a diff."""
-    if result.get("status") != "completed" or wt_note != "No files changed.":
-        return
+def _worker_expected_to_edit(meta: Dict[str, Any]) -> bool:
+    role = str(meta.get("role") or "").lower()
+    if re.search(r"\b(?:review|reviewer|research|researcher|read[- ]?only)\b", role):
+        return False
+    prompt = str(meta.get("prompt") or "")
     if _is_read_only_prompt(prompt):
-        result["reason"] = (reply or "").strip()
+        return False
+    capabilities = meta.get("capabilities") or []
+    # files:write is the clearest edit signal; god mode also enables unrestricted tools.
+    if ("files:write" not in capabilities and "terminal:full" not in capabilities
+            and meta.get("mode") != "god" and meta.get("permission_mode") != "auto_approve"):
+        return False
+    return bool(re.search(
+        r"\b(?:add|change|create|implement|update|modify|edit|fix|refactor|remove|delete|rename|write|replace|introduce|extend|migrate|convert|build)\b",
+        prompt,
+        re.IGNORECASE,
+    ))
+
+
+def _git_change_fingerprint(project_dir: str) -> Optional[str]:
+    """Fingerprint tracked and untracked git changes relative to the worker's start state."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        cwd=project_dir, capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+
+    digest = hashlib.sha256(status.stdout)
+    for args in (["git", "diff", "--binary", "--"], ["git", "diff", "--cached", "--binary", "--"]):
+        diff = subprocess.run(args, cwd=project_dir, capture_output=True, check=True)
+        digest.update(diff.stdout)
+    for entry in status.stdout.split(b"\0"):
+        if not entry.startswith(b"?? "):
+            continue
+        path = os.path.join(project_dir, os.fsdecode(entry[3:]))
+        if os.path.islink(path):
+            digest.update(os.fsencode(os.readlink(path)))
+        elif os.path.isfile(path):
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_status_entries(status: bytes) -> List[Tuple[str, str]]:
+    entries = []
+    records = status.split(b"\0")
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            continue
+        code = os.fsdecode(record[:2])
+        entries.append((code, os.fsdecode(record[3:])))
+        if "R" in code or "C" in code:
+            if i < len(records) and records[i]:
+                entries.append((code, os.fsdecode(records[i])))
+                i += 1
+    return entries
+
+
+def _git_dirty_paths(project_dir: str) -> Optional[List[str]]:
+    root = subprocess.run(
+        ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if root.returncode:
+        if "not a git repository" in root.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(root.returncode, root.args, root.stdout, root.stderr)
+    status = subprocess.run(
+        ["git", "-C", root.stdout.strip(), "status", "--porcelain=1", "-z", "--untracked-files=all"],
+        capture_output=True,
+    )
+    if status.returncode:
+        if b"not a git repository" in status.stderr.lower():
+            return None
+        raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
+    return [path for _, path in _git_status_entries(status.stdout)][:500]
+
+
+def _settle_worker_result(result: Dict[str, Any], meta: Dict[str, Any], no_changes: bool, reply: str) -> None:
+    if result.get("status") != "completed" or not no_changes:
         return
-    if "Edit " in prompt or "edit" in prompt:
-        result["status"] = "failed"
-        result["reason"] = "Reported work, but no files changed."
+    summary = (reply or "").strip() or str(result.get("reason") or "").strip()
+    if not _worker_expected_to_edit(meta):
+        result["reason"] = summary
+        return
+    result["status"] = "failed"
+    result["reason"] = f"No changes made. {summary}".strip()
 
 
 def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
@@ -2530,7 +2614,7 @@ def _determine_outcome(meta: Dict[str, Any], result: Dict[str, Any]) -> str:
     reason = str(result.get("reason") or meta.get("report") or "")
     if status == "budget_stopped" or "budget" in reason.lower():
         return "budget_stopped"
-    if "no files changed" in reason.lower() or reason == "Reported work, but no files changed.":
+    if "no files changed" in reason.lower() or "no changes made" in reason.lower():
         return "no_change"
     if status == "completed" or "patch applied" in reason.lower():
         return "landed"
@@ -2621,6 +2705,13 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
             _save_worker(current)
             should_record = True
     if should_record and result is not None:
+        status = str(current.get("status") or result.get("status") or "failed")
+        if status in ("failed", "stopped", "timed_out", "budget_stopped") or current.get("priority") == "urgent":
+            message = f"Worker {wid} ({current.get('role') or 'worker'}) ended: {status}."
+            reason = result.get("reason") or current.get("report")
+            if reason:
+                message += f" {reason}"
+            notify_desktop_event(f"worker_ended|{wid}|{status}", "Subway Context", message[:500], route="workers")
         _record_worker_stat(current, result)
     return current
 
@@ -4113,7 +4204,7 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
     pct = (usage / window) * 100.0
     level = 90 if pct >= 90 else (80 if pct >= 80 else (75 if (pct >= 75 and thresh_pct <= 75) else 60))
     level = f"{level}|{usage // 100000}"  # Warn again for every 100K more, not only at window shares.
-    sid = session_id or _self_id()
+    sid = session_id or _self_id() or "unknown-chat"
     key = f"compaction_warning|{sid}|{level}"
     now = time.time()
     with _state_lock("pings"):
@@ -4331,14 +4422,26 @@ def budget_rows() -> List[Dict[str, Any]]:
 
 
 def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] = None,
-                        chat_id: Optional[str] = None) -> str:
+                        chat_id: Optional[str] = None, subject_id: Optional[str] = None,
+                        window: Optional[str] = None, reset_at: Any = None,
+                        desktop: bool = False) -> str:
     if not limit or limit <= 0:
         return ""
     pct = (used / limit) * 100
     if pct < 80 or pct >= 100:
         return ""
     level = 90 if pct >= 90 else 80
-    key = f"budget_warning|{scope}|{limit}|{level}"
+    if scope == "chat":
+        subject = subject_id or chat_id or _self_id() or "unknown-chat"
+        key = f"budget_warning|chat|{subject}|{limit}|{level}"
+    else:
+        key = f"budget_warning|provider|{scope}|{window or '5h'}|{reset_at or 'unknown'}|{limit}|{level}"
+    label = label or scope
+    cmd = f"subway-context budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
+    message = (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
+               f"Add more with: {cmd}, or in the HUD.")
+    if desktop:
+        return message if notify_desktop_event(key, "Subway Context budget warning", message, route="overview") else ""
     now = time.time()
     with _state_lock("pings"):
         sent = _load_json("limit_pings.json")
@@ -4346,10 +4449,25 @@ def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] =
             return ""
         sent[key] = now
         _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
-    label = label or scope
-    cmd = f"subway-context budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
-    return (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
-            f"Add more with: {cmd}, or in the HUD.")
+    return message
+
+
+def _provider_budget_reset(provider_id: str) -> Optional[float]:
+    for provider in discover_connected_providers(refresh=False):
+        if provider.get("id") != provider_id:
+            continue
+        for pool in provider.get("pools") or []:
+            for window in pool.get("windows") or []:
+                key = str(window.get("key") or "").lower()
+                label = str(window.get("label") or "").lower()
+                if key in ("5h", "five_hour") or "5-hour" in label:
+                    reset = window.get("resets_at")
+                    try:
+                        return float(reset) if reset is not None else None
+                    except (TypeError, ValueError):
+                        return None
+    return None
+
 
 def enforce_budgets() -> None:
     try:
@@ -4535,6 +4653,88 @@ def _reviewer_task_text(prompt: str, limit: int = 6000) -> str:
         if len(parts) == 2 and parts[1].strip():
             text = parts[1].strip()
     return text[:limit].rstrip()
+
+
+_REVIEW_DIFF_LIMIT = 60000
+
+
+def _capture_in_place_review_diff(meta: Dict[str, Any]) -> None:
+    """Save an in-place worker's git changes as reviewer context, not as an applicable patch."""
+    project_dir = str(meta.get("project_dir") or "")
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diff_text = f"No diff is available: could not inspect the project git repository: {one_line(str(exc), 200)}"
+    else:
+        if root_result.returncode:
+            diff_text = "No diff is available: the project folder is not a git repository."
+        else:
+            root = root_result.stdout.strip()
+            try:
+                status_result = subprocess.run(
+                    ["git", "-C", root, "status", "--porcelain=1", "-z", "--untracked-files=all"],
+                    capture_output=True, timeout=60,
+                )
+                if status_result.returncode:
+                    diff_text = ("No diff is available: could not capture git changes. "
+                                 + one_line(status_result.stderr, 200))
+                else:
+                    status_entries = _git_status_entries(status_result.stdout)
+                    dirty_before = set(meta.get("git_dirty_before") or [])
+                    changed = [(code, path) for code, path in status_entries if path not in dirty_before]
+                    preexisting = [(code, path) for code, path in status_entries if path in dirty_before]
+                    pieces = []
+                    for index, (title, entries) in enumerate((
+                            ("Changed by this worker", changed),
+                            ("Already modified before this worker started (may include this worker's edits)", preexisting))):
+                        if index:
+                            pieces.append("")
+                        pieces.append(title)
+                        if index:
+                            pieces.append("The second group may contain other people's work.")
+                        paths = list(dict.fromkeys(path for _, path in entries))
+                        if not paths:
+                            pieces.append("(none)")
+                            continue
+                        pieces.extend(f"{code} {path}" for code, path in entries)
+                        tracked_paths = [path for code, path in entries if not code.startswith("??")]
+                        pathspecs = [f":(literal){path}" for path in dict.fromkeys(tracked_paths)]
+                        if pathspecs:
+                            for label, args in (
+                                ("Git diff", ["git", "-C", root, "diff", "--no-ext-diff", "--"] + pathspecs),
+                                ("Git staged diff", ["git", "-C", root, "diff", "--cached", "--no-ext-diff", "--"] + pathspecs),
+                            ):
+                                result = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=60)
+                                if result.returncode:
+                                    raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+                                if result.stdout.strip():
+                                    pieces.append(f"{label}:\n{result.stdout.rstrip()}")
+                        for code, rel_path in entries:
+                            if not code.startswith("??"):
+                                continue
+                            file_path = os.path.realpath(os.path.join(root, rel_path))
+                            if os.path.commonpath((root, file_path)) != root or not os.path.isfile(file_path):
+                                continue
+                            with open(file_path, "rb") as f:
+                                content = f.read(_REVIEW_DIFF_LIMIT + 1).decode("utf-8", "replace")
+                            pieces.append(f"Untracked file {rel_path}:\n{content}")
+                    diff_text = "\n\n".join(piece for piece in pieces if piece.strip())
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                diff_text = f"No diff is available: could not capture git changes: {one_line(str(exc), 200)}"
+
+    trimmed_note = "\n\n[Review diff trimmed to 60000 characters.]"
+    if len(diff_text) > _REVIEW_DIFF_LIMIT:
+        diff_text = diff_text[:_REVIEW_DIFF_LIMIT - len(trimmed_note)] + trimmed_note
+    review_diff_path = os.path.join(WORKERS_DIR, f"{meta['id']}.review_diff")
+    try:
+        with open(review_diff_path, "w", encoding="utf-8") as f:
+            f.write(diff_text)
+        meta["review_diff_path"] = review_diff_path
+    except OSError as exc:
+        meta["review_diff_note"] = f"No diff is available: could not save reviewer diff: {one_line(str(exc), 200)}"
 
 
 def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
@@ -5272,6 +5472,17 @@ def _launch_worker(worker_id: str) -> str:
                     _save_worker(meta)
                     return f"Error: couldn't create a worktree: {exc}"
                 meta["isolate"] = False  # Not a git folder, so there's nothing to copy: it works in place.
+        if not meta.get("isolate") and _worker_expected_to_edit(meta):
+            try:
+                git_state = _git_change_fingerprint(meta.get("project_dir") or HOME)
+                git_dirty_before = _git_dirty_paths(meta.get("project_dir") or HOME)
+            except (OSError, subprocess.SubprocessError) as exc:
+                meta["status"] = "pending_approval"
+                _save_worker(meta)
+                return f"Error: couldn't record starting git state: {exc}"
+            if git_state is not None:
+                meta["git_state_before"] = git_state
+                meta["git_dirty_before"] = git_dirty_before or []
         _save_worker(meta)
 
     try:
@@ -5281,6 +5492,8 @@ def _launch_worker(worker_id: str) -> str:
     except OSError as exc:
         meta.update({"status": "failed", "report": f"Could not start supervisor: {exc}"})
         _save_worker(meta)
+        notify_desktop_event(f"worker_ended|{worker_id}|failed", "Subway Context",
+                             f"Worker {worker_id} failed to start: {exc}", route="workers")
         return f"Error spawning approved worker process: {exc}"
     threading.Thread(target=proc.wait, daemon=True).start()  # Reap the child, so no zombie lingers.
 
@@ -5336,97 +5549,164 @@ def _escape_xml(s: str) -> str:
     )
 
 
-def _send_desktop_notification(title: str, message: str) -> None:
-    """Send a desktop notification: macOS via terminal-notifier/osascript, Linux via notify-send, Windows via native toast."""
-    if os.environ.get("SUBWAY_NO_NOTIFY"):  # Tests and sandboxes must never reach the real desktop.
-        return
+_notification_log_lock = threading.Lock()
+
+
+def _log_notification_failure(mechanism: str, error: Any) -> None:
+    """Keep the notification failure log bounded without making alerts fatal."""
+    path = os.path.expanduser("~/.subway-context/notify.log")
+    entry = f"{_dt.datetime.now().astimezone().isoformat(timespec='seconds')} [{mechanism}] {error}\n"
     try:
-        if sys.platform == "darwin":
-            notifier = shutil.which("terminal-notifier")
-            if notifier:  # Unlike osascript, it can open the HUD when the alert is clicked.
-                subprocess.run([notifier, "-title", title, "-message", message, "-group", "subway-context",
-                                "-open", f"http://127.0.0.1:{_hud_port()}/#workers"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            else:
-                safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
-                safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-                script = f'display notification "{safe_msg}" with title "{safe_title}"'
-                subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        elif sys.platform.startswith("linux"):
-            if not shutil.which("notify-send"):
-                return
-            has_action = False
+        with _notification_log_lock:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             try:
-                proc = subprocess.run(["notify-send", "--help"], capture_output=True, text=True, timeout=2)
-                has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
-            except Exception:
-                has_action = False
-            if has_action:
-                url = f"http://127.0.0.1:{_hud_port()}/#workers"
-                def _linux_wait() -> None:
-                    try:
-                        res = subprocess.run(
-                            ["notify-send", "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
-                            capture_output=True, text=True
-                        )
-                        if res.stdout and res.stdout.strip() == "open":
-                            subprocess.run(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception:
-                        pass
-                threading.Thread(target=_linux_wait, daemon=True).start()
-            else:
-                subprocess.run(["notify-send", title, message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        elif sys.platform.startswith("win"):
-            url = f"http://127.0.0.1:{_hud_port()}/#workers"
-            xml_url = _escape_xml(url)
-            safe_title = _escape_xml(title).replace("'", "''")
-            safe_msg = _escape_xml(message).replace("'", "''")
-            xml = (
-                f'<toast activationType="protocol" launch="{xml_url}">'
-                f'<visual><binding template="ToastGeneric">'
-                f'<text>{safe_title}</text><text>{safe_msg}</text>'
-                f'</binding></visual></toast>'
-            )
-            app_id = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
-            cmd = (
-                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
-                "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
-                f"$xml = [Windows.Data.Xml.Dom.XmlDocument]::new(); $xml.LoadXml('{xml}'); "
-                f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
-                f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast)"
-            )
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.run(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
-                creationflags=creationflags,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-    except Exception:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines((lines + [entry])[-200:])
+    except (OSError, UnicodeError):
         pass
 
 
-def notify_if_still_waiting(key: str, message: str, still_waiting: Callable[[], bool], delay: float = 20.0) -> None:
+def _run_notification_command(mechanism: str, command: List[str], timeout: Optional[float] = None,
+                              **kwargs: Any) -> Optional[str]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, **kwargs)
+        return_code = getattr(result, "returncode", 0)
+        if isinstance(return_code, int) and return_code != 0:
+            error = (result.stderr or result.stdout or f"exited with status {return_code}").strip()
+            _log_notification_failure(mechanism, error)
+            return error
+    except Exception as exc:
+        error = str(exc)
+        _log_notification_failure(mechanism, error)
+        return error
+    return None
+
+
+def _find_executable(name: str, fallback_paths: Tuple[str, ...] = ()) -> Optional[str]:
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    for path in fallback_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _send_desktop_notification(title: str, message: str, route: str = "workers") -> Tuple[str, Optional[str]]:
+    """Send a desktop notification and report the mechanism and any non-fatal error."""
+    if os.environ.get("SUBWAY_NO_NOTIFY"):  # Tests and sandboxes must never reach the real desktop.
+        return "disabled", "SUBWAY_NO_NOTIFY is set"
+    route = route if route in ("overview", "usage", "workers") else "workers"
+    url = f"http://127.0.0.1:{_hud_port()}/#{route}"
+    if sys.platform == "darwin":
+        notifier = _find_executable(
+            "terminal-notifier",
+            ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"),
+        )
+        if notifier:
+            error = _run_notification_command(
+                "terminal-notifier",
+                [notifier, "-title", title, "-message", message, "-group", "subway-context", "-open", url],
+                timeout=3,
+            )
+            return "terminal-notifier", error
+        safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'display notification "{safe_msg}" with title "{safe_title}"'
+        error = _run_notification_command("osascript", ["osascript", "-e", script], timeout=2)
+        return "osascript", error
+    if sys.platform.startswith("linux"):
+        notifier = _find_executable("notify-send", ("/usr/bin/notify-send",))
+        if not notifier:
+            error = "notify-send was not found"
+            _log_notification_failure("notify-send", error)
+            return "notify-send", error
+        try:
+            proc = subprocess.run([notifier, "--help"], capture_output=True, text=True, timeout=2)
+            has_action = "--action" in ((proc.stdout or "") + (proc.stderr or ""))
+        except Exception as exc:
+            _log_notification_failure("notify-send capability check", exc)
+            has_action = False
+        if has_action:
+            def _linux_wait() -> None:
+                try:
+                    res = subprocess.run(
+                        [notifier, "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
+                        capture_output=True, text=True,
+                    )
+                    return_code = getattr(res, "returncode", 0)
+                    if isinstance(return_code, int) and return_code != 0:
+                        _log_notification_failure("notify-send", res.stderr or f"exited with status {return_code}")
+                    elif res.stdout and res.stdout.strip() == "open":
+                        _run_notification_command("xdg-open", ["xdg-open", url])
+                except Exception as exc:
+                    _log_notification_failure("notify-send", exc)
+
+            threading.Thread(target=_linux_wait, daemon=True).start()
+            return "notify-send", None
+        error = _run_notification_command("notify-send", [notifier, title, message], timeout=2)
+        return "notify-send", error
+    if sys.platform.startswith("win"):
+        xml_url = _escape_xml(url)
+        safe_title = _escape_xml(title).replace("'", "''")
+        safe_msg = _escape_xml(message).replace("'", "''")
+        xml = (
+            f'<toast activationType="protocol" launch="{xml_url}">'
+            f'<visual><binding template="ToastGeneric">'
+            f'<text>{safe_title}</text><text>{safe_msg}</text>'
+            f'</binding></visual></toast>'
+        )
+        app_id = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+        cmd = (
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+            "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
+            f"$xml = [Windows.Data.Xml.Dom.XmlDocument]::new(); $xml.LoadXml('{xml}'); "
+            f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+            f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast)"
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        error = _run_notification_command(
+            "Windows toast",
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
+            timeout=5,
+            creationflags=creationflags,
+        )
+        return "Windows toast", error
+    error = f"unsupported platform: {sys.platform}"
+    _log_notification_failure("desktop notification", error)
+    return "none", error
+
+
+def notify_if_still_waiting(key: str, message: str, still_waiting: Callable[[], bool], delay: float = 20.0,
+                            route: str = "workers") -> None:
     """Alert only for what's really waiting on the user: most requests are answered or launched within seconds."""
     def later() -> None:
         time.sleep(delay)
-        with contextlib.suppress(Exception):
+        try:
             if still_waiting():
-                notify_desktop_event(key, "Subway Context", message)
+                notify_desktop_event(key, "Subway Context", message, route=route)
+        except Exception as exc:
+            _log_notification_failure("waiting check", exc)
     threading.Thread(target=later, daemon=True).start()
 
 
-def notify_desktop_event(key: str, title: str, message: str) -> bool:
+def notify_desktop_event(key: str, title: str, message: str, route: str = "workers") -> bool:
     """Send one desktop notification per event, keyed in limit_pings.json so each event notifies once."""
     now = time.time()
-    with _state_lock("pings"):
-        sent = _load_json("limit_pings.json")
-        if key in sent:
-            return False
-        sent[key] = now
-        _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
-    _send_desktop_notification(title, message)
+    try:
+        with _state_lock("pings"):
+            sent = _load_json("limit_pings.json")
+            if key in sent:
+                return False
+            sent[key] = now
+            _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+    except Exception as exc:
+        _log_notification_failure("notification dedupe", exc)
+    _send_desktop_notification(title, message, route=route)
     return True
 
 
@@ -5451,8 +5731,8 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
                                         "text": f"Permission needed ({rid}): {tool}: {detail}"}) + "\n")
     t_broadcast_track(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {one_line(detail, 200)}",
                       track=meta.get("track", "main"), station_id=meta["id"])
-    notify_if_still_waiting(f"permission_request|{rid}", f"Permission needed ({meta['id']}): {tool}",
-                            lambda: rid in {r["id"] for r in _pending_permissions()})
+    notify_if_still_waiting(f"permission_request|{meta['id']}|{rid}", f"Permission needed ({meta['id']}): {tool}",
+                            lambda: rid in {r["id"] for r in _pending_permissions()}, route="workers")
     return rid
 
 
@@ -5990,11 +6270,14 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         want = step.get("include") or "patch"
         patch_text = ""
         if want in ("patch", "both"):
-            patch_file = meta.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
+            patch_file = (meta.get("patch_path") or meta.get("review_diff_path")
+                          or os.path.join(WORKERS_DIR, f"{worker_id}.patch"))
             with contextlib.suppress(OSError):
                 with open(patch_file, "r", encoding="utf-8", errors="replace") as f:
-                    patch_text = f.read(40000)
+                    patch_text = f.read(_REVIEW_DIFF_LIMIT)
         report_text = str(result.get("reason") or meta.get("report") or "").strip()
+        if not patch_text and meta.get("review_diff_note"):
+            patch_text = str(meta["review_diff_note"])
         if want in ("patch", "both") and not patch_text:
             patch_text = report_text[:40000]
         pieces = []
@@ -6796,14 +7079,24 @@ def supervise_worker(worker_id: str) -> int:
                 _save_worker(fresh)
         except (OSError, subprocess.SubprocessError) as exc:
             result["reason"] = f"Worktree kept at {fresh['worktree']}: {exc}"
-    if result.get("status") == "completed" and fresh.get("isolate"):
-        prompt = fresh.get("prompt") or ""
-        _settle_isolated_result(result, prompt, wt_note, str(run.get("response") or ""))
+    no_changes = bool(fresh.get("isolate") and wt_note == "No files changed.")
+    if result.get("status") == "completed" and fresh.get("git_state_before"):
+        try:
+            no_changes = _git_change_fingerprint(fresh.get("project_dir") or HOME) == fresh["git_state_before"]
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["status"] = "failed"
+            result["reason"] = f"Could not verify worker changes: {exc}"
+    if result.get("status") == "completed" and (fresh.get("isolate") or fresh.get("git_state_before")):
+        _settle_worker_result(result, fresh, no_changes, str(run.get("response") or ""))
         if result.get("status") == "completed":
             patch_file = fresh.get("patch_path") or os.path.join(WORKERS_DIR, f"{worker_id}.patch")
-            if os.path.exists(patch_file):
+            if fresh.get("isolate") and os.path.exists(patch_file):
                 with contextlib.suppress(Exception):
                     verify_worker(worker_id)
+    if (result.get("status") == "completed" and not fresh.get("isolate")
+            and any(step.get("verdict") for step in fresh.get("then") or [])):
+        _capture_in_place_review_diff(fresh)
+        _save_worker(fresh)
     with contextlib.suppress(Exception):
         result["response"] = str(run.get("response") or "")
     _write_json_atomic(_exit_file(worker_id), result)
@@ -8954,24 +9247,24 @@ def low_limit_notice() -> str:
         return ""
     _limit_checked = now
     threshold = _load_json("config.json").get("shed_at_pct", 20)
+    notices = []
+    for p in discover_connected_providers(refresh=False):
+        for pool in p.get("pools") or []:
+            for w in pool["windows"]:
+                if w.get("disabled") or w.get("left_pct") is None or w["left_pct"] > threshold:
+                    continue
+                if w.get("resets_at") and w["resets_at"] <= now:
+                    continue
+                level = 10 if w["left_pct"] <= 10 else threshold  # A second ping at 10%.
+                reset = int(w.get("resets_at") or 0)
+                key = f"{p['id']}|{pool['name']}|{w['label']}|{reset}|{level}"
+                text = (f"{p['name']} ({pool['name']}): {w['left_pct']}% of its {w['label']} limit left, "
+                        f"resets in {_fmt_reset(w.get('resets_at'))}")
+                notices.append((key, text))
     notes = []
-    with _state_lock("pings"):
-        sent = _load_json("limit_pings.json")
-        for p in discover_connected_providers(refresh=False):
-            for pool in p.get("pools") or []:
-                for w in pool["windows"]:
-                    if w.get("disabled") or w.get("left_pct") is None or w["left_pct"] > threshold:
-                        continue
-                    if w.get("resets_at") and w["resets_at"] <= now:
-                        continue
-                    level = 10 if w["left_pct"] <= 10 else threshold  # A second ping at 10%.
-                    key = f"{p['id']}|{pool['name']}|{w['label']}|{int(w.get('resets_at') or 0)}|{level}"
-                    if key not in sent:
-                        sent[key] = now
-                        notes.append(f"{p['name']} ({pool['name']}): {w['left_pct']}% of its {w['label']} limit left, "
-                                     f"resets in {_fmt_reset(w.get('resets_at'))}")
-        if notes:
-            _save_json("limit_pings.json", {k: v for k, v in sent.items() if now - v < 8 * 86400})
+    for key, text in notices:
+        if notify_desktop_event(key, "Subway Context limit warning", text, route="usage"):
+            notes.append(text)
     return "[LOW LIMIT] " + "; ".join(notes) + ". Plan around it, and shed load if it's yours." if notes else ""
 
 def _fmt_reset(resets_at: Any) -> str:
@@ -9601,7 +9894,7 @@ def _open_hud(port: int) -> None:
             if EDITOR_HINT.get("text"):
                 log(EDITOR_HINT["text"])
                 with contextlib.suppress(Exception):
-                    notify_desktop_event("editor_extension_missing", "Subway Context", EDITOR_HINT["text"][:180])
+                    notify_desktop_event("editor_extension_missing|editor", "Subway Context", EDITOR_HINT["text"][:180])
 
 
 def t_start_hud(port: int = 0) -> str:
@@ -10552,6 +10845,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         c_label = "This chat's budget" if c_scope == "chat" else "The universal chat budget"
                         c_cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if c_scope == "chat" else "")
                         block_msg = f"{c_label} is reached: {used:,} of {limit:,} tokens. Add more with: {c_cmd}, or in the HUD."
+                        notify_desktop_event(f"chat_budget_blocked|{sid or 'unknown-chat'}|{limit}", "Subway Context",
+                                             block_msg, route="overview")
                         return {"jsonrpc": "2.0", "id": rid, "result": {
                             "content": [{"type": "text", "text": block_msg}],
                             "isError": True
@@ -10568,7 +10863,7 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     used = chat_tokens_used(sid)
                     if used is not None:
                         c_ping = budget_ping_notice("chat", used, limit, label=("this chat's" if c_scope == "chat" else "the universal chat"),
-                                                     chat_id=sid if c_scope == "chat" else None)
+                                                     chat_id=sid if c_scope == "chat" else None, subject_id=sid, desktop=True)
                         if c_ping:
                             text = f"{text}\n\n{c_ping}"
                 budgets = cfg.get("budgets") or {}
@@ -10576,7 +10871,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     p_lim = int(p_lim or 0)
                     if p_lim > 0:
                         p_used = _provider_5h_tokens(p_prov)
-                        p_ping = budget_ping_notice(p_prov, p_used, p_lim)
+                        p_reset = _provider_budget_reset(p_prov)
+                        p_ping = budget_ping_notice(p_prov, p_used, p_lim, window="5h", reset_at=p_reset, desktop=True)
                         if p_ping:
                             text = f"{text}\n\n{p_ping}"
                 lln = low_limit_notice()
@@ -10607,6 +10903,7 @@ USAGE = """Subway Context v{version}
   subway-context allow|always|deny <request_id>
   subway-context tail <worker_id>    Show a worker's status and log
   subway-context locks | track [name] | quota [source]
+  subway-context notify test           Send a test desktop notification
   subway-context install | status | uninstall
   subway-context <tool> '<json args>' Call any MCP tool directly"""
 
@@ -10676,8 +10973,9 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if used is not None and used >= limit:
             label = "This chat's budget" if scope == "chat" else "The universal chat budget"
             cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" else "")
-            notify_desktop_event(f"chat_budget_blocked|{sid}|{limit}", "Subway Context",
-                                 f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD.")
+            notify_desktop_event(f"chat_budget_blocked|{sid or _self_id() or 'unknown-chat'}|{limit}", "Subway Context",
+                                 f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD.",
+                                 route="overview")
             return {
                 "decision": "block",
                 "reason": f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD."
@@ -10692,7 +10990,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     notices = []
     if limit:
         notice = budget_ping_notice("chat", used, limit, label=("this chat's" if scope == "chat" else "the universal chat"),
-                                     chat_id=sid if scope == "chat" else None)
+                                     chat_id=sid if scope == "chat" else None, subject_id=sid, desktop=True)
         if notice:
             notices.append(notice)
 
@@ -10922,6 +11220,28 @@ def run_cli(argv: List[str]) -> int:
                 chat_sid = extra[idx + 1]
         msg = set_budget(scope, tokens, session_id=chat_sid)
         print(msg)
+        return 0
+    if arg == "notify":
+        if not rest or rest[0] != "test":
+            print("Usage: subway-context notify test")
+            return 2
+        mechanism, error = _send_desktop_notification(
+            "Subway Context test", "Desktop notifications are working.", route="workers")
+        if error:
+            print(f"Notification test failed using {mechanism}: {error}")
+            return 1
+        if mechanism == "terminal-notifier":
+            path = _find_executable(
+                "terminal-notifier",
+                ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"),
+            )
+        elif mechanism == "notify-send":
+            path = _find_executable("notify-send", ("/usr/bin/notify-send",))
+        elif mechanism == "osascript":
+            path = _find_executable("osascript")
+        else:
+            path = None
+        print(f"Test notification sent using {mechanism} ({path or mechanism}).")
         return 0
     if arg in ("hud-autostart", "--hud-autostart"):
         if not rest or rest[0].lower() not in ("on", "off"):
