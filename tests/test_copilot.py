@@ -94,6 +94,24 @@ class TestCopilotIntegration(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def _build_session_state(self):
+        """A ~/.copilot/session-state look-alike holding the fixture's usage checkpoints, timestamped now."""
+        sess_dir = os.path.join(self.temp_dir, "session-now")
+        os.makedirs(sess_dir, exist_ok=True)
+        dest_events = os.path.join(sess_dir, "events.jsonl")
+        now = time.time()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+        with open(self.fixture_path, "r", encoding="utf-8") as f_in, open(dest_events, "w", encoding="utf-8") as f_out:
+            for line in f_in:
+                if "session.usage_checkpoint" in line:
+                    ev = json.loads(line)
+                    ev["timestamp"] = now_iso
+                    f_out.write(json.dumps(ev) + "\n")
+                else:
+                    f_out.write(line)
+        os.utime(dest_events, (now, now))
+        return self.temp_dir
+
     def test_copilot_cli_usage_missing_folder(self):
         missing_dir = os.path.join(self.temp_dir, "nonexistent")
         res = server._copilot_cli_usage(missing_dir)
@@ -149,7 +167,12 @@ class TestCopilotIntegration(unittest.TestCase):
         ok, msg = server.check_budget_preflight(model="auto", provider="copilot")
         self.assertTrue(ok)
 
-        with patch.object(server, "find_copilot_binary", return_value="/mock/copilot"):
+        with patch.object(server, "find_copilot_binary", return_value="/mock/copilot"), \
+             patch.object(server, "_launch_worker") as launch, \
+             patch.object(server, "start_approved_workers"), \
+             patch.object(server, "notify_if_still_waiting"), \
+             patch.object(server, "t_broadcast_track"), \
+             patch.object(server.subprocess, "Popen", side_effect=OSError("no subprocess may start")) as popen:
             res = server.t_spin_worker(
                 role="Unit Tester",
                 prompt="echo hello",
@@ -157,6 +180,70 @@ class TestCopilotIntegration(unittest.TestCase):
                 model="auto",
             )
             self.assertIn("worker_", res)
+            launch.assert_not_called()  # No worker is launched: the record waits for the user's approval.
+            self.assertFalse([c for c in popen.call_args_list if "__supervise" in (c.args[0] if c.args else [])])
+
+    def test_result_event_records_credits(self):
+        line = json.dumps({"type": "result", "sessionId": "s1", "result": "done",
+                           "usage": {"premiumRequests": 2, "credits": 0.5}})
+        run = server.parse_copilot_jsonl(line)
+        self.assertEqual(run["usage"]["requests"], 2)
+        self.assertAlmostEqual(run["usage"]["credits"], 0.5)
+
+    def test_copilot_view_is_json_serialisable(self):
+        res = server._copilot_cli_usage(self._build_session_state())
+        self.assertIsNotNone(res)
+        client = {"id": "copilot", "installed": True, "dispatchable": True}
+        raw = {"copilot_plan": "individual", "quota_reset_date": "2026-12-01",
+               "quota_snapshots": {"chat": {"percent_remaining": 50.0, "remaining": 100,
+                                            "entitlement": 200, "unlimited": False}}}
+        with patch.object(server, "_copilot_cli_usage", return_value=res), \
+             patch.object(server, "_copilot_raw", return_value=raw), \
+             patch.object(server, "_copilot_models", return_value=["mai-code-1.1-flash"]), \
+             patch.object(server, "_other_sessions", return_value=[]):
+            view = server._copilot_view(client, refresh=True)
+        json.dumps(view)  # A self-referential usage dict used to raise "Circular reference detected".
+        self.assertEqual(view["credits"], res["credits"])
+
+    def test_chat_pool_unknown_keeps_copilot_dispatchable(self):
+        with patch.object(server, "_copilot_cli_usage", return_value=None), \
+             patch.object(server, "_copilot_models", return_value=["mai-code-1.1-flash"]), \
+             patch.object(server, "_other_sessions", return_value=[]):
+            client = {"id": "copilot", "installed": True, "dispatchable": True}
+            with patch.object(server, "_copilot_raw", return_value={"quota_snapshots": {}}):
+                server._copilot_view(client, refresh=True)
+            self.assertTrue(client["dispatchable"])
+
+            client = {"id": "copilot", "installed": True, "dispatchable": True}
+            empty = {"quota_snapshots": {"chat": {"remaining": 0, "entitlement": 200, "unlimited": False}}}
+            with patch.object(server, "_copilot_raw", return_value=empty):
+                server._copilot_view(client, refresh=True)
+            self.assertFalse(client["dispatchable"])
+
+    def test_review_step_prompt_carries_builder_task(self):
+        meta = {"id": "worker_abc123", "status": "completed", "provider": "claude", "role": "Builder",
+                "track": "main", "report": "changed two files",
+                "prompt": "Work only in this repo. No git.\n\nAdd a --dry-run flag to the exporter.",
+                "then": [server._review_trigger_step("auto")]}
+        captured = {}
+
+        def fake_spin(**kwargs):
+            captured.update(kwargs)
+            return "Worker worker_def456 queued."
+
+        with patch.object(server, "_load_worker", side_effect=lambda wid: dict(meta) if wid == meta["id"] else None), \
+             patch.object(server, "_save_worker"), \
+             patch.object(server, "route_task", return_value={"picks": [{"provider": "copilot", "model": "auto"}], "reason": ""}), \
+             patch.object(server, "t_spin_worker", side_effect=fake_spin), \
+             patch.object(server, "_launch_worker"), \
+             patch.object(server, "t_broadcast_track"):
+            server._run_triggers(meta["id"], {"status": "completed", "response": "done"})
+
+        child_prompt = captured.get("prompt", "")
+        self.assertIn("TASK:", child_prompt)
+        self.assertIn("Add a --dry-run flag to the exporter.", child_prompt)
+        self.assertNotIn("Work only in this repo", child_prompt)
+        self.assertLess(child_prompt.index("TASK:"), child_prompt.index("PREVIOUS WORKER"))
 
 
 if __name__ == "__main__":

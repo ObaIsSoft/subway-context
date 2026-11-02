@@ -4267,7 +4267,20 @@ _TRIGGER_STEP_FIELDS = {"role", "prompt", "provider", "model", "when", "include"
 _TRIGGER_WHEN = ("completed", "failed", "always", "approved", "rejected")
 _TRIGGER_INCLUDE = ("patch", "report", "both", "none")
 _REVIEW_PROMPT = ("Read-only review. Do not edit any file and use no tools. Reply with the first line APPROVE or REJECT: <reason>, "
-                  "then at most 4 lines. Approve only if the patch does the task, nothing else, and would not break existing behaviour.")
+                  "then at most 4 lines. Approve only if the patch does the TASK below, nothing else, and would not break "
+                  "existing behaviour. Anything the TASK asks for is not scope creep.")
+
+_TASK_RULES_OPENERS = ("Work only in this repo", "Private repo copy")
+
+
+def _reviewer_task_text(prompt: str, limit: int = 6000) -> str:
+    """The previous worker's own task, so a reviewer judges the patch against what was actually asked."""
+    text = str(prompt or "").strip()
+    if text.startswith(_TASK_RULES_OPENERS):
+        parts = text.split("\n\n", 1)
+        if len(parts) == 2 and parts[1].strip():
+            text = parts[1].strip()
+    return text[:limit].rstrip()
 
 
 def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
@@ -5509,10 +5522,14 @@ def _process_copilot_event(ev: Dict[str, Any], run: Dict[str, Any], write: Calla
             run["response"] = ev["result"]
             write(str(ev["result"]))
         usage = ev.get("usage") or {}
-        reqs = usage.get("premiumRequests")
-        if reqs is not None:
+        reqs = usage.get("premiumRequests")  # A request count, never credits.
+        creds = usage.get("credits")
+        if reqs is not None or creds is not None:
             u = run.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "credits": 0.0, "requests": 0})
-            u["requests"] = int(reqs)
+            if reqs is not None:
+                u["requests"] = int(reqs)
+            if creds is not None:
+                u["credits"] = float(creds)
     elif kind == "session.usage_checkpoint":
         data = ev.get("data") or {}
         snap = data.get("accountingSnapshot") or {}
@@ -5711,6 +5728,10 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
             pieces.append(report_text[:40000])
         included = "\n\n".join(piece for piece in pieces if piece)
         child_prompt = str(step.get("prompt") or "").rstrip()
+        if step.get("verdict"):  # Reviewers judge the patch against the task, whatever provider runs them.
+            task_text = _reviewer_task_text(meta.get("prompt") or "")
+            if task_text:
+                child_prompt += f"\n\nTASK:\n{task_text}"
         child_prompt += f"\n\nPREVIOUS WORKER {worker_id} ({meta.get('role') or 'worker'}, {status}):\n{included}"
         provider = str(step.get("provider") or "auto").lower()
         model = str(step.get("model") or "")
@@ -7923,7 +7944,6 @@ def _copilot_cli_usage(base_dir: Optional[str] = None) -> Optional[Dict[str, Any
     credits["7d"] = round(credits["7d"], 4)
     res["credits"] = credits
     res["per_model"] = per_model
-    res["tokens"] = res
     return res
 
 
@@ -7965,7 +7985,9 @@ def _copilot_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     unlimited = bool(chat.get("unlimited"))
     rem = chat.get("remaining")
     pct = chat.get("percent_remaining")
-    chat_ok = unlimited or (rem is not None and rem > 0) or (pct is not None and pct > 0)
+    chat_known = bool(chat) and (rem is not None or pct is not None)
+    # Only a chat pool known to be empty blocks dispatch; a missing or dataless snapshot is unknown, not exhausted.
+    chat_ok = unlimited or not chat_known or (rem is not None and rem > 0) or (pct is not None and pct > 0)
     client["dispatchable"] = bool(client.get("dispatchable")) and chat_ok
     name_map = {
         "chat": "Chat",
