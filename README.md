@@ -336,6 +336,7 @@ Subway Context tracks live rate limits, token usage, and session windows across 
 - **Worker Token Caps**: Workers are told to wrap up at two thirds, and no call is started that would pass the cap. A call already running can still overrun. Counts thinking and Claude cache creation. Set Claude caps above about 100K: one call can cost 35K. Custom providers report no tokens, so they use max_seconds.
 - **Context Compaction**: `subway-context compaction` shows the mode; `subway-context compaction <suggest|auto|never> [tokens]` sets it, e.g. `subway-context compaction auto 300k`. The compaction point defaults to 300,000 tokens and accepts 100K to 1M; the HUD's "Compact at (tokens)" field sets it too. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's `autoCompactWindow`, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only.
 - **Capacity**: 4 running workers per chat. Per machine: 2 up to 8 GB, 6 up to 16 GB, 10 above, or set `max_workers` in `config.json`. A worker over the limit stays queued.
+- **Worker safeguards**: `worker_rules: false` omits the standard rules from edit-worker prompts. Antigravity and OpenCode deny identifiable whole-file reads over 1,500 lines inside the worker folder; set `large_file_read_lines` to change the limit or `large_file_reads: "allow"` to disable the guard.
 
 ---
 

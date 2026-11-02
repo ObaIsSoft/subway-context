@@ -86,6 +86,16 @@ HUD_PORT = int(os.environ.get("SUBWAY_HUD_PORT", "7890"))
 
 DEFAULT_MAX_CHARS = 30000
 MAX_THOUGHT_CHARS = 1200
+_WORKER_READING_RULE = "Never read a file over 400 lines whole; grep for what you need, then read line ranges."
+_WORKER_STANDING_RULES = """SUBWAY STANDING RULES
+Never read a file over 400 lines whole; grep for what you need, then read line ranges. Change only what the task asks.
+Handle applicable edge cases: missing/corrupt inputs; claude, antigravity, opencode, copilot, local, custom; ask, auto_safe, auto_approve; isolated and in-place workers; silent providers.
+On retry, reroute, or copy, preserve max_tokens, max_seconds, budgets, privacy, permissions, and launcher. Use the worker's own identity for its records.
+For concurrency, use existing atomic-write helpers and state locks. Never log or print secrets.
+Guard macOS, Linux, and Windows paths with existence checks. Keep HUD fields correct when empty, loading, or stale, including phone width.
+Tests: use a temporary SUBWAY_DIR and patch/restore every touched *_DIR and home path; never touch real home state, network, or agent CLIs.
+Clear module caches and restore env/patches. Do not sleep for timing; use threading.Event or timed joins. Test real functions, not reimplemented logic.
+Run the full suite twice; tests must pass in any order."""
 
 
 def ttl_cached(seconds: float) -> Callable[..., Any]:
@@ -5126,6 +5136,15 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
                 return f"Error: code packet exceeds 60000 characters ({len(packet_text)} chars)."
             prompt = f"{prompt}\n\n=== CODE (all you need: do not search) ===\n\n{packet_text}"
 
+    if _load_json("config.json").get("worker_rules", True) is not False:
+        reviewer = (prompt.lstrip().lower().startswith(("read-only", "read only"))
+                    or re.search(r"\b(?:review|reviewer|research|researcher|read[- ]?only)\b", str(role or "").lower()))
+        if reviewer:
+            if _WORKER_READING_RULE not in prompt:
+                prompt = f"{prompt.rstrip()}\n\n{_WORKER_READING_RULE}"
+        elif _WORKER_STANDING_RULES not in prompt:
+            prompt = f"{prompt.rstrip()}\n\n{_WORKER_STANDING_RULES}"
+
     permission_mode = _MODE_ALIASES.get(permission_mode, permission_mode) or get_permission_mode()
     if permission_mode not in PERMISSION_MODES:
         return f"Error: unknown permission_mode '{permission_mode}'. Must be one of {', '.join(PERMISSION_MODES)}."
@@ -6000,13 +6019,93 @@ def notify_desktop_event(key: str, title: str, message: str, route: str = "worke
     return True
 
 
-def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Optional[List[str]] = None) -> str:
+def _large_file_read_denial(meta: Dict[str, Any], tool: str, detail: Any, kind: str = "",
+                            locations: Optional[List[str]] = None) -> Optional[str]:
+    """Block identifiable whole-file reads of large files inside a worker's workspace."""
+    if str(meta.get("provider") or "").lower() not in ("antigravity", "opencode", "local"):
+        return None
+    config = _load_json("config.json")
+    if str(config.get("large_file_reads") or "").lower() == "allow":
+        return None
+    tool_name = re.sub(r"[\s_-]+", "", str(tool or "").lower())
+    kind_name = str(kind or "").lower()
+    if tool_name not in ("read", "readfile", "readtextfile") and kind_name != "read":
+        return None
+
+    raw: Any = detail
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                raw = parsed
+        except ValueError:
+            pass
+
+    path: Optional[str] = None
+    ranged = False
+    if isinstance(raw, dict):
+        path_keys = {"path", "filepath", "targetfile", "filename", "file"}
+        range_keys = {"startline", "endline", "linerange", "lines", "range"}
+        for key, value in raw.items():
+            normalized = re.sub(r"[\s_-]+", "", str(key).lower())
+            if normalized in path_keys and isinstance(value, str) and value:
+                path = value
+                break
+        for key, value in raw.items():
+            normalized = re.sub(r"[\s_-]+", "", str(key).lower())
+            if normalized in range_keys and value is not None and value != "":
+                ranged = True
+            elif normalized in ("offset", "limit") and value is not None:
+                try:
+                    ranged = ranged or int(value) > 0
+                except (TypeError, ValueError):
+                    ranged = True
+    elif isinstance(raw, str):
+        path = raw.strip()
+
+    if ranged:
+        return None
+    if not path and locations:
+        path = next((p for p in locations if p), None)
+    if not path:
+        return None
+
+    workspace = str(meta.get("worktree") or meta.get("project_dir") or "")
+    if not workspace:
+        return None
+    root = os.path.realpath(os.path.expanduser(workspace))
+    resolved = os.path.realpath(os.path.expanduser(path if os.path.isabs(path) else os.path.join(root, path)))
+    try:
+        if os.path.commonpath((root, resolved)) != root or not os.path.isfile(resolved):
+            return None
+    except (OSError, ValueError):
+        return None
+
+    threshold = config.get("large_file_read_lines", 1500)
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
+        threshold = 1500
+    try:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            line_count = sum(1 for _ in f)
+    except OSError:
+        return None
+    if line_count <= threshold:
+        return None
+    return f"{path} has {line_count} lines. Grep for what you need, then read a line range."
+
+
+def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Optional[List[str]] = None,
+                       raw_input: Any = None) -> str:
     """Queue a question for the user, and tell the window that launched this worker."""
     rid = f"perm_{uuid.uuid4().hex[:8]}"
+    denial = _large_file_read_denial(meta, tool, raw_input or detail)
     rec = {"id": rid, "worker_id": meta["id"], "role": meta.get("role"), "provider": meta.get("provider"),
            "tool": tool, "detail": detail, "rules": rules or [], "status": "pending",
            "launched_by": meta.get("launched_by"), "created_at": time.time()}
     _write_json_atomic(_perm_file(rid), rec)
+    if denial:
+        _answer_permission(rid, "deny", "Subway large-file read guard", denial_reason=denial)
+        return rid
     if meta.get("permission_mode") == "auto_approve" or meta.get("skip_permissions"):
         # The user chose to auto-approve everything: keep the record, but never ask or alert them.
         _answer_permission(rid, "allow", "your auto-approve setting")
@@ -6043,7 +6142,7 @@ def await_permission(rid: str, wait: int = PERMISSION_WAIT, stop: Optional[Calla
     return "deny"
 
 
-def _answer_permission(rid: str, decision: str, answered_by: str) -> str:
+def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason: str = "") -> str:
     if decision not in ("allow", "allow_always", "deny"):
         return "Error: decision must be 'allow', 'allow_always', or 'deny'."
     with _state_lock("permissions"):
@@ -6055,6 +6154,8 @@ def _answer_permission(rid: str, decision: str, answered_by: str) -> str:
         if rec.get("status") != "pending":
             return f"Permission request `{rid}` was already answered ({rec.get('decision')})."
         rec.update({"status": "answered", "decision": decision, "answered_by": answered_by, "answered_at": time.time()})
+        if denial_reason:
+            rec["denial_reason"] = denial_reason
         _write_json_atomic(_perm_file(rid), rec)
     _broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {one_line(rec['detail'], 160)} "
                               f"(by {answered_by})", track="main", station_id="guard")
@@ -6332,7 +6433,7 @@ def _pump_agy(
             # File tools don't report an error step: this notice is the only sign they were denied.
             m = re.search(r'required the "(\w+)" permission', line)
             if m and run.get("last_tool"):
-                run["last_error"] = (m.group(1), run["last_tool"])
+                run["last_error"] = (m.group(1), run["last_tool"], run.get("last_tool_input"))
             continue
         error_text = _quota_error_event_text(ev)
         if error_text and quota_handler:
@@ -6358,10 +6459,11 @@ def _pump_agy(
             if st.get("step_type") == "tool":
                 if st.get("state") == "ACTIVE":
                     run["last_tool"] = str(detail)
+                    run["last_tool_input"] = params
                     write(f"[tool] {st.get('tool_name')}: {one_line(str(detail), 200)}")
                 elif st.get("state") == "ERROR":
                     write(f"[denied or failed] {st.get('tool_name')}: {one_line(str(detail), 200)}")
-                    run["last_error"] = (st.get("tool_name"), str(detail))
+                    run["last_error"] = (st.get("tool_name"), str(detail), params)
         elif kind == "result":
             res = ev.get("result") or {}
             run["conversation"] = res.get("conversation_id") or run.get("conversation")
@@ -7398,7 +7500,7 @@ def supervise_worker(worker_id: str) -> int:
                     break
                 denied = run.get("last_error")
                 if is_agy and code == 0 and denied and run.get("conversation") and denied[1] not in asked_denied:
-                    tool, detail = denied
+                    tool, detail, *denied_input = denied
                     asked_denied.add(detail)
                     project = os.path.realpath(meta.get("project_dir") or HOME)
                     if tool in ("run_command", "command"):
@@ -7406,7 +7508,8 @@ def supervise_worker(worker_id: str) -> int:
                     else:
                         scope = project if os.path.realpath(detail).startswith(project + os.sep) else os.path.dirname(detail)
                         once, rules = [f"{tool}({detail})"], [f"{tool}({scope})"]
-                    rid = request_permission(meta, tool, detail, rules)
+                    rid = request_permission(meta, tool, detail, rules,
+                                             raw_input=denied_input[0] if denied_input else None)
                     save_progress(waiting_permission=rid)
                     decision = await_permission(rid, min(PERMISSION_WAIT, int(remaining() or PERMISSION_WAIT)),
                                                 stop=lambda: stopped["flag"])
@@ -7418,8 +7521,17 @@ def supervise_worker(worker_id: str) -> int:
                         result = {"status": "budget_stopped" if is_b else "stopped", "exit_code": code, "reason": stop_r or "Stopped on request."}
                         break
                     if decision == "deny":
-                        cmd = _agy_resume(cmd, run["conversation"], f"The user denied this: {detail}. Don't retry it. "
-                                          f"Continue without it, and report what you couldn't do.", [])
+                        permission_record = {}
+                        with contextlib.suppress(OSError, ValueError):
+                            with open(_perm_file(rid), "r", encoding="utf-8") as f:
+                                loaded_record = json.load(f)
+                                permission_record = loaded_record if isinstance(loaded_record, dict) else {}
+                        denial_reason = permission_record.get("denial_reason")
+                        reason = (f"Subway denied this read: {denial_reason}. Don't retry it. Continue without it, "
+                                  "and report what you couldn't do." if denial_reason else
+                                  f"The user denied this: {detail}. Don't retry it. Continue without it, "
+                                  "and report what you couldn't do.")
+                        cmd = _agy_resume(cmd, run["conversation"], reason, [])
                     else:
                         # Allow covers this exact command. Only allow_always widens to the whole program.
                         grant = rules if decision == "allow_always" else once
@@ -8047,12 +8159,18 @@ def _pump_opencode(
                 places = [str(p.get("path") or "") for p in tool_call.get("locations") or [] if isinstance(p, dict)]
                 root = os.path.join(os.path.realpath(workdir), "")
                 inside = all(os.path.join(os.path.realpath(os.path.join(workdir, p)), "").startswith(root) for p in places if p)
-                if meta.get("permission_mode") == "auto_approve" or meta.get("skip_permissions"):
-                    decision = "allow"  # The user chose to auto-approve everything.
-                elif meta.get("permission_mode") == "auto_safe" and kind in ("read", "search", "edit") and inside and (places or kind != "edit"):
-                    decision = "allow"  # The same as Antigravity's accept-edits: its own folder, nothing else.
+                auto_approve = meta.get("permission_mode") == "auto_approve" or meta.get("skip_permissions")
+                auto_safe = (meta.get("permission_mode") == "auto_safe" and kind in ("read", "search", "edit")
+                             and inside and (places or kind != "edit"))
+                if auto_approve or auto_safe:
+                    denial = _large_file_read_denial(meta, str(title), raw, kind=str(kind or ""), locations=places)
+                    if denial:
+                        write(f"[read guard] {denial}")
+                        decision = "deny"
+                    else:
+                        decision = "allow"
                 else:
-                    rid = request_permission(meta, str(title), detail)
+                    rid = request_permission(meta, str(title), detail, raw_input=raw)
                     decision = await_permission(rid, stop=lambda: stopped["flag"])
 
                 if decision not in ("allow", "allow_always"):

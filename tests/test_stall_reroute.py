@@ -471,7 +471,8 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(len(new_workers), 1)
         w2 = new_workers[0]
         self.assertEqual(w2["status"], "pending_approval")
-        self.assertEqual(w2["prompt"], prompt_text)
+        self.assertTrue(w2["prompt"].startswith(prompt_text))
+        self.assertEqual(w2["prompt"].count("SUBWAY STANDING RULES"), 1)
         self.assertEqual(w2["model"], "sonnet")
         self.assertEqual(w2["provider"], "claude")
         self.assertEqual(w2["rerouted_from"], worker_id)
@@ -550,7 +551,8 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(len(new_workers), 1)
         w2 = new_workers[0]
         self.assertEqual(w2["status"], "pending_approval")
-        self.assertEqual(w2["prompt"], prompt_text)
+        self.assertTrue(w2["prompt"].startswith(prompt_text))
+        self.assertEqual(w2["prompt"].count("SUBWAY STANDING RULES"), 1)
         self.assertEqual(w2["model"], "opus")
         self.assertEqual(w2["rerouted_from"], worker_id)
 

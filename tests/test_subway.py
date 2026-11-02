@@ -49,6 +49,7 @@ os.environ["CLAUDE_BIN"] = _STUB_BIN
 os.environ["OPENCODE_BIN"] = _STUB_BIN
 os.environ["AGY_BIN"] = _STUB_BIN
 os.environ.pop("ANTIGRAVITY_CONVERSATION_ID", None)
+os.environ.pop("SUBWAY_WORKER_ID", None)
 os.environ.pop("SUBWAY_STATION_ID", None)
 
 import server
