@@ -437,7 +437,7 @@ if __name__ == "__main__":
 
 _ZSH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
-  python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 &
+  ( python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
   _subway_preexec() {
     SUBWAY_CMD_START=$EPOCHREALTIME
     SUBWAY_CMD="$1"
@@ -445,7 +445,7 @@ _ZSH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   _subway_precmd() {
     local code=$?
     if [ -n "$SUBWAY_CMD" ]; then
-      python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$EPOCHREALTIME" "$PWD" >/dev/null 2>&1 &
+      ( python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$EPOCHREALTIME" "$PWD" >/dev/null 2>&1 & )
       unset SUBWAY_CMD
     fi
     return $code
@@ -456,7 +456,7 @@ fi'''
 
 _BASH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
-  python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 &
+  ( python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
   _subway_prev_debug_cmd=""
   if trap -p DEBUG | grep -q .; then
     _subway_prev_debug_cmd=$(trap -p DEBUG | sed -E "s/^trap -- '(.*)' DEBUG$/\\\\1/")
@@ -470,7 +470,7 @@ _BASH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   _subway_precmd() {
     local code=$?
     if [ -n "$SUBWAY_CMD" ]; then
-      python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$(date +%s.%N)" "$PWD" >/dev/null 2>&1 &
+      ( python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$(date +%s.%N)" "$PWD" >/dev/null 2>&1 & )
       unset SUBWAY_CMD
     fi
     return $code

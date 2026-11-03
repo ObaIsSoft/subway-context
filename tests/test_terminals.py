@@ -334,6 +334,15 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         rec = terminals.get_terminal(server._terminals_dir(), "t1") or {}
         self.assertNotIn("TOPSECRET", str(rec.get("commands", [])))
 
+    def test_hook_background_calls_print_no_job_messages(self):
+        # A bare trailing "&" makes zsh print "[2] 86830 ... + done" after every command; a subshell "( ... & )" doesn't.
+        import inspect
+        src = inspect.getsource(terminals)
+        calls = [l.strip() for l in src.splitlines() if 'terminal_hook.py" optin' in l or 'terminal_hook.py" event' in l]
+        self.assertTrue(calls)
+        for line in calls:
+            self.assertTrue(line.startswith("( ") and line.endswith("& )"), line)
+
     def test_run_terminal_ask_mode_denied(self):
         with server._state_lock("terminals"):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
