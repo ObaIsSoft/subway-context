@@ -1570,8 +1570,10 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertIn("private", res)
 
     def test_bulk_work_goes_local_first_and_hard_work_does_not(self):
-        self.assertEqual(server.route_task("Extraction job over 29,028 documents")["order"][0], "local")
-        self.assertNotIn("local", server.route_task("Refactor the auth flow across services")["order"])
+        # Fixed provider list: the real one depends on what this machine has (CI has no local models).
+        providers = [{"id": p, "client": {"dispatchable": True}} for p in ("local", "opencode", "antigravity", "claude")]
+        self.assertEqual(server.route_task("Extraction job over 29,028 documents", providers=providers)["order"][0], "local")
+        self.assertNotIn("local", server.route_task("Refactor the auth flow across services", providers=providers)["order"])
 
     def test_chunks_cover_all_text(self):
         self.assertEqual("".join(server._chunks("abcdefghij", 3)), "abcdefghij")
