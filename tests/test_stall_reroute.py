@@ -26,6 +26,7 @@ class TestStallAndReroute(unittest.TestCase):
         self.orig_claude_json = server.CLAUDE_JSON
         self.orig_agy_dir = server.AGY_DIR
         self.orig_opencode_agents_dir = server.OPENCODE_AGENTS_DIR
+        self.orig_copilot_dir = server.COPILOT_DIR
         self.orig_tracks_dir = server.TRACKS_DIR
         self.orig_hud_dir = server.HUD_DIR
         server.SUBWAY_DIR = self.temp_dir
@@ -36,6 +37,7 @@ class TestStallAndReroute(unittest.TestCase):
         server.AGY_DIR = os.path.join(self.temp_dir, ".gemini", "antigravity")
         server.OPENCODE_DIR = os.path.join(self.temp_dir, ".local", "share", "opencode")
         server.OPENCODE_AGENTS_DIR = os.path.join(self.temp_dir, ".config", "opencode", "agents")
+        server.COPILOT_DIR = os.path.join(self.temp_dir, ".copilot")
         server.TRACKS_DIR = os.path.join(self.temp_dir, "tracks")
         server.HUD_DIR = os.path.join(self.temp_dir, "hud")
         os.makedirs(server.WORKERS_DIR, exist_ok=True)
@@ -51,6 +53,7 @@ class TestStallAndReroute(unittest.TestCase):
         server.AGY_DIR = self.orig_agy_dir
         server.OPENCODE_DIR = self.orig_opencode_dir
         server.OPENCODE_AGENTS_DIR = self.orig_opencode_agents_dir
+        server.COPILOT_DIR = self.orig_copilot_dir
         server.TRACKS_DIR = self.orig_tracks_dir
         server.HUD_DIR = self.orig_hud_dir
         server._model_catalog.clear()
@@ -301,6 +304,46 @@ class TestStallAndReroute(unittest.TestCase):
             last_active, 10_000.0, 300.0, active=signals["copilot_tool_running"],
         ))
 
+    def test_copilot_tool_execution_event_matching(self):
+        test_cases = (
+            (
+                "identified start followed by id-less completion",
+                [
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1"}},
+                    {"type": "tool.execution_complete"},
+                ],
+                False,
+            ),
+            (
+                "starts completed by id",
+                [
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1"}},
+                    {"type": "tool.execution_start", "data": {"id": "tool-2"}},
+                    {"type": "tool.execution_complete", "data": {"call_id": "tool-1"}},
+                    {"type": "tool.execution_complete", "data": {"callId": "tool-2"}},
+                ],
+                False,
+            ),
+            (
+                "one start still open",
+                [
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1"}},
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-2"}},
+                    {"type": "tool.execution_complete", "data": {"toolCallId": "tool-1"}},
+                ],
+                True,
+            ),
+        )
+        events_path = os.path.join(self.temp_dir, ".copilot", "events.jsonl")
+        os.makedirs(os.path.dirname(events_path), exist_ok=True)
+        for name, events, expected in test_cases:
+            with self.subTest(name=name):
+                with open(events_path, "w", encoding="utf-8") as event_file:
+                    event_file.write("{malformed json}\n")
+                    for event in events:
+                        event_file.write(json.dumps(event) + "\n")
+                self.assertEqual(server._copilot_has_open_tool_execution(events_path), expected)
+
     def test_live_copilot_silence_gets_ten_extra_minutes(self):
         meta = {"provider": "copilot", "stall_timeout": 300}
         proc = mock.Mock()
@@ -309,6 +352,54 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(timeout, 900)
         self.assertFalse(server._worker_is_stalled({"start": 0.0}, 899.0, timeout))
         self.assertTrue(server._worker_is_stalled({"start": 0.0}, 900.0, timeout))
+
+    def _run_silent_copilot_stall(self, route, new_worker_id):
+        worker_id = "worker_242424"
+        session_id = "2eb1e932-c4c7-4a56-a708-72507680dd6a"
+        meta = {
+            "id": worker_id, "role": "Worker", "provider": "copilot", "model": "gpt-6-luna",
+            "copilot_session_id": session_id, "prompt": "Make the requested change",
+            "project_dir": self.temp_dir, "timeout_seconds": 30, "stall_timeout": 0.3,
+            "status": "running", "cmd": [
+                sys.executable, "-c", "import threading; threading.Event().wait()",
+            ], "log_file": server._log_file(worker_id),
+        }
+        server._save_worker(meta)
+        with mock.patch.object(server, "route_task", return_value=route), \
+             mock.patch.object(server, "find_copilot_binary", return_value="/mock/copilot"), \
+             mock.patch.object(server, "_worker_stall_timeout", return_value=0.1), \
+             mock.patch.object(server, "t_spin_worker", return_value=f"Worker `{new_worker_id}` queued") as spin, \
+             mock.patch.object(server, "t_broadcast_track"), \
+             mock.patch.object(server, "notify_desktop_event"), \
+             mock.patch.object(server, "_ping_launcher"):
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+
+        with open(server._exit_file(worker_id), encoding="utf-8") as exit_file:
+            exit_result = json.load(exit_file)
+        return exit_result, spin
+
+    def test_silent_copilot_with_no_activity_is_stalled_rerouted_not_exhausted(self):
+        exit_result, spin = self._run_silent_copilot_stall({
+            "picks": [{"provider": "copilot", "model": "gpt-6-luna-alt"}],
+            "reason": "alternate",
+        }, "worker_252525")
+
+        self.assertIn("worker_252525", exit_result["reason"])
+        self.assertIn("stalled", exit_result["reason"])
+        self.assertEqual(spin.call_args.kwargs["provider"], "copilot")
+        self.assertEqual(spin.call_args.kwargs["model"], "gpt-6-luna-alt")
+        self.assertNotIn("gpt-6-luna", server._load_json("bad_models.json"))
+        self.assertIn("gpt-6-luna", server._load_json("stall_cooldowns.json"))
+
+    def test_silent_copilot_without_same_cost_reroute_is_not_restarted(self):
+        exit_result, spin = self._run_silent_copilot_stall({
+            "picks": [{"provider": "claude", "model": "opus"}],
+            "reason": "Only Claude models are available.",
+        }, "worker_252525")
+
+        self.assertIn("no same-cost or cheaper provider/model is available", exit_result["reason"].lower())
+        self.assertIn("stalled", exit_result["reason"])
+        spin.assert_not_called()
 
     def test_missing_copilot_events_falls_back_to_output_activity(self):
         log_file = os.path.join(self.temp_dir, "worker.log")

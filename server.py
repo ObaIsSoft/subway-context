@@ -8285,6 +8285,17 @@ def _file_activity_signature(path: str) -> Tuple[bool, int, int]:
 
 def _copilot_has_open_tool_execution(events_path: str) -> bool:
     open_tools: List[Optional[str]] = []
+
+    def event_call_id(event: Dict[str, Any]) -> Optional[str]:
+        data = event.get("data")
+        sources = [data, event] if isinstance(data, dict) else [event]
+        for source in sources:
+            for key in ("toolCallId", "tool_call_id", "callId", "call_id", "id"):
+                value = source.get(key)
+                if value is not None and value != "":
+                    return str(value)
+        return None
+
     try:
         with open(events_path, "r", encoding="utf-8", errors="replace") as events_file:
             for line in events_file:
@@ -8295,17 +8306,18 @@ def _copilot_has_open_tool_execution(events_path: str) -> bool:
                 if not isinstance(event, dict):
                     continue
                 event_type = event.get("type")
-                data = event.get("data") if isinstance(event.get("data"), dict) else event
-                call_id = str(data.get("toolCallId") or data.get("callId") or data.get("id") or "")
+                call_id = event_call_id(event)
                 if event_type == "tool.execution_start":
-                    open_tools.append(call_id or None)
+                    open_tools.append(call_id)
                 elif event_type == "tool.execution_complete":
-                    if call_id and call_id in open_tools:
+                    if call_id is not None and call_id in open_tools:
                         open_tools.remove(call_id)
-                    else:
+                    elif call_id is None:
                         anonymous = next((i for i, active_id in enumerate(open_tools) if active_id is None), None)
                         if anonymous is not None:
                             open_tools.pop(anonymous)
+                        elif open_tools:
+                            open_tools.pop(0)
     except OSError:
         return False
     return bool(open_tools)
