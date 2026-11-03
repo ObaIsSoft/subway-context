@@ -9686,6 +9686,8 @@ def _pump_opencode(
     last_msg_time = time.time()
     had_tool_call = False
     had_tool_call_this_turn = False
+    continued_replies: List[str] = []
+    preserve_continued_reply = False
     run.setdefault("continues", 0)
 
     def send_cancel() -> None:
@@ -9853,29 +9855,42 @@ def _pump_opencode(
                 past_two_thirds = bool(cap and spent >= (cap * 2 // 3))
 
                 worker_prompt = str(meta.get("prompt") or "")
-                prompt_asks_edits = bool(re.search(r"\b(edit|edits|editing)\b", worker_prompt, re.I) or ("edit" in worker_prompt.lower()))
+                is_edit_worker = "files:write" in (meta.get("capabilities") or [])
                 plan_markers = ("I'll", "I will", "Let me", "Next,")
                 is_plan = any(m in reply for m in plan_markers) or any(m.lower() in reply.lower() for m in plan_markers)
 
                 continue_reason = None
                 if res.get("stopReason") == "max_tokens":
                     continue_reason = "max_tokens"
-                elif not had_tool_call_this_turn and prompt_asks_edits and is_plan:
+                elif not had_tool_call_this_turn and is_edit_worker and is_plan:
                     continue_reason = "plan"
 
                 continues = run.get("continues", 0)
                 if continue_reason and continues < 2 and not past_two_thirds and not run.get("wrapping"):
                     run["continues"] = continues + 1
                     write(f"[continue] {continue_reason}")
+                    if reply:
+                        continued_replies.append(reply)
+                    if continue_reason == "max_tokens":
+                        preserve_continued_reply = True
                     response_chunks.clear()
                     had_tool_call_this_turn = False
                     cancel_sent = False
                     msg_counter += 1
                     prompt_id = msg_counter
+                    continue_text = (
+                        "You were cut off by the output limit. Continue exactly where you stopped; "
+                        "do not repeat what you already wrote."
+                        if continue_reason == "max_tokens"
+                        else "Continue: do it now with your tools. Make the edits, then reply DONE with what changed."
+                    )
+                    continue_text += "\nYour task: " + worker_prompt[:300]
                     send_rpc({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt", "params": {"sessionId": session_id or run.get("conversation"), "prompt": [
-                        {"type": "text", "text": "Continue: do it now with your tools. Make the edits, then reply DONE with what changed."}]}})
+                        {"type": "text", "text": continue_text}]}})
                     continue
 
+                if preserve_continued_reply:
+                    reply = "\n".join([*continued_replies, reply]).strip()
                 run["response"] = reply
                 if not reply:
                     write(f"[no reply] OpenCode ended the turn: {res.get('stopReason') or msg.get('error') or 'no reason given'}")

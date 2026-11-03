@@ -1306,12 +1306,32 @@ class TestAutoApproveNeverAsks(unittest.TestCase):
 class TestOpenCodeCalibration(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="subway_oc_calib_")
+        subway_dir = os.path.join(self.test_dir, ".subway-context")
+        self.path_patches = [
+            patch.object(server, "HOME", self.test_dir),
+            patch.object(server, "SUBWAY_DIR", subway_dir),
+            patch.object(server, "CLAUDE_DIR", os.path.join(self.test_dir, ".claude")),
+            patch.object(server, "AGY_DIR", os.path.join(self.test_dir, ".gemini", "antigravity")),
+            patch.object(server, "OPENCODE_DIR", os.path.join(self.test_dir, ".local", "share", "opencode")),
+            patch.object(server, "OPENCODE_AGENTS_DIR", os.path.join(self.test_dir, ".config", "opencode", "agents")),
+            patch.object(server, "COPILOT_DIR", os.path.join(self.test_dir, ".copilot")),
+            patch.object(server, "WORKERS_DIR", os.path.join(subway_dir, "workers")),
+            patch.object(server, "TRACKS_DIR", os.path.join(subway_dir, "tracks")),
+            patch.object(server, "HUD_DIR", os.path.join(self.test_dir, "hud")),
+        ]
+        for path_patch in self.path_patches:
+            path_patch.start()
 
     def tearDown(self):
+        for path_patch in reversed(self.path_patches):
+            path_patch.stop()
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _create_fake_opencode2(self):
+    def _create_fake_opencode2(self, first_reply="I will edit server.py to add the feature.", first_stop_reason=None,
+                               second_reply="DONE: edited server.py"):
         script_path = os.path.join(self.test_dir, "fake_opencode2.py")
+        continuation_path = os.path.join(self.test_dir, "continuation_prompt.txt")
+        stop_reason = f", 'stopReason': {first_stop_reason!r}" if first_stop_reason else ""
         code = (
             "import sys, json\n"
             "def send(msg):\n"
@@ -1319,6 +1339,7 @@ class TestOpenCodeCalibration(unittest.TestCase):
             "    sys.stdout.flush()\n"
             "prompt_id = None\n"
             "turn = 0\n"
+            f"continuation_path = {continuation_path!r}\n"
             "for line in sys.stdin:\n"
             "    line = line.strip()\n"
             "    if not line: continue\n"
@@ -1334,11 +1355,11 @@ class TestOpenCodeCalibration(unittest.TestCase):
             "        prompt_id = req_id\n"
             "        turn += 1\n"
             "        if turn == 1:\n"
-            "            send({'jsonrpc': '2.0', 'id': prompt_id, 'result': {'response': 'I will edit server.py to add the feature.'}})\n"
+            f"            send({{'jsonrpc': '2.0', 'id': prompt_id, 'result': {{'response': {first_reply!r}{stop_reason}}}}})\n"
             "        else:\n"
-            "            send({'jsonrpc': '2.0', 'method': 'session/update',\n"
-            "                  'params': {'sessionId': 'fake_ses_01', 'update': {'sessionUpdate': 'tool_call', 'toolCall': {'title': 'edit'}}}})\n"
-            "            send({'jsonrpc': '2.0', 'id': prompt_id, 'result': {'response': 'DONE: edited server.py'}})\n"
+            "            with open(continuation_path, 'w', encoding='utf-8') as f:\n"
+            "                f.write('\\n'.join(p.get('text', '') for p in req.get('params', {}).get('prompt', [])))\n"
+            f"            send({{'jsonrpc': '2.0', 'id': prompt_id, 'result': {{'response': {second_reply!r}}}}})\n"
             "    elif method == 'session/cancel':\n"
             "        sys.exit(0)\n"
         )
@@ -1346,20 +1367,52 @@ class TestOpenCodeCalibration(unittest.TestCase):
             f.write(code)
         return script_path
 
+    def _pump_fake(self, proc, out, run, meta, stopped):
+        try:
+            server._pump_opencode(proc, out, run, meta, stopped)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=2)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream:
+                    stream.close()
+
     def test_opencode_plan_reply_triggers_continue(self):
         fake_bin = self._create_fake_opencode2()
         proc = subprocess.Popen([sys.executable, fake_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out = io.BytesIO()
         run = {"continues": 0, "cap": 10000, "spent": 100}
-        meta = {"prompt": "Edit server.py to calibrate OpenCode", "project_dir": self.test_dir}
+        meta = {"prompt": "Edit server.py to calibrate OpenCode", "capabilities": ["files:read", "files:write"],
+                "project_dir": self.test_dir}
         stopped = {"flag": False}
 
-        server._pump_opencode(proc, out, run, meta, stopped)
+        self._pump_fake(proc, out, run, meta, stopped)
 
         self.assertEqual(run["continues"], 1)
         self.assertEqual(run["response"], "DONE: edited server.py")
         logs = out.getvalue().decode("utf-8")
         self.assertIn("[continue] plan", logs)
+        with open(os.path.join(self.test_dir, "continuation_prompt.txt"), encoding="utf-8") as f:
+            continuation = f.read()
+        self.assertIn("Continue: do it now with your tools. Make the edits, then reply DONE with what changed.", continuation)
+        self.assertIn("Your task: Edit server.py to calibrate OpenCode", continuation)
+
+    def test_read_only_plan_reply_does_not_trigger_continue(self):
+        fake_bin = self._create_fake_opencode2(first_reply="I will review the diff and report findings.")
+        proc = subprocess.Popen([sys.executable, fake_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = io.BytesIO()
+        run = {"continues": 0, "cap": 10000, "spent": 100}
+        meta = {"prompt": "Do not edit any file; review the requested change.", "capabilities": ["files:read"],
+                "project_dir": self.test_dir}
+        stopped = {"flag": False}
+
+        self._pump_fake(proc, out, run, meta, stopped)
+
+        self.assertEqual(run["continues"], 0)
+        self.assertEqual(run["response"], "I will review the diff and report findings.")
+        logs = out.getvalue().decode("utf-8")
+        self.assertNotIn("[continue] plan", logs)
 
     def test_opencode_token_cap_blocks_continue(self):
         fake_bin = self._create_fake_opencode2()
@@ -1370,12 +1423,38 @@ class TestOpenCodeCalibration(unittest.TestCase):
         meta = {"prompt": "Edit server.py to calibrate OpenCode", "project_dir": self.test_dir}
         stopped = {"flag": False}
 
-        server._pump_opencode(proc, out, run, meta, stopped)
+        self._pump_fake(proc, out, run, meta, stopped)
 
         self.assertEqual(run["continues"], 0)
         self.assertEqual(run["response"], "I will edit server.py to add the feature.")
         logs = out.getvalue().decode("utf-8")
         self.assertNotIn("[continue] plan", logs)
+
+    def test_opencode_max_tokens_continues_and_preserves_reply(self):
+        prompt = "Review the implementation and report the issue."
+        fake_bin = self._create_fake_opencode2(
+            first_reply="The initial review found a boundary issue.",
+            first_stop_reason="max_tokens",
+            second_reply="The continued review confirms it is reproducible.",
+        )
+        proc = subprocess.Popen([sys.executable, fake_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = io.BytesIO()
+        run = {"continues": 0, "cap": 10000, "spent": 100}
+        meta = {"prompt": prompt, "capabilities": ["files:read"], "project_dir": self.test_dir}
+        stopped = {"flag": False}
+
+        self._pump_fake(proc, out, run, meta, stopped)
+
+        self.assertEqual(run["continues"], 1)
+        self.assertEqual(
+            run["response"],
+            "The initial review found a boundary issue.\nThe continued review confirms it is reproducible.",
+        )
+        with open(os.path.join(self.test_dir, "continuation_prompt.txt"), encoding="utf-8") as f:
+            continuation = f.read()
+        self.assertIn("You were cut off by the output limit.", continuation)
+        self.assertIn("Continue exactly where you stopped; do not repeat what you already wrote.", continuation)
+        self.assertIn("Your task: " + prompt[:300], continuation)
 
 
 class TestHudOpenOnUse(unittest.TestCase):
