@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.4 - 2026-11-03
+
+> [!IMPORTANT]
+> A stalled worker is never rerouted to a provider that costs more than the one it started on (order: local, OpenCode free, Antigravity Flash, Copilot, Claude Sonnet, Claude Opus). If nothing the same price or cheaper is available, it stops and says why. Before this, a silent Copilot worker could be rerouted to Claude Opus.
+
+- **Terminals you opt in to**: Subway can read, search and (with your permission) run commands in terminals you share. Capture comes from the VS Code extension (`subway.terminalSharing.enabled` plus the **Subway: Share Terminal**, **Stop Sharing Terminal** and **Allow Terminal Commands** commands) or from a shell hook (`subway-context terminal hook install`). Output is redacted and stripped of colour codes, and `list_terminals`, `read_terminal`, `search_terminal` and `run_terminal` work with a new Terminals page in the HUD; `read_terminal` in errors mode keeps line breaks.
+- **Copilot workers keep going**: the stall watchdog counts Copilot session events and a running tool as activity, and gives silent Copilot turns 10 extra minutes. In auto_safe mode Copilot workers run in Copilot's OS sandbox: they can edit files only inside their folder and may run `python3`, so they can run their own tests. The file-write rule now actually covers files inside the folder.
+- **Copilot chats are readable**: VS Code Copilot Chat transcripts are read, so `read_chat` shows tool activity and a "Last tool" line, and "Last active" is correct. Copilot CLI `read_chat` shows last active and last tool.
+- **Per-chat permission modes**: the HUD sets a permission mode per chat, and workers take their chat's mode. Sub-workers inherit their parent's approval and permission mode, never broader, and a refused command no longer loses a worker's edits.
+- **More is visible in worker logs**: Antigravity reads are guarded, Copilot tool inputs, results, permission and subagent events appear in worker logs, logs can be read by range, and older Copilot usage is marked as an estimate.
+- **Cut-off workers carry on**: OpenCode and local workers cut off by the output limit are told to continue where they stopped, with their task restated, and the final report keeps both parts. Read-only workers are never told to "make the edits".
+- **Threads**: OpenCode dates are fixed (they were shown in the year 58808), and running worker sessions are hidden from Threads.
+- **Fixes**: a lead waiting on its own sub-workers is not marked stalled; local models are no longer blamed for OpenCode free-limit errors; the memory guard counts memory macOS can free; HUD dialogs close on a backdrop click; and packaging adds a repository field and keeps assets out of the npm package.
+
 ## 1.3.3 - 2026-11-02
 
 > [!IMPORTANT]

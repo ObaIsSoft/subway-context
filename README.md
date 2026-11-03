@@ -212,7 +212,7 @@ Subway Context exposes 29 MCP tools divided across functional roles:
 - **`worker_status(worker_id, track)`**: Inspect status, exit code, and log tail of workers.
 - **`collect_reports(track, wait)`**: Collect completion summaries and log tails from workers on a track.
 - **`estimate_complexity(prompt, role)`**: Advisory evaluation recommending model tier, effort, and provider.
-- **`escalate_worker(worker_id, new_effort, new_mode, reason, successor_provider)`**: Replace a struggling worker with a higher-tier successor (queued for user approval).
+- **`escalate_worker(worker_id, new_effort, new_mode, reason, successor_provider)`**: Replace a struggling worker with a higher-tier successor (queued for user approval). Automatic reroutes never move a stalled worker to a provider that costs more than the one it started on; if nothing the same price or cheaper is available, it stops and says why.
 - **`on_worker_done(worker_id, then)`**: Attach follow-up steps to a worker that is running or queued, or fire them now if it has finished.
 
 #### Worker triggers
@@ -315,9 +315,9 @@ export SUBWAY_HUD_ORIGINS="vscode-webview://*,http://127.0.0.1:3000"
 
 ## Terminals
 
-Subway Context can capture commands from terminals you explicitly share with it, so agents and the HUD can see what failed and hand it to a worker — nothing is captured from anywhere you haven't opted in.
+Subway Context can capture commands from terminals you explicitly share with it, so agents and the HUD can see what failed and hand it to a worker — nothing is captured from anywhere you haven't opted in. There are two ways to opt in, and both need the 1.3.4 build of the VS Code extension (rebuild and reinstall it from the `vscode` folder):
 
-- **VS Code / Antigravity / Cursor / Windsurf extension**: install the Subway Context VS Code extension, then enable the `subway.terminalSharing.enabled` setting and run **Subway: Share This Terminal** on the terminal you want captured (no shell integration → nothing is captured, shown in the HUD as "no shell integration"). **Subway: Allow Commands From HUD In This Terminal** additionally lets `run_terminal` execute commands there. **Subway: Stop Sharing This Terminal** opts back out.
+- **VS Code / Antigravity / Cursor / Windsurf extension**: install the Subway Context VS Code extension, then enable the `subway.terminalSharing.enabled` setting and run **Subway: Share Terminal** on the terminal you want captured (no shell integration → nothing is captured, shown in the HUD as "no shell integration"). **Subway: Allow Terminal Commands** additionally lets `run_terminal` execute commands there. **Subway: Stop Sharing Terminal** opts back out.
 - **Standalone zsh/bash shells**: `subway-context terminal hook install [zsh|bash]` adds a marked block to your `.zshrc`/`.bashrc` (backing up the original first) that reports each finished command's text, exit code and working directory in the background — never its output. `subway-context terminal hook status` and `subway-context terminal hook uninstall [zsh|bash]` check or cleanly remove it.
 - Captured commands are redacted (tokens, keys, passwords, `Authorization` headers) before they reach the store, and are visible via `read_terminal`, `search_terminal`, and the HUD's **Terminals** page, where a failed command can be handed straight to a worker.
 
@@ -378,7 +378,7 @@ Workers **always require user approval** before any execution begins:
 
 Workers use permission modes to govern actions:
 - **ask (Default)**: Always ask before running actions.
-- **auto_safe**: Automatically approves safe read-only and diagnostic commands; lets OpenCode and local workers read and edit inside their own folder.
+- **auto_safe**: Automatically approves safe read-only and diagnostic commands; lets OpenCode and local workers read and edit inside their own folder. Copilot workers run in Copilot's OS sandbox, may edit files only inside their folder, and may run `python3` so they can run their own tests.
 - **auto_approve**: Auto-approves actions only if the user explicitly chooses it. Agents cannot enable this mode on their own.
 
 ### Platform Support
