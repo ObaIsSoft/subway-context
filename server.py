@@ -64,6 +64,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import terminals
+import native_terminals
 
 try:
     import fcntl
@@ -7534,9 +7535,46 @@ def t_search_terminal(query: str, terminal: str = "") -> str:
     return "\n".join(lines)
 
 
+_last_capture_thread: Optional[threading.Thread] = None
+
+
+def _capture_hook_output(base_dir: str, tid: str, cmd_text: str, start_ts: Any, end_ts: Any, app: str, tty: str) -> None:
+    try:
+        if not terminal_sharing_enabled():
+            return
+        with _state_lock("terminals"):
+            term = terminals.get_terminal(base_dir, tid)
+        if not term or not term.get("share_enabled") or not term.get("capture_output"):
+            return
+
+        time.sleep(0.3)  # let the shell draw its next prompt, so slice_output drops the prompt, not output
+        history = native_terminals.read_history(app, tty)
+        raw_out = native_terminals.slice_output(history, cmd_text)
+        cleaned = terminals.redact_text(terminals.strip_ansi(raw_out or ""))
+        if len(cleaned) > 20000:
+            cleaned = cleaned[-20000:]
+
+        if not terminal_sharing_enabled():
+            return
+        with _state_lock("terminals"):
+            term = terminals.get_terminal(base_dir, tid)
+            if not term or not term.get("share_enabled") or not term.get("capture_output"):
+                return
+            cmds = term.get("commands") or []
+            for c in reversed(cmds):
+                if (c.get("command") in (cmd_text, terminals.redact_text(cmd_text))
+                        and (c.get("end_ts") == end_ts or c.get("ts") == start_ts)):
+                    c["output"] = cleaned
+                    break
+            path = terminals._terminal_path(base_dir, tid)
+            terminals._write_json_atomic(path, term)
+        mark_hud_cache_stale()
+    except Exception:
+        pass
+
+
 def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -> str:
-    """Run a command in an opted-in editor terminal through the extension. Refuses terminals that
-    haven't opted in to running commands, have no shell integration, or are closed."""
+    """Run a command in an opted-in editor terminal through the extension or native terminal."""
     if not terminal_sharing_enabled():
         return "[REFUSED] terminal sharing is off."
     caller = _self_id()
@@ -7546,12 +7584,17 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         return f"Error: terminal `{terminal_id}` not found."
     if term.get("closed"):
         return f"[REFUSED] terminal `{terminal_id}` is closed."
-    if terminals.terminal_source(term) == "hook":
-        return (f"[REFUSED] terminal `{terminal_id}` is a shell-hook terminal: Subway sees its commands "
-                "and exit codes but can't run commands in it. Run commands in an editor terminal with "
-                "the Subway extension.")
-    if term.get("shell_integration") is False:
-        return f"[REFUSED] terminal `{terminal_id}` has no shell integration; run_terminal needs it."
+    is_hook = terminals.terminal_source(term) == "hook"
+    if is_hook:
+        app = term.get("app") or ""
+        tty = term.get("tty") or ""
+        if app not in ("terminal", "iterm") or not tty:
+            return (f"[REFUSED] terminal `{terminal_id}` is a shell-hook terminal: Subway sees its commands "
+                    "and exit codes but can't run commands in it. Run commands in an editor terminal with "
+                    "the Subway extension. (only Terminal.app and iTerm2 can run commands from Subway)")
+    else:
+        if term.get("shell_integration") is False:
+            return f"[REFUSED] terminal `{terminal_id}` has no shell integration; run_terminal needs it."
     if not term.get("allow_commands"):
         return f"[REFUSED] terminal `{terminal_id}` hasn't opted in to running commands (needs 'Subway: Allow commands in this terminal')."
 
@@ -7564,6 +7607,100 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         decision = await_permission(rid, wait=min(max(timeout_seconds, 0) + 60, PERMISSION_WAIT))
         if decision not in ("allow", "allow_always"):
             return f"[DENIED] run_terminal `{terminal_id}`: {command}"
+
+    if is_hook:
+        if "\n" in command or "\r" in command:
+            return "[REFUSED] one line only."
+        try:
+            busy = native_terminals.is_busy(app, tty)
+        except Exception as e:
+            msg = str(e)
+            if "macOS blocked Subway" in msg:
+                return f"Error: {msg}"
+            return f"[REFUSED] {msg}"
+        if busy is True:
+            return f"[REFUSED] `{terminal_id}` is busy running something; try again when it's at a prompt."
+        if busy is None:
+            return f"[REFUSED] terminal window not found; is it still open?"
+
+        if not terminal_sharing_enabled():
+            return "[REFUSED] terminal sharing is off."
+        with _state_lock("terminals"):
+            term = terminals.get_terminal(_terminals_dir(), terminal_id)
+        if not term or not term.get("share_enabled") or not term.get("allow_commands"):
+            return f"[REFUSED] terminal `{terminal_id}` is not available or commands not allowed."
+
+        typed_ts = time.time()
+        ok, err = native_terminals.type_command(app, tty, command)
+        if not ok:
+            if "macOS blocked Subway" in err:
+                return f"Error: {err}"
+            return f"[REFUSED] {err}"
+
+        deadline = time.time() + max(1, min(timeout_seconds, 600)) + 5
+        matching = None
+        while time.time() < deadline:
+            time.sleep(0.5)
+            with _state_lock("terminals"):
+                term = terminals.get_terminal(_terminals_dir(), terminal_id)
+            cmds = (term or {}).get("commands") or []
+            for c in reversed(cmds):
+                if (c.get("command") in (command, terminals.redact_text(command))
+                        and (c.get("end_ts") or 0) >= typed_ts):
+                    matching = c
+                    break
+            if matching:
+                break
+        if not matching:
+            return f"Error: `{terminal_id}` did not respond within {timeout_seconds}s."
+
+        if not terminal_sharing_enabled():
+            with _state_lock("terminals"):
+                term = terminals.get_terminal(_terminals_dir(), terminal_id)
+                if term:
+                    for c in reversed(term.get("commands") or []):
+                        if (c.get("command") in (command, terminals.redact_text(command))
+                                and (c.get("end_ts") or 0) >= typed_ts):
+                            c["output"] = ""
+                            break
+                    path = terminals._terminal_path(_terminals_dir(), terminal_id)
+                    terminals._write_json_atomic(path, term)
+            return "[REFUSED] terminal sharing was turned off while the command ran; its output was not kept."
+
+        with _state_lock("terminals"):
+            term = terminals.get_terminal(_terminals_dir(), terminal_id)
+        capture_on = bool(term and term.get("share_enabled") and term.get("capture_output") and terminal_sharing_enabled())
+        cleaned_out = ""
+        if capture_on:
+            try:
+                history = native_terminals.read_history(app, tty)
+                raw_out = native_terminals.slice_output(history, command)
+                cleaned_out = terminals.redact_text(terminals.strip_ansi(raw_out or ""))
+                if len(cleaned_out) > 20000:
+                    cleaned_out = cleaned_out[-20000:]
+            except Exception:
+                cleaned_out = ""
+
+        with _state_lock("terminals"):
+            term = terminals.get_terminal(_terminals_dir(), terminal_id)
+            if term:
+                still_valid = bool(terminal_sharing_enabled() and term.get("share_enabled") and term.get("capture_output"))
+                final_to_store = cleaned_out if still_valid else ""
+                for c in reversed(term.get("commands") or []):
+                    if (c.get("command") in (command, terminals.redact_text(command))
+                            and (c.get("end_ts") or 0) >= typed_ts):
+                        c["output"] = final_to_store
+                        break
+                path = terminals._terminal_path(_terminals_dir(), terminal_id)
+                terminals._write_json_atomic(path, term)
+        mark_hud_cache_stale()
+
+        code = matching.get("exit_code")
+        if not capture_on:
+            return f"[exit {code}] (output capture is off for this terminal)"
+        if cleaned_out:
+            return f"[exit {code}] {cleaned_out}"
+        return f"[exit {code}]"
 
     run_id = f"run_{uuid.uuid4().hex[:8]}"
     with _state_lock("terminals"):
@@ -13051,13 +13188,18 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             source = str(payload.get("source", ""))
             if source not in ("hook", "editor"):
                 source = ""
+            raw_app = str(payload.get("app", "") or "")
+            app = raw_app if raw_app in ("terminal", "iterm") else ""
+            raw_tty = str(payload.get("tty", "") or "")
+            tty = raw_tty if re.match(r"^/dev/ttys[0-9]+$", raw_tty) else ""
             with _state_lock("terminals"):
                 rec = terminals.set_terminal_opt_in(
                     _terminals_dir(), tid, name=str(payload.get("name", "")),
                     window_id=str(payload.get("window_id", "")), folder=str(payload.get("folder", "")),
                     share_enabled=payload.get("share_enabled"), allow_commands=payload.get("allow_commands"),
+                    capture_output=payload.get("capture_output"),
                     shell_integration=payload.get("shell_integration"), closed=payload.get("closed"),
-                    source=source)
+                    source=source, app=app, tty=tty)
             res = {"ok": True, "terminal": rec}
         elif path == "/api/terminal_event":
             if not terminal_sharing_enabled():
@@ -13067,18 +13209,44 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if not tid:
                 self._deny(400, "missing terminal_id")
                 return
+            raw_app = str(payload.get("app", "") or "")
+            app = raw_app if raw_app in ("terminal", "iterm") else ""
+            raw_tty = str(payload.get("tty", "") or "")
+            tty = raw_tty if re.match(r"^/dev/ttys[0-9]+$", raw_tty) else ""
+            cmd_text = str(payload.get("command", ""))
+            start_ts = payload.get("start_ts")
+            end_ts = payload.get("end_ts")
             with _state_lock("terminals"):
                 term = terminals.get_terminal(_terminals_dir(), tid)
                 if not term or not term.get("share_enabled"):
                     self._deny(403, "terminal has not opted in to sharing")
                     return
                 terminals.record_command(
-                    _terminals_dir(), tid, str(payload.get("command", "")),
-                    exit_code=payload.get("exit_code"), start_ts=payload.get("start_ts"),
-                    end_ts=payload.get("end_ts"), output=str(payload.get("output", "")),
+                    _terminals_dir(), tid, cmd_text,
+                    exit_code=payload.get("exit_code"), start_ts=start_ts,
+                    end_ts=end_ts, output=str(payload.get("output", "")),
                     caller_id=str(payload.get("caller_id") or "editor"),
                     name=str(payload.get("name", "")), window_id=str(payload.get("window_id", "")),
-                    folder=str(payload.get("folder", "")))
+                    folder=str(payload.get("folder", "")), app=app, tty=tty)
+                term = terminals.get_terminal(_terminals_dir(), tid)
+                eff_app = (term or {}).get("app") or app
+                eff_tty = (term or {}).get("tty") or tty
+                should_capture = (
+                    terminal_sharing_enabled()
+                    and bool((term or {}).get("share_enabled"))
+                    and bool((term or {}).get("capture_output"))
+                    and eff_app in ("terminal", "iterm")
+                    and bool(eff_tty)
+                )
+            if should_capture:
+                global _last_capture_thread
+                t = threading.Thread(
+                    target=_capture_hook_output,
+                    args=(_terminals_dir(), tid, cmd_text, start_ts, end_ts, eff_app, eff_tty),
+                    daemon=True,
+                )
+                _last_capture_thread = t
+                t.start()
             res = {"ok": True}
         elif path == "/api/run_result":
             rid = str(payload.get("run_id", ""))

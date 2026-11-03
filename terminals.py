@@ -95,8 +95,9 @@ def get_terminal(base_dir: str, terminal_id: str) -> Optional[Dict[str, Any]]:
 def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_id: str = "",
                         folder: str = "", share_enabled: Optional[bool] = None,
                         allow_commands: Optional[bool] = None,
+                        capture_output: Optional[bool] = None,
                         shell_integration: Optional[bool] = None, closed: Optional[bool] = None,
-                        source: str = "") -> Dict[str, Any]:
+                        source: str = "", app: str = "", tty: str = "") -> Dict[str, Any]:
     """Register or update a terminal's identity and opt-in flags. Missing fields keep their old value."""
     os.makedirs(base_dir, exist_ok=True)
     path = _terminal_path(base_dir, terminal_id)
@@ -104,6 +105,7 @@ def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_
     rec.setdefault("id", terminal_id)
     rec.setdefault("commands", [])
     rec.setdefault("since", {})
+    rec.setdefault("capture_output", False)
     if name:
         rec["name"] = name
     if window_id:
@@ -114,12 +116,18 @@ def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_
         rec["share_enabled"] = bool(share_enabled)
     if allow_commands is not None:
         rec["allow_commands"] = bool(allow_commands)
+    if capture_output is not None:
+        rec["capture_output"] = bool(capture_output)
     if shell_integration is not None:
         rec["shell_integration"] = bool(shell_integration)
     if closed is not None:
         rec["closed"] = bool(closed)
     if source:
         rec["source"] = source
+    if app:
+        rec["app"] = app
+    if tty:
+        rec["tty"] = tty
     rec["updated_at"] = time.time()
     rec.setdefault("created_at", rec["updated_at"])
     _write_json_atomic(path, rec)
@@ -129,7 +137,7 @@ def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_
 def record_command(base_dir: str, terminal_id: str, command: str, exit_code: Optional[int] = None,
                    start_ts: Optional[float] = None, end_ts: Optional[float] = None,
                    output: str = "", caller_id: str = "", name: str = "", window_id: str = "",
-                   folder: str = "") -> Dict[str, Any]:
+                   folder: str = "", app: str = "", tty: str = "") -> Dict[str, Any]:
     """Append one finished command to a terminal's history, redacted, capped and pruned."""
     os.makedirs(base_dir, exist_ok=True)
     path = _terminal_path(base_dir, terminal_id)
@@ -142,6 +150,10 @@ def record_command(base_dir: str, terminal_id: str, command: str, exit_code: Opt
         rec["window_id"] = window_id
     if folder:
         rec["folder"] = folder
+    if app:
+        rec["app"] = app
+    if tty:
+        rec["tty"] = tty
 
     clean_output = redact_text(strip_ansi(output or ""))
     encoded = clean_output.encode("utf-8", "ignore")
@@ -195,8 +207,11 @@ def list_terminals(base_dir: str) -> List[Dict[str, Any]]:
                 "id": rec.get("id"), "name": rec.get("name") or rec.get("id"),
                 "folder": rec.get("folder") or "", "window_id": rec.get("window_id") or "",
                 "share_enabled": bool(rec.get("share_enabled")), "allow_commands": bool(rec.get("allow_commands")),
+                "capture_output": bool(rec.get("capture_output")),
                 "shell_integration": rec.get("shell_integration"), "closed": bool(rec.get("closed")),
                 "source": terminal_source(rec),
+                "app": rec.get("app") or "",
+                "tty": rec.get("tty") or "",
                 "last_command": last.get("command") if last else "",
                 "last_exit_code": last.get("exit_code") if last else None,
                 "last_ts": (last.get("ts") if last else None) or rec.get("updated_at") or 0,
@@ -361,7 +376,7 @@ def _hook_shell_and_rc(shell: str):
 
 
 _HOOK_SCRIPT = '''#!/usr/bin/env python3
-import sys, os, json, time, urllib.request, urllib.error
+import sys, os, json, time, urllib.request, urllib.error, subprocess
 
 def _hud():
     base = os.path.join(os.path.expanduser("~"), ".subway-context")
@@ -410,12 +425,30 @@ def _post(port, token, path, body):
     except Exception:
         return 0
 
+def _app_and_tty(tid):
+    tp = os.environ.get("TERM_PROGRAM", "")
+    app = "terminal" if tp == "Apple_Terminal" else ("iterm" if tp == "iTerm.app" else "")
+    tty = ""
+    try:
+        parts = str(tid).split("-")
+        pid = parts[1] if len(parts) >= 2 and parts[0] == "shell" else ""
+        if pid:
+            res = subprocess.run(["ps", "-o", "tty=", "-p", pid], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1)
+            raw = (res.stdout or "").strip()
+            if raw and raw != "??" and not raw.startswith("?"):
+                tty = raw if raw.startswith("/dev/") else ("/dev/" + raw)
+    except Exception:
+        tty = ""
+    return app, tty
+
 def _optin(port, token, tid, folder):
     name = _term_name(folder)
+    app, tty = _app_and_tty(tid)
     _post(port, token, "/api/terminal_opt_in", {
         "terminal_id": tid, "name": name, "window_id": "",
         "folder": folder, "share_enabled": True,
         "shell_integration": True, "source": "hook",
+        "app": app, "tty": tty,
     })
 
 def _ts(value):
@@ -467,11 +500,13 @@ def main():
             start_ts = _ts(start)
             if start_ts is None:
                 start_ts = end_ts
+            app, tty = _app_and_tty(tid)
             body = {
                 "terminal_id": tid, "command": command,
                 "exit_code": (int(code) if code not in ("", "None") else None),
                 "start_ts": start_ts, "end_ts": end_ts, "output": "",
                 "caller_id": "shell", "name": name, "window_id": "", "folder": folder,
+                "app": app, "tty": tty,
             }
             status = _post(port, token, "/api/terminal_event", body)
             if status == 403 and _known(port, token, tid) is False:

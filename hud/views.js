@@ -1054,7 +1054,15 @@ export const terminalsState = { rows: [], sharing: false, loadedAt: 0, loading: 
 function terminalRowTags(t) {
   const tags = [];
   if (t.closed) tags.push(h("span", { class: "tag bad" }, "closed"));
-  if (t.source === "hook") tags.push(h("span", { class: "tag" }, "shell hook: commands and exit codes, no output"));
+  if (t.source === "hook") {
+    if (t.app === "terminal") {
+      tags.push(h("span", { class: "tag" }, "Terminal.app"));
+    } else if (t.app === "iterm") {
+      tags.push(h("span", { class: "tag" }, "iTerm2"));
+    } else {
+      tags.push(h("span", { class: "tag" }, "shell hook: commands and exit codes, no output"));
+    }
+  }
   if (t.shell_integration === false) tags.push(h("span", { class: "tag" }, "no shell integration"));
   if (t.allow_commands) tags.push(h("span", { class: "tag" }, "commands allowed"));
   if (t.failures) tags.push(h("span", { class: "tag bad" }, `${t.failures} failing`));
@@ -1099,6 +1107,7 @@ async function openTerminalDetail(t) {
 }
 
 const terminalConfirm = new Set();
+const terminalCaptureConfirm = new Set();
 
 /* Switches are real buttons, so keyboard and screen readers get the same control as touch. */
 function terminalSwitch(label, checked, onToggle, disabled = false) {
@@ -1136,17 +1145,27 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
           ? "On. Agents can read terminals you share below."
           : "Off. Agents can't see or use any terminal.")),
       terminalSwitch("Terminal sharing", masterOn, () => {
-        if (masterOn) terminalConfirm.clear();
+        if (masterOn) {
+          terminalConfirm.clear();
+          terminalCaptureConfirm.clear();
+        }
         postTerminal("/api/terminal_sharing", { enabled: !masterOn }, onRefresh);
       })));
   const bodyRows = list.map((t) => {
     const shared = Boolean(t.share_enabled);
     const isHook = t.source === "hook";
-    const allowDisabled = !masterOn || !shared || isHook;
+    const isNativeHook = isHook && (t.app === "terminal" || t.app === "iterm");
+    const isOtherHook = isHook && !isNativeHook;
+    const allowDisabled = !masterOn || !shared || isOtherHook;
+    const captureDisabled = !masterOn || !shared;
     const confirming = terminalConfirm.has(t.id) && !allowDisabled;
+    const captureConfirming = terminalCaptureConfirm.has(t.id) && !captureDisabled;
     const stamp = terminalStamp(t);
     const sharedSwitch = terminalSwitch("Shared", shared, () => {
-      if (shared) terminalConfirm.delete(t.id);
+      if (shared) {
+        terminalConfirm.delete(t.id);
+        terminalCaptureConfirm.delete(t.id);
+      }
       postTerminal("/api/terminal_opt_in", { terminal_id: t.id, share_enabled: !shared }, onRefresh);
     });
     const allowSwitch = terminalSwitch("Agents may run commands", Boolean(t.allow_commands), () => {
@@ -1157,8 +1176,20 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
         rerenderTerminals();
       }
     }, allowDisabled);
-    const hookNote = isHook
+    const captureSwitch = isNativeHook ? terminalSwitch("Capture output", Boolean(t.capture_output), () => {
+      if (t.capture_output) {
+        postTerminal("/api/terminal_opt_in", { terminal_id: t.id, capture_output: false }, onRefresh);
+      } else if (!terminalCaptureConfirm.has(t.id)) {
+        terminalCaptureConfirm.add(t.id);
+        rerenderTerminals();
+      }
+    }, captureDisabled) : null;
+    const hookNote = isOtherHook
       ? h("div", { class: "row-sub" }, "Needs an editor terminal with the Subway extension.")
+      : null;
+    const appLabel = t.app === "terminal" ? "Terminal.app" : "iTerm2";
+    const macNote = isNativeHook
+      ? h("div", { class: "row-sub" }, `macOS will ask once to let Subway control ${appLabel}.`)
       : null;
     const confirm = confirming ? h("div", {
       class: "term-confirm", role: "group", "aria-label": `Allow commands in ${t.name || t.id}`,
@@ -1183,6 +1214,29 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
             },
           },
         }, "Cancel"))) : null;
+    const captureConfirm = captureConfirming ? h("div", {
+      class: "term-confirm", role: "group", "aria-label": `Capture output in ${t.name || t.id}`,
+    },
+      h("div", { class: "term-confirm-text" }, "Subway will read this terminal's text after each command (secrets are redacted). Allow?"),
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn primary", type: "button",
+          on: {
+            click: () => {
+              terminalCaptureConfirm.delete(t.id);
+              postTerminal("/api/terminal_opt_in", { terminal_id: t.id, capture_output: true }, onRefresh);
+            },
+          },
+        }, "Allow"),
+        h("button", {
+          class: "btn", type: "button",
+          on: {
+            click: () => {
+              terminalCaptureConfirm.delete(t.id);
+              rerenderTerminals();
+            },
+          },
+        }, "Cancel"))) : null;
     return h("div", { class: "row term-row" },
       h("div", {
         class: "term-main", tabindex: "0", role: "button",
@@ -1195,9 +1249,11 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
         h("div", { class: "row-sub" }, `${t.folder || "Unknown folder"}${stamp ? ` · ${stamp}` : ""}`),
         t.last_command ? h("div", { class: "row-sub mono" }, `$ ${t.last_command}`) : null),
       h("div", { class: "term-controls" },
-        h("div", { class: "term-switches" }, sharedSwitch, h("div", {}, allowSwitch, hookNote)),
+        h("div", { class: "term-switches" }, sharedSwitch, h("div", {}, allowSwitch, hookNote), captureSwitch ? h("div", {}, captureSwitch) : null),
+        macNote,
         h("div", { class: "tags" }, terminalRowTags(t)),
-        confirm));
+        confirm,
+        captureConfirm));
   });
   return [
     sharingCard,

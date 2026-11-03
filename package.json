@@ -35,6 +35,7 @@
     "bin",
     "server.py",
     "terminals.py",
+    "native_terminals.py",
     "install.py",
     "README.md",
     "AGENTS.md",
