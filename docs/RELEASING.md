@@ -39,4 +39,5 @@ Previews are numbered `BASE-rc.N`, for example `1.3.4-rc.1`, then `1.3.4-rc.2`. 
 ## If a run fails
 
 - **Failed before the npm publish**: nothing is public. Fix the problem and run the workflow again.
+- **You rejected a production run, or it failed after the draft was made**: delete the draft release (`gh release delete vX.Y.Z`) before running again, or the next run stops at "GitHub release already exists".
 - **npm publish succeeded but a GitHub step failed**: do not re-run the whole job, because it would try to publish again. Run the failed `gh` step by hand, using the command shown in the log. For production, the draft release stays a draft until that step runs.
