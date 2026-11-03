@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import contextlib
+import contextvars
 import datetime as _dt
 import glob
 import hashlib
@@ -65,6 +66,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import terminals
 import native_terminals
+import threads
 
 try:
     import fcntl
@@ -2931,6 +2933,8 @@ def t_send_note(to: str, text: str, from_chat: str = "", share_chat: str = "") -
     with _state_lock("inbox"):
         with open(inbox_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
+    _thread_record(_thread_root_for_caller(det_id if det is not None else sender), "note", sender, str(target["id"]),
+                   data={"text_head": str(text or "")[:200]})
     return (f"Transit dispatch queued for {target['source'].upper()} `{target['id'][:8]}` ({target.get('title')}). "
             f"Delivered when that session calls check_notes.")
 
@@ -6319,6 +6323,98 @@ def _inherit_from_parent(parent: Optional[Dict[str, Any]], requested_mode: str, 
     return requested_mode, selected_mode
 
 
+# --------------------------------------------------------------------------
+# Thread recording (roadmap item 7): every spawn, follow-up, reroute, approval,
+# permission, note, terminal run and finish appends one record to a thread log,
+# so the thread graph is built from the records, never guessed.
+# --------------------------------------------------------------------------
+
+_THREAD_PARENT: "contextvars.ContextVar[Optional[Tuple[str, str, Optional[Dict[str, Any]]]]]" = \
+    contextvars.ContextVar("subway_thread_parent", default=None)
+
+
+@contextlib.contextmanager
+def _thread_parent(parent_id: str, kind: str, data: Optional[Dict[str, Any]] = None) -> Iterator[None]:
+    """Mark the next t_spin_worker call in this scope as an edge from `parent_id` of the given kind."""
+    token = _THREAD_PARENT.set((parent_id, kind, data))
+    try:
+        yield
+    finally:
+        _THREAD_PARENT.reset(token)
+
+
+def _thread_record(thread_id: str, kind: str, node: str, peer: str = "", data: Optional[Dict[str, Any]] = None) -> None:
+    """Append one thread record with secrets redacted. Never breaks or changes the action it records."""
+    if not thread_id:
+        return
+    try:
+        def redact(value: Any, depth: int = 0) -> Any:
+            if depth > 8:
+                return value
+            if isinstance(value, str):
+                return terminals.redact_text(value)
+            if isinstance(value, dict):
+                return {k: redact(v, depth + 1) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [redact(v, depth + 1) for v in value]
+            return value
+        threads.record(SUBWAY_DIR, thread_id, kind, node, peer=peer, data=redact(data or {}))
+    except Exception:
+        pass
+
+
+def _thread_root(meta: Dict[str, Any], _depth: int = 0) -> str:
+    """The initiator this worker belongs to: its stored root, else the first parent's root, else itself."""
+    try:
+        if not isinstance(meta, dict):
+            return str(meta or "")
+        stored = str(meta.get("thread_root") or "")
+        if stored:
+            return stored
+        seen = {str(meta.get("id") or "")}
+        if _depth < 10:
+            for key in ("parent_id", "triggered_by", "rerouted_from"):
+                pid = str(meta.get(key) or "")
+                if pid and WORKER_ID_RE.match(pid) and pid not in seen:
+                    parent = _load_worker(pid)
+                    if parent:
+                        seen.add(pid)
+                        root = _thread_root(parent, _depth + 1)
+                        if root:
+                            return root
+        launched_by = str(meta.get("launched_by") or "")
+        if launched_by and launched_by != "hud" and not WORKER_ID_RE.match(launched_by):
+            return launched_by
+        return str(meta.get("id") or "")
+    except Exception:
+        return ""
+
+
+def _thread_root_for_caller(caller_id: str) -> str:
+    """A chat roots its own thread; a worker caller resolves to its thread's root."""
+    caller_id = str(caller_id or "")
+    if caller_id and WORKER_ID_RE.match(caller_id):
+        worker = _load_worker(caller_id)
+        if worker:
+            return _thread_root(worker)
+    return caller_id
+
+
+def _settings_snapshot(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """What a worker runs with, never its prompt or command (secrets and size stay out of the log)."""
+    snapshot: Dict[str, Any] = {}
+    for key in ("role", "provider", "model", "effort", "mode", "permission_mode", "capabilities",
+                "timeout_seconds", "isolate", "private", "priority", "track", "review", "project_dir", "swarm_id"):
+        if key in meta:
+            snapshot[key] = meta.get(key)
+    budget = meta.get("budget")
+    if isinstance(budget, dict):
+        snapshot["budget"] = {k: v for k, v in budget.items() if k != "preflight"}
+    snapshot["route"] = one_line(str(meta.get("route") or ""), 300)
+    snapshot["steps"] = len(meta.get("then") or [])
+    return snapshot
+
+
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
                   project_dir: str = "", timeout_seconds: int = DEFAULT_WORKER_TIMEOUT, effort: str = "auto",
                   mode: str = "standard", model: str = "", permission_mode: str = "",
@@ -6573,7 +6669,23 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         # The user approved the parent, so its sub-workers start without a second approval.
         meta["parent_id"] = lineage_parent["id"]
         meta["approved_by"] = f"lineage:{lineage_parent['id']}"
+    thread_override = _THREAD_PARENT.get()
+    thread_extra: Dict[str, Any] = {}
+    if thread_override:
+        thread_parent = _load_worker(thread_override[0]) or {"id": thread_override[0]}
+        meta["thread_root"] = _thread_root(thread_parent)
+        thread_kind, thread_from = thread_override[1], thread_override[0]
+        thread_extra = dict(thread_override[2] or {})
+    elif lineage_parent:
+        meta["thread_root"] = _thread_root(lineage_parent)
+        thread_kind, thread_from = "spawned", lineage_parent["id"]
+    else:
+        meta["thread_root"] = _thread_root_for_caller(meta["launched_by"]) or meta["id"]
+        thread_kind, thread_from = "spawned", meta["launched_by"] or "hud"
     _save_worker(meta)
+    _thread_record(meta["thread_root"], thread_kind, thread_from, worker_id, {
+        "settings": _settings_snapshot(meta), "prompt_head": prompt[:200],
+        "approved_by": meta.get("approved_by", ""), **thread_extra})
     if lineage_parent:
         launched = _launch_worker(worker_id)
         _broadcast_track_internal(f"{lineage_parent['id']} started sub-worker `{worker_id}` ({role}, "
@@ -7086,6 +7198,7 @@ def _launch_worker(worker_id: str) -> str:
     meta.update({"status": "running", "pid": proc.pid, "report": "",
                  "started_at": _dt.datetime.now().astimezone().isoformat()})
     _save_worker(meta)
+    _thread_record(meta.get("thread_root") or _thread_root(meta), "started", worker_id, data={"pid": proc.pid})
     _broadcast_track_internal(
         f"[WORKER APPROVED & LAUNCHED] Worker `{worker_id}` [{meta.get('provider', '').upper()}] "
         f"(PID {proc.pid}) started for role: '{meta.get('role')}'",
@@ -7380,6 +7493,8 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
            "tool": tool, "detail": detail, "rules": rules or [], "status": "pending",
            "launched_by": meta.get("launched_by"), "created_at": time.time()}
     _write_json_atomic(_perm_file(rid), rec)
+    _thread_record(meta.get("thread_root") or _thread_root_for_caller(meta["id"]), "permission_asked", meta["id"],
+                   data={"request_id": rid, "tool": tool, "detail": one_line(str(detail or ""), 300)})
     if denial:
         _answer_permission(rid, "deny", "Subway large-file read guard", denial_reason=denial)
         return rid
@@ -7434,6 +7549,9 @@ def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason:
         if denial_reason:
             rec["denial_reason"] = denial_reason
         _write_json_atomic(_perm_file(rid), rec)
+    _perm_node = str(rec.get("worker_id") or rec.get("launched_by") or "")
+    _thread_record(_thread_root_for_caller(_perm_node), "permission_answered", _perm_node, data={
+        "request_id": rid, "decision": decision, "answered_by": answered_by})
     _broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {one_line(rec['detail'], 160)} "
                               f"(by {answered_by})", track="main", station_id="guard")
     return f"[{decision.upper()}] `{rid}`: {rec['tool']}: {one_line(rec['detail'], 160)}"
@@ -7684,6 +7802,13 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
                                               get_protected_commands(), get_protected_exceptions())
     mode = get_terminal_mode(caller)
     must_ask = kind == "protected" or mode == "ask" or (mode == "auto_safe" and kind != "safe")
+    decision = ""
+
+    def _thread_terminal(answer: Any) -> None:
+        _thread_record(_thread_root_for_caller(caller), "terminal_run", caller, terminal_id, {
+            "command": one_line(str(command or ""), 300), "kind": kind, "mode": mode,
+            "asked": bool(must_ask), "answer": answer})
+
     if must_ask:
         meta = {"id": caller, "role": "chat", "provider": "terminal", "launched_by": caller, "permission_mode": "ask"}
         detail = f"{terminal_id}: {command}"
@@ -7692,6 +7817,7 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         rid = request_permission(meta, "run_terminal", detail)
         decision = await_permission(rid, wait=min(max(timeout_seconds, 0) + 60, PERMISSION_WAIT))
         if decision not in ("allow", "allow_always"):
+            _thread_terminal("deny")
             denied = f"[DENIED] run_terminal `{terminal_id}`: {command}"
             if kind == "protected":
                 denied += f" (protected: {reason})"
@@ -7720,6 +7846,7 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
             return f"[REFUSED] terminal `{terminal_id}` is not available or commands not allowed."
 
         typed_ts = time.time()
+        _thread_terminal(decision if must_ask else "")
         ok, err = native_terminals.type_command(app, tty, command)
         if not ok:
             if "macOS blocked Subway" in err:
@@ -7792,6 +7919,7 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         return f"[exit {code}]"
 
     run_id = f"run_{uuid.uuid4().hex[:8]}"
+    _thread_terminal(decision if must_ask else "")
     with _state_lock("terminals"):
         terminals.create_run_request(_terminals_dir(), run_id, terminal_id, command,
                                      timeout_seconds=timeout_seconds, caller_id=caller)
@@ -8400,10 +8528,11 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         if not step_max_tokens:
             step_max_tokens = 160000 if provider == "claude" else 80000
         try:
-            res = t_spin_worker(role=str(step["role"]), prompt=child_prompt, provider=provider, model=model,
-                                track=meta.get("track") or "main", project_dir=meta.get("project_dir") or "",
-                                max_tokens=step_max_tokens, isolate=True,
-                                then=json.dumps(step.get("then") or []))
+            with _thread_parent(worker_id, "followed", {"role": step.get("role"), "verdict": bool(step.get("verdict"))}):
+                res = t_spin_worker(role=str(step["role"]), prompt=child_prompt, provider=provider, model=model,
+                                    track=meta.get("track") or "main", project_dir=meta.get("project_dir") or "",
+                                    max_tokens=step_max_tokens, isolate=True,
+                                    then=json.dumps(step.get("then") or []))
         except Exception:
             continue
         if res.startswith("Error:"):
@@ -9084,7 +9213,8 @@ def _handle_worker_exhaustion_or_stall(
     spin_args.pop("provider", None)
     spin_args.pop("model", None)
     spin_args.update(provider=next_cand["provider"], model=next_cand["model"])
-    spin_res = t_spin_worker(**spin_args)
+    with _thread_parent(worker_id, "rerouted", {"condition": condition, "from_model": model, "to_model": next_cand["model"]}):
+        spin_res = t_spin_worker(**spin_args)
 
     m_wid = re.search(r"Worker `(worker_[0-9a-f]+)`", spin_res)
     if not m_wid:
@@ -9653,6 +9783,24 @@ def supervise_worker(worker_id: str) -> int:
     if result.get("status") == "completed":
         _clear_model_stall_cooldown(str(fresh.get("model_used") or fresh.get("model") or ""))
     _write_json_atomic(_exit_file(worker_id), result)
+    try:
+        finished_meta = fresh or meta
+        finished_at = _dt.datetime.now().astimezone()
+        duration_s = None
+        started_at = str(finished_meta.get("started_at") or "")
+        if started_at:
+            with contextlib.suppress(ValueError, TypeError):
+                duration_s = round((finished_at - _dt.datetime.fromisoformat(started_at)).total_seconds(), 1)
+        _thread_record(finished_meta.get("thread_root") or _thread_root(finished_meta), "finished", worker_id, data={
+            "status": result.get("status"), "exit_code": result.get("exit_code"),
+            "reason": one_line(str(result.get("reason") or ""), 300),
+            "rerouted_to": result.get("rerouted_to"),
+            "usage": dict(finished_meta.get("usage") or {}),
+            "model_used": finished_meta.get("model_used"),
+            "created_at": finished_meta.get("created_at"),
+            "completed_at": finished_at.isoformat(), "duration_s": duration_s})
+    except Exception:
+        pass
     _update_worker_status(_load_worker(worker_id) or meta)
     with contextlib.suppress(Exception):
         _run_triggers(worker_id, result)
@@ -9694,7 +9842,11 @@ def t_spin_batch(role: str, prompt: str, input_glob: str, output_file: str, mode
         "progress": {"files_done": 0, "files_total": len(files), "chunks_done": 0, "failed": 0},
         "merge_prompt": merge_prompt,
     }
+    meta["thread_root"] = _thread_root_for_caller(meta["launched_by"]) or meta["id"]
     _save_worker(meta)
+    _thread_record(meta["thread_root"], "spawned", meta["launched_by"] or "hud", worker_id, {
+        "settings": _settings_snapshot(meta), "prompt_head": str(prompt or "")[:200],
+        "approved_by": meta.get("approved_by", "")})
     _broadcast_track_internal(f"[PENDING APPROVAL] Batch `{worker_id}` queued ({role}, {len(files)} files, model {chosen}).", track=track, station_id="guard")
     return (f"[APPROVAL REQUIRED] Batch `{worker_id}` is queued in PENDING APPROVAL state.\n"
             f"- Files: {len(files)}\n- Model: **{chosen}** ({msg})\n- Results: `{out_path}`\n\n"
@@ -10288,6 +10440,8 @@ def t_approve_worker(worker_id: str, approval_code: str = "") -> str:
     if not hmac.compare_digest((approval_code or "").strip().upper(), globals()["approval_code"](worker_id)):
         return (f"[APPROVAL REFUSED] Worker `{worker_id}` needs the approval code shown to your user in the "
                 f"Live HUD or by `subway-context workers`. Ask them for it, or ask them to approve it there.")
+    _thread_record(_thread_root(_load_worker(worker_id) or {"id": worker_id}), "approved", worker_id,
+                   data={"by": "approval code"})
     return _launch_worker(worker_id)
 
 
@@ -10303,6 +10457,8 @@ def t_stop_worker(worker_id: str, reason: str = "") -> str:
         meta["status"] = "stopping"
         meta["stop_reason"] = reason or "Stopped on request"
         _save_worker(meta)
+    _thread_record(meta.get("thread_root") or _thread_root(meta), "stopped", worker_id,
+                   data={"reason": meta["stop_reason"]})
     with contextlib.suppress(OSError):
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/PID", str(meta["pid"]), "/T", "/F"],
@@ -10329,6 +10485,8 @@ def t_reject_worker(worker_id: str, reason: str = "") -> str:
         meta["status"] = "rejected"
         meta["rejection_reason"] = reason or "Cancelled by user"
         _save_worker(meta)
+    _thread_record(meta.get("thread_root") or _thread_root(meta), "rejected", worker_id,
+                   data={"reason": meta["rejection_reason"]})
     _broadcast_track_internal(f"[WORKER REJECTED] Worker `{worker_id}` rejected. Reason: {meta['rejection_reason']}",
                               track=meta.get("track", "main"), station_id="guard")
     return f"[REJECTED] Worker `{worker_id}` was rejected and cancelled."
@@ -10550,6 +10708,9 @@ def t_escalate_worker(worker_id: str, new_effort: str = "max", new_mode: str = "
         current["escalated_from"] = {"effort": prev_effort, "mode": prev_mode, "reason": reason}
         current["escalated_to"] = {"effort": new_effort, "mode": new_mode}
         _save_worker(current)
+    _thread_record(current.get("thread_root") or _thread_root(current), "escalated", worker_id, data={
+        "from": {"effort": prev_effort, "mode": prev_mode}, "to": {"effort": new_effort, "mode": new_mode},
+        "reason": reason})
 
     esc_msg = f"[ESCALATE_COMPLEXITY] Worker `{worker_id}` ({role}) escalated from {prev_effort}/{prev_mode} to {new_effort}/{new_mode}."
     if reason:
@@ -12992,6 +13153,21 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(get_hud_data(project=query.get("project", [""])[0]))
             return
 
+        if path == "/api/thread_log":
+            self.send_json({"threads": threads.list_threads(SUBWAY_DIR)})
+            return
+
+        if path == "/api/thread_log_read":
+            thread_wanted = query.get("id", [""])[0]
+            if not thread_wanted:
+                self._deny(400, "Missing thread id")
+                return
+            try:
+                self.send_json(threads.read_thread(SUBWAY_DIR, thread_wanted))
+            except (ValueError, OSError):
+                self.send_json({"thread": thread_wanted, "records": [], "nodes": {}, "edges": []})
+            return
+
         if path in ("/api/chats", "/api/threads"):
             source = query.get("source", ["all"])[0]
             include_subagents = query.get("include_subagents", ["false"])[0].lower() in ("1", "true", "yes", "on")
@@ -13148,7 +13324,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 decisions=[str(d) for d in payload.get("decisions") or []],
                 station_id="user (HUD)")
         elif path == "/api/approve_worker":
-            res = _launch_worker(str(payload.get("id", "")))  # The HUD token proves this is the user.
+            approve_id = str(payload.get("id", ""))
+            if WORKER_ID_RE.match(approve_id):
+                _thread_record(_thread_root(_load_worker(approve_id) or {"id": approve_id}), "approved", approve_id,
+                               data={"by": "hud"})
+            res = _launch_worker(approve_id)  # The HUD token proves this is the user.
         elif path == "/api/reject_worker":
             res = t_reject_worker(worker_id=str(payload.get("id", "")), reason=str(payload.get("reason", "")))
         elif path == "/api/stop_worker":
