@@ -1049,7 +1049,7 @@ export function threadsPage(d, chats, onRefresh, error = "") {
 }
 
 /* Terminals */
-export const terminalsState = { rows: [], loadedAt: 0, loading: false, error: "" };
+export const terminalsState = { rows: [], sharing: false, loadedAt: 0, loading: false, error: "" };
 
 function terminalRowTags(t) {
   const tags = [];
@@ -1097,29 +1097,118 @@ async function openTerminalDetail(t) {
   }
 }
 
-export function terminalsPage(d, rows, onRefresh, error = "", loading = false, stale = false) {
+const terminalConfirm = new Set();
+
+/* Switches are real buttons, so keyboard and screen readers get the same control as touch. */
+function terminalSwitch(label, checked, onToggle, disabled = false) {
+  const btn = h("button", {
+    class: "tgl", type: "button", role: "switch",
+    "aria-checked": String(!!checked), "aria-label": label,
+    disabled: disabled || undefined,
+    on: { click: () => { if (!disabled) onToggle(); } },
+  }, h("span", { class: "tgl-track", "aria-hidden": "true" }, h("span", { class: "tgl-knob" })));
+  return h("div", { class: `tgl-field${disabled ? " disabled" : ""}` }, h("span", { class: "tgl-label" }, label), btn);
+}
+
+function postTerminal(path, body, onRefresh) {
+  return act(path, body).finally(() => onRefresh());
+}
+
+function rerenderTerminals() {
+  document.dispatchEvent(new Event("subway:rerender"));
+}
+
+function terminalStamp(t) {
+  const at = t.updated_at || t.last_ts;
+  return at ? new Date(at * 1000).toLocaleString() : "";
+}
+
+export function terminalsPage(d, rows, onRefresh, error = "", loading = false, stale = false, sharing = false) {
   const list = rows || [];
-  const bodyRows = list.map((t) => h("div", {
-    class: "row", tabindex: "0", role: "button",
-    on: {
-      click: () => openTerminalDetail(t),
-      keydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openTerminalDetail(t); } },
-    },
-  },
-    h("div", {},
-      h("b", {}, t.name || t.id),
-      h("div", { class: "row-sub" }, `${t.folder || "Unknown folder"}${t.last_ts ? ` · ${new Date(t.last_ts * 1000).toLocaleString()}` : ""}`),
-      t.last_command ? h("div", { class: "row-sub mono" }, `$ ${t.last_command}`) : null),
-    h("div", { class: "tags" }, terminalRowTags(t))));
-  return h("section", { class: "card" },
+  const masterOn = Boolean(sharing);
+  const sharingCard = h("section", { class: "card", "aria-labelledby": "terminal-sharing-title" },
     h("div", { class: "card-head" },
-      h("div", {}, h("h2", { class: "card-title" }, "Terminals"),
-        stale && !error ? h("span", { class: "tag" }, "stale") : null,
-        h("div", { class: "card-sub" }, "Commands run in terminals your user has shared. Nothing is captured until they opt in.")),
-      h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
-    error ? h("div", { class: "err" }, `Could not refresh terminals: ${error}`) : null,
-    h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" },
-      loading ? "Loading…" : "No terminals have been shared yet.")));
+      h("div", {},
+        h("h2", { class: "card-title", id: "terminal-sharing-title" }, "Terminal sharing"),
+        h("div", { class: "card-sub" }, masterOn
+          ? "On. Agents can read terminals you share below."
+          : "Off. Agents can't see or use any terminal.")),
+      terminalSwitch("Terminal sharing", masterOn, () => {
+        if (masterOn) terminalConfirm.clear();
+        postTerminal("/api/terminal_sharing", { enabled: !masterOn }, onRefresh);
+      })));
+  const bodyRows = list.map((t) => {
+    const shared = Boolean(t.share_enabled);
+    const allowDisabled = !masterOn || !shared;
+    const confirming = terminalConfirm.has(t.id) && !allowDisabled;
+    const stamp = terminalStamp(t);
+    const sharedSwitch = terminalSwitch("Shared", shared, () => {
+      if (shared) terminalConfirm.delete(t.id);
+      postTerminal("/api/terminal_opt_in", { terminal_id: t.id, share_enabled: !shared }, onRefresh);
+    });
+    const allowSwitch = terminalSwitch("Agents may run commands", Boolean(t.allow_commands), () => {
+      if (t.allow_commands) {
+        postTerminal("/api/terminal_opt_in", { terminal_id: t.id, allow_commands: false }, onRefresh);
+      } else if (!terminalConfirm.has(t.id)) {
+        terminalConfirm.add(t.id);
+        rerenderTerminals();
+      }
+    }, allowDisabled);
+    const confirm = confirming ? h("div", {
+      class: "term-confirm", role: "group", "aria-label": `Allow commands in ${t.name || t.id}`,
+    },
+      h("div", { class: "term-confirm-text" }, `Agents will be able to run commands in ${t.name || t.id}. Allow?`),
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn primary", type: "button",
+          on: {
+            click: () => {
+              terminalConfirm.delete(t.id);
+              postTerminal("/api/terminal_opt_in", { terminal_id: t.id, allow_commands: true }, onRefresh);
+            },
+          },
+        }, "Allow"),
+        h("button", {
+          class: "btn", type: "button",
+          on: {
+            click: () => {
+              terminalConfirm.delete(t.id);
+              rerenderTerminals();
+            },
+          },
+        }, "Cancel"))) : null;
+    return h("div", { class: "row term-row" },
+      h("div", {
+        class: "term-main", tabindex: "0", role: "button",
+        on: {
+          click: () => openTerminalDetail(t),
+          keydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openTerminalDetail(t); } },
+        },
+      },
+        h("b", {}, t.name || t.id),
+        h("div", { class: "row-sub" }, `${t.folder || "Unknown folder"}${stamp ? ` · ${stamp}` : ""}`),
+        t.last_command ? h("div", { class: "row-sub mono" }, `$ ${t.last_command}`) : null),
+      h("div", { class: "term-controls" },
+        h("div", { class: "term-switches" }, sharedSwitch, allowSwitch),
+        h("div", { class: "tags" }, terminalRowTags(t)),
+        confirm));
+  });
+  return [
+    sharingCard,
+    h("section", { class: "card" },
+      h("div", { class: "card-head" },
+        h("div", {}, h("h2", { class: "card-title" }, "Terminals"),
+          stale && !error ? h("span", { class: "tag" }, "stale") : null,
+          h("div", { class: "card-sub" }, "Commands run in terminals your user has shared. Nothing is captured until they opt in.")),
+        h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
+      error ? h("div", { class: "err" }, `Could not refresh terminals: ${error}`) : null,
+      h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" },
+        loading ? "Loading…" : h("div", { class: "term-empty" },
+          h("p", {}, "No terminals have been shared yet."),
+          h("p", {}, "To start sharing, either:"),
+          h("code", { class: "term-hint" }, "VS Code: run 'Subway: Share Terminal' in a terminal"),
+          h("code", { class: "term-hint" }, "Shell: python3 server.py terminal hook install, then open a new terminal"))))),
+  ];
 }
 
 /* Ledger */
