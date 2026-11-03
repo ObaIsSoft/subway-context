@@ -2,17 +2,34 @@ import os as _sandbox_os, sys as _sandbox_sys
 _sandbox_sys.path.insert(0, _sandbox_os.path.dirname(_sandbox_os.path.abspath(__file__)))
 import _sandbox  # noqa: E402,F401
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 import server
 import terminals
+
+
+class _FakeHttpResponse:
+    def __init__(self, data):
+        self._data = json.dumps(data).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._data
 
 
 class TerminalsStoreTests(unittest.TestCase):
@@ -102,6 +119,14 @@ class TerminalsStoreTests(unittest.TestCase):
         rec2 = terminals.set_terminal_opt_in(self.base_dir, "t1", allow_commands=True)
         self.assertTrue(rec2["share_enabled"])  # preserved
         self.assertTrue(rec2["allow_commands"])
+
+    def test_terminal_source_resolution(self):
+        self.assertEqual(terminals.terminal_source({"id": "shell-1", "source": "editor"}), "editor")
+        self.assertEqual(terminals.terminal_source({"id": "t1", "source": "hook"}), "hook")
+        self.assertEqual(terminals.terminal_source({"id": "shell-1"}), "hook")
+        self.assertEqual(terminals.terminal_source({"id": "t1"}), "editor")
+        self.assertEqual(terminals.terminal_source({"id": "shell-1", "source": "bogus"}), "hook")
+        self.assertEqual(terminals.terminal_source(None), "editor")
 
     def test_is_safe_command_matching(self):
         safe = ["ls", "git status"]
@@ -471,6 +496,21 @@ class TerminalSharingTests(unittest.TestCase):
         res = server.t_run_terminal("t1", "echo hi")
         self.assertIn("terminal sharing is off", res)
 
+    def test_run_terminal_refuses_shell_hook_without_permission_or_run_request(self):
+        server.set_terminal_sharing(True)
+        with server._state_lock("terminals"):
+            terminals.set_terminal_opt_in(server._terminals_dir(), "shell-123-456",
+                                           allow_commands=True, shell_integration=True)
+        with mock.patch.object(server, "request_permission") as perm, \
+             mock.patch.object(terminals, "create_run_request") as run:
+            res = server.t_run_terminal("shell-123-456", "echo hi", timeout_seconds=1)
+        self.assertIn("[REFUSED]", res)
+        self.assertIn("shell-hook terminal", res)
+        self.assertIn("Run commands in an editor terminal with the Subway extension.", res)
+        perm.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(server._pending_permissions(), [])
+
 
 class TerminalHookTests(unittest.TestCase):
     """Exercises hook install, uninstall, status and script in terminals.py."""
@@ -492,6 +532,107 @@ class TerminalHookTests(unittest.TestCase):
         server.TRACKS_DIR = self.orig_tracks_dir
         self.env_patcher.stop()
         shutil.rmtree(self.temp_home, ignore_errors=True)
+
+    def _run_hook(self, args, handler):
+        calls = []
+
+        def fake_urlopen(req, timeout=1):
+            path = req.full_url.split("127.0.0.1:7890", 1)[-1]
+            body = json.loads(req.data.decode("utf-8")) if req.data else None
+            calls.append((req.get_method(), path, body))
+            return handler(req.get_method(), path, body)
+
+        base = os.path.join(self.temp_home, ".subway-context")
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, "hud.json"), "w", encoding="utf-8") as f:
+            json.dump({"port": 7890}, f)
+        with open(os.path.join(base, "hud_token"), "w", encoding="utf-8") as f:
+            f.write("test-token")
+        ns = {"__name__": "subway_hook_test"}
+        exec(compile(terminals._HOOK_SCRIPT, "terminal_hook.py", "exec"), ns)
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(sys, "argv", ["terminal_hook.py"] + args):
+            ns["main"]()
+        return calls
+
+    def test_hook_event_optin_retries_once_for_unknown_terminal(self):
+        state = {"events": 0}
+
+        def handler(method, path, body):
+            if method == "GET" and path == "/api/terminals":
+                return _FakeHttpResponse({"sharing": True, "terminals": []})
+            if method == "POST" and path == "/api/terminal_event":
+                state["events"] += 1
+                if state["events"] == 1:
+                    err = urllib.error.HTTPError("http://127.0.0.1:7890/api/terminal_event",
+                                                 403, "Forbidden", {}, None)
+                    err.close()
+                    raise err
+                return _FakeHttpResponse({"ok": True})
+            if method == "POST" and path == "/api/terminal_opt_in":
+                return _FakeHttpResponse({"ok": True})
+            raise AssertionError((method, path))
+
+        calls = self._run_hook(
+            ["event", "tid-1", "ls", "0", "100.0", "101.5", self.temp_home], handler)
+        optins = [c for c in calls if c[1] == "/api/terminal_opt_in"]
+        events = [c for c in calls if c[1] == "/api/terminal_event"]
+        self.assertEqual(len(optins), 1)
+        self.assertEqual(len(events), 2)
+
+    def test_hook_event_does_not_reoptin_known_terminal_with_sharing_off(self):
+        def handler(method, path, body):
+            if method == "GET" and path == "/api/terminals":
+                return _FakeHttpResponse({"sharing": True, "terminals": [{"id": "tid-1"}]})
+            if method == "POST" and path == "/api/terminal_event":
+                err = urllib.error.HTTPError("http://127.0.0.1:7890/api/terminal_event",
+                                             403, "Forbidden", {}, None)
+                err.close()
+                raise err
+            raise AssertionError((method, path))
+
+        calls = self._run_hook(
+            ["event", "tid-1", "ls", "0", "100.0", "101.5", self.temp_home], handler)
+        optins = [c for c in calls if c[1] == "/api/terminal_opt_in"]
+        events = [c for c in calls if c[1] == "/api/terminal_event"]
+        self.assertEqual(optins, [])
+        self.assertEqual(len(events), 1)
+
+    def test_hook_event_tolerates_missing_nanoseconds_and_bad_start(self):
+        captured = {}
+
+        def handler(method, path, body):
+            if method == "GET" and path == "/api/terminals":
+                return _FakeHttpResponse({"sharing": True, "terminals": []})
+            if method == "POST" and path == "/api/terminal_event":
+                captured.update(body)
+                return _FakeHttpResponse({"ok": True})
+            raise AssertionError((method, path))
+
+        before = time.time()
+        self._run_hook(
+            ["event", "tid-1", "ls", "0", "bad", "1793694932.N", self.temp_home], handler)
+        after = time.time()
+        self.assertIsInstance(captured["end_ts"], float)
+        self.assertGreaterEqual(captured["end_ts"], before)
+        self.assertLessEqual(captured["end_ts"], after)
+        self.assertEqual(captured["start_ts"], captured["end_ts"])
+
+    def test_hook_optin_body_marks_source_and_sends_no_allow_commands(self):
+        captured = {}
+
+        def handler(method, path, body):
+            if method == "GET" and path == "/api/terminals":
+                return _FakeHttpResponse({"sharing": True, "terminals": []})
+            if method == "POST" and path == "/api/terminal_opt_in":
+                captured.update(body)
+                return _FakeHttpResponse({"ok": True})
+            raise AssertionError((method, path))
+
+        self._run_hook(["optin", "tid-1", self.temp_home], handler)
+        self.assertEqual(captured.get("source"), "hook")
+        self.assertTrue(captured.get("shell_integration"))
+        self.assertNotIn("allow_commands", captured)
 
     def test_install_fresh_rc(self):
         # Bash on fresh home

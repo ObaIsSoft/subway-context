@@ -7546,6 +7546,10 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         return f"Error: terminal `{terminal_id}` not found."
     if term.get("closed"):
         return f"[REFUSED] terminal `{terminal_id}` is closed."
+    if terminals.terminal_source(term) == "hook":
+        return (f"[REFUSED] terminal `{terminal_id}` is a shell-hook terminal: Subway sees its commands "
+                "and exit codes but can't run commands in it. Run commands in an editor terminal with "
+                "the Subway extension.")
     if term.get("shell_integration") is False:
         return f"[REFUSED] terminal `{terminal_id}` has no shell integration; run_terminal needs it."
     if not term.get("allow_commands"):
@@ -13044,12 +13048,16 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if not tid:
                 self._deny(400, "missing terminal_id")
                 return
+            source = str(payload.get("source", ""))
+            if source not in ("hook", "editor"):
+                source = ""
             with _state_lock("terminals"):
                 rec = terminals.set_terminal_opt_in(
                     _terminals_dir(), tid, name=str(payload.get("name", "")),
                     window_id=str(payload.get("window_id", "")), folder=str(payload.get("folder", "")),
                     share_enabled=payload.get("share_enabled"), allow_commands=payload.get("allow_commands"),
-                    shell_integration=payload.get("shell_integration"), closed=payload.get("closed"))
+                    shell_integration=payload.get("shell_integration"), closed=payload.get("closed"),
+                    source=source)
             res = {"ok": True, "terminal": rec}
         elif path == "/api/terminal_event":
             if not terminal_sharing_enabled():

@@ -95,7 +95,8 @@ def get_terminal(base_dir: str, terminal_id: str) -> Optional[Dict[str, Any]]:
 def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_id: str = "",
                         folder: str = "", share_enabled: Optional[bool] = None,
                         allow_commands: Optional[bool] = None,
-                        shell_integration: Optional[bool] = None, closed: Optional[bool] = None) -> Dict[str, Any]:
+                        shell_integration: Optional[bool] = None, closed: Optional[bool] = None,
+                        source: str = "") -> Dict[str, Any]:
     """Register or update a terminal's identity and opt-in flags. Missing fields keep their old value."""
     os.makedirs(base_dir, exist_ok=True)
     path = _terminal_path(base_dir, terminal_id)
@@ -117,6 +118,8 @@ def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_
         rec["shell_integration"] = bool(shell_integration)
     if closed is not None:
         rec["closed"] = bool(closed)
+    if source:
+        rec["source"] = source
     rec["updated_at"] = time.time()
     rec.setdefault("created_at", rec["updated_at"])
     _write_json_atomic(path, rec)
@@ -167,6 +170,14 @@ def record_command(base_dir: str, terminal_id: str, command: str, exit_code: Opt
     return entry
 
 
+def terminal_source(rec: Dict[str, Any]) -> str:
+    """'hook' for shell-hook terminals, 'editor' for extension-backed ones."""
+    source = (rec or {}).get("source")
+    if source in ("hook", "editor"):
+        return source
+    return "hook" if str((rec or {}).get("id") or "").startswith("shell-") else "editor"
+
+
 def list_terminals(base_dir: str) -> List[Dict[str, Any]]:
     """Summaries of every known terminal: name, folder, last command, failure count."""
     out: List[Dict[str, Any]] = []
@@ -185,6 +196,7 @@ def list_terminals(base_dir: str) -> List[Dict[str, Any]]:
                 "folder": rec.get("folder") or "", "window_id": rec.get("window_id") or "",
                 "share_enabled": bool(rec.get("share_enabled")), "allow_commands": bool(rec.get("allow_commands")),
                 "shell_integration": rec.get("shell_integration"), "closed": bool(rec.get("closed")),
+                "source": terminal_source(rec),
                 "last_command": last.get("command") if last else "",
                 "last_exit_code": last.get("exit_code") if last else None,
                 "last_ts": (last.get("ts") if last else None) or rec.get("updated_at") or 0,
@@ -349,7 +361,7 @@ def _hook_shell_and_rc(shell: str):
 
 
 _HOOK_SCRIPT = '''#!/usr/bin/env python3
-import sys, os, json, urllib.request
+import sys, os, json, time, urllib.request, urllib.error
 
 def _hud():
     base = os.path.join(os.path.expanduser("~"), ".subway-context")
@@ -392,8 +404,41 @@ def _post(port, token, path, body):
         )
         with urllib.request.urlopen(req, timeout=1) as resp:
             resp.read()
+        return 200
+    except urllib.error.HTTPError as e:
+        return e.code
     except Exception:
-        pass
+        return 0
+
+def _optin(port, token, tid, folder):
+    name = _term_name(folder)
+    _post(port, token, "/api/terminal_opt_in", {
+        "terminal_id": tid, "name": name, "window_id": "",
+        "folder": folder, "share_enabled": True,
+        "shell_integration": True, "source": "hook",
+    })
+
+def _ts(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def _known(port, token, tid):
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%s/api/terminals" % port,
+            headers={"X-Subway-Token": token},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for row in data.get("terminals") or []:
+            if row.get("id") == tid:
+                return True
+        return False
+    except Exception:
+        return None
 
 def _term_name(folder):
     shell = os.path.basename(os.environ.get("SHELL", "shell")) or "shell"
@@ -412,22 +457,26 @@ def main():
         if not _is_sharing(port, token):
             return
         if kind == "optin" and len(args) >= 3:
-            tid, folder = args[1], args[2]
-            name = _term_name(folder)
-            _post(port, token, "/api/terminal_opt_in", {
-                "terminal_id": tid, "name": name, "window_id": "",
-                "folder": folder, "share_enabled": True,
-                "shell_integration": True,
-            })
+            _optin(port, token, args[1], args[2])
         elif kind == "event" and len(args) >= 6:
             tid, command, code, start, end, folder = args[1:7]
             name = _term_name(folder)
-            _post(port, token, "/api/terminal_event", {
+            end_ts = _ts(end)
+            if end_ts is None:
+                end_ts = time.time()
+            start_ts = _ts(start)
+            if start_ts is None:
+                start_ts = end_ts
+            body = {
                 "terminal_id": tid, "command": command,
                 "exit_code": (int(code) if code not in ("", "None") else None),
-                "start_ts": float(start), "end_ts": float(end), "output": "",
+                "start_ts": start_ts, "end_ts": end_ts, "output": "",
                 "caller_id": "shell", "name": name, "window_id": "", "folder": folder,
-            })
+            }
+            status = _post(port, token, "/api/terminal_event", body)
+            if status == 403 and _known(port, token, tid) is False:
+                _optin(port, token, tid, folder)
+                _post(port, token, "/api/terminal_event", body)
     except Exception:
         pass
 

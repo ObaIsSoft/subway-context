@@ -1054,6 +1054,7 @@ export const terminalsState = { rows: [], sharing: false, loadedAt: 0, loading: 
 function terminalRowTags(t) {
   const tags = [];
   if (t.closed) tags.push(h("span", { class: "tag bad" }, "closed"));
+  if (t.source === "hook") tags.push(h("span", { class: "tag" }, "shell hook: commands and exit codes, no output"));
   if (t.shell_integration === false) tags.push(h("span", { class: "tag" }, "no shell integration"));
   if (t.allow_commands) tags.push(h("span", { class: "tag" }, "commands allowed"));
   if (t.failures) tags.push(h("span", { class: "tag bad" }, `${t.failures} failing`));
@@ -1104,6 +1105,7 @@ function terminalSwitch(label, checked, onToggle, disabled = false) {
   const btn = h("button", {
     class: "tgl", type: "button", role: "switch",
     "aria-checked": String(!!checked), "aria-label": label,
+    "aria-disabled": disabled ? "true" : undefined,
     disabled: disabled || undefined,
     on: { click: () => { if (!disabled) onToggle(); } },
   }, h("span", { class: "tgl-track", "aria-hidden": "true" }, h("span", { class: "tgl-knob" })));
@@ -1139,7 +1141,8 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
       })));
   const bodyRows = list.map((t) => {
     const shared = Boolean(t.share_enabled);
-    const allowDisabled = !masterOn || !shared;
+    const isHook = t.source === "hook";
+    const allowDisabled = !masterOn || !shared || isHook;
     const confirming = terminalConfirm.has(t.id) && !allowDisabled;
     const stamp = terminalStamp(t);
     const sharedSwitch = terminalSwitch("Shared", shared, () => {
@@ -1154,6 +1157,9 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
         rerenderTerminals();
       }
     }, allowDisabled);
+    const hookNote = isHook
+      ? h("div", { class: "row-sub" }, "Needs an editor terminal with the Subway extension.")
+      : null;
     const confirm = confirming ? h("div", {
       class: "term-confirm", role: "group", "aria-label": `Allow commands in ${t.name || t.id}`,
     },
@@ -1189,7 +1195,7 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
         h("div", { class: "row-sub" }, `${t.folder || "Unknown folder"}${stamp ? ` · ${stamp}` : ""}`),
         t.last_command ? h("div", { class: "row-sub mono" }, `$ ${t.last_command}`) : null),
       h("div", { class: "term-controls" },
-        h("div", { class: "term-switches" }, sharedSwitch, allowSwitch),
+        h("div", { class: "term-switches" }, sharedSwitch, h("div", {}, allowSwitch, hookNote)),
         h("div", { class: "tags" }, terminalRowTags(t)),
         confirm));
   });
