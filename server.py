@@ -10837,6 +10837,42 @@ def local_profile(total: int) -> Dict[str, Any]:
 
 
 _ollama_caps: Dict[str, List[str]] = {}
+# Model details from the same /api/show reply, keyed by digest so one call fills both.
+_ollama_details: Dict[str, Dict[str, Any]] = {}
+
+# Bits per weight for Ollama's quantization labels. A derived model (a new window over a parent) uses its
+# parent's measured size, since one dictionary guess missed a 3.5 GB model by three times.
+_BPW = {"Q4_0": 4.5, "Q4_K_M": 4.8, "Q4_K_S": 4.6, "Q5_K_M": 5.7, "Q6_K": 6.6, "Q8_0": 8.5, "F16": 16, "BF16": 16}
+
+
+def _estimate_local_model_bytes(name: str, details: Optional[Dict[str, Any]], measured: Dict[str, int],
+                                disk: int = 0) -> int:
+    """Bytes a local model will need: measured, else its parent's measured size, else params x precision, else disk x 1.2."""
+    exact = measured.get(name)
+    if exact:
+        return int(exact)
+    details = details or {}
+    parent = str(details.get("parent_model") or "")
+    if parent and measured.get(parent):
+        return int(measured[parent] * 1.15)
+    params = str(details.get("parameter_size") or "").strip().upper()
+    quant = str(details.get("quantization_level") or "").strip().upper()
+    mult = {"B": 1e9, "M": 1e6}.get(params[-1:], 0) if params else 0
+    try:
+        count = float(params[:-1]) * mult
+    except ValueError:
+        count = 0
+    if count and quant:
+        if quant in _BPW:
+            bpw = _BPW[quant]
+        elif quant.startswith("Q4"):
+            bpw = 4.8
+        elif quant.startswith("Q5"):
+            bpw = 5.7
+        else:
+            bpw = 8.5
+        return int(count * bpw / 8 + 0.5 * GB)
+    return int(disk * 1.2 + 0.3 * GB)
 
 
 def _fetch_local() -> Dict[str, Any]:
@@ -10862,10 +10898,14 @@ def _fetch_local() -> Dict[str, Any]:
         key = m.get("digest") or m["name"]
         if key not in _ollama_caps:
             with contextlib.suppress(OSError, ValueError):
-                _ollama_caps[key] = _ollama("/api/show", {"model": m["name"]}).get("capabilities") or []
+                shown = _ollama("/api/show", {"model": m["name"]})
+                _ollama_caps[key] = shown.get("capabilities") or []
+                _ollama_details[key] = shown.get("details") or {}
         name = m["name"]
         exact = measured.get(name)
-        models.append({"name": name, "disk": int(m.get("size") or 0), "needs": exact or int(m.get("size", 0) * 1.2 + 0.3 * GB),
+        disk = int(m.get("size") or 0)
+        models.append({"name": name, "disk": disk,
+                       "needs": _estimate_local_model_bytes(name, _ollama_details.get(key), measured, disk),
                        "measured": bool(exact), "capabilities": _ollama_caps.get(key, []),
                        "details": {k: (m.get("details") or {}).get(k) for k in ("family", "parameter_size", "quantization_level")}})
     data["models"] = models
