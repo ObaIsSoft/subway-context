@@ -37,6 +37,100 @@ export function modeControl(settings) {
     current === "auto_approve" ? h("div", { class: "err" }, "Workers will not ask before running commands.") : null);
 }
 
+/* ---- Terminal commands: a mode of its own, plus the protected list ---- */
+export function terminalCommandsCard(settings) {
+  const s = settings || {};
+  const modes = s.permission_modes || {
+    ask: "Approve everything",
+    auto_safe: "Auto-approve safe commands",
+    auto_approve: "Auto-approve everything",
+  };
+  const current = s.terminal_mode || "ask";
+  const protectedCommands = Array.isArray(s.protected_commands) ? s.protected_commands : [];
+  const exceptions = Array.isArray(s.protected_exceptions) ? s.protected_exceptions : [];
+  const post = (body) => act("/api/settings", body);
+
+  const listEditor = (title, hint, key, items) => {
+    const input = h("input", {
+      type: "text",
+      value: "",
+      placeholder: "e.g. npm publish",
+      "aria-label": `Add an entry to ${title}`,
+    });
+    const add = () => {
+      const value = input.value.trim();
+      if (!value) return;
+      if (items.includes(value)) {
+        input.value = "";
+        return;
+      }
+      post({ [key]: [...items, value] });
+    };
+    const chips = items.length
+      ? h("div", { class: "btns" }, items.map((item) => h("span", { class: "tag" }, item,
+          h("button", {
+            class: "btn",
+            type: "button",
+            "aria-label": `Remove ${item}`,
+            on: { click: () => post({ [key]: items.filter((value) => value !== item) }) },
+          }, "×"))))
+      : h("div", { class: "row-sub" }, "None.");
+    return h("div", { class: "field full" },
+      h("div", { class: "label" }, title),
+      h("div", { class: "row-sub" }, hint),
+      chips,
+      h("div", { class: "btns" },
+        h("div", { class: "field", style: "flex: 1 1 220px;" }, input),
+        h("button", { class: "btn", type: "button", on: { click: add } }, "Add")));
+  };
+
+  let confirming = false;
+  const resetArea = h("div", { class: "btns" });
+  const renderReset = () => {
+    resetArea.replaceChildren();
+    if (!confirming) {
+      resetArea.append(h("button", {
+        class: "btn",
+        type: "button",
+        on: { click: () => { confirming = true; renderReset(); } },
+      }, "Reset to defaults"));
+      return;
+    }
+    resetArea.append(
+      h("div", { class: "row-sub", role: "status" }, "Reset both lists to the defaults?"),
+      h("button", {
+        class: "btn primary",
+        type: "button",
+        on: { click: () => { confirming = false; post({ protected_reset: true }); renderReset(); } },
+      }, "Reset"),
+      h("button", {
+        class: "btn",
+        type: "button",
+        on: { click: () => { confirming = false; renderReset(); } },
+      }, "Cancel"));
+  };
+  renderReset();
+
+  return h("section", { class: "card", "aria-labelledby": "terminal-mode-title" },
+    h("div", { class: "card-head" },
+      h("div", {},
+        h("h2", { class: "card-title", id: "terminal-mode-title" }, "Terminal commands"),
+        h("div", { class: "card-sub" }, "Separate from worker permissions. Protected commands below always ask."))),
+    h("div", { class: "seg", role: "group", "aria-labelledby": "terminal-mode-title" },
+      Object.entries(modes).map(([key, label]) => h("button", {
+        type: "button",
+        "aria-pressed": String(key === current),
+        style: "min-height: 44px;",
+        on: { click: () => post({ terminal_mode: key }) },
+      }, label))),
+    current === "auto_approve"
+      ? h("div", { class: "err" }, "Terminal commands will run without asking, except protected commands.")
+      : null,
+    listEditor("Protected commands", "These always ask, in every mode.", "protected_commands", protectedCommands),
+    listEditor("Allowed without asking (exceptions)", "A command here skips its matching protected rule, never the others.", "protected_exceptions", exceptions),
+    resetArea);
+}
+
 export function settingsCard(settings) {
   const s = settings || {};
   const currentCompaction = s.compaction;
@@ -948,7 +1042,7 @@ export function workersPage(d) {
 
   return [
     permissionsCard(d.permissions || []),
-    h("div", { class: "controls-grid" }, modeControl(d.settings), settingsCard(d.settings)),
+    h("div", { class: "controls-grid" }, modeControl(d.settings), settingsCard(d.settings), terminalCommandsCard(d.settings)),
     hasChatScope ? null : chatBudgetCard,
     h("section", { class: "card" },
       h("div", { class: "card-head" },
@@ -1064,7 +1158,8 @@ function terminalRowTags(t) {
     }
   }
   if (t.shell_integration === false) tags.push(h("span", { class: "tag" }, "no shell integration"));
-  if (t.allow_commands) tags.push(h("span", { class: "tag" }, "commands allowed"));
+  const canRun = t.source !== "hook" || t.app === "terminal" || t.app === "iterm";
+  if (t.allow_commands && canRun) tags.push(h("span", { class: "tag" }, "commands allowed"));
   if (t.failures) tags.push(h("span", { class: "tag bad" }, `${t.failures} failing`));
   return tags;
 }
@@ -1156,8 +1251,9 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
     const isHook = t.source === "hook";
     const isNativeHook = isHook && (t.app === "terminal" || t.app === "iterm");
     const isOtherHook = isHook && !isNativeHook;
-    const allowDisabled = !masterOn || !shared || isOtherHook;
-    const captureDisabled = !masterOn || !shared;
+    // A greyed-out switch can still be turned off; it only can't be turned on.
+    const allowDisabled = (!masterOn || !shared || isOtherHook) && !t.allow_commands;
+    const captureDisabled = (!masterOn || !shared) && !t.capture_output;
     const confirming = terminalConfirm.has(t.id) && !allowDisabled;
     const captureConfirming = terminalCaptureConfirm.has(t.id) && !captureDisabled;
     const stamp = terminalStamp(t);

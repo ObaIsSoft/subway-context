@@ -167,7 +167,7 @@ class NativeTerminalsTests(unittest.TestCase):
             )
         server.set_terminal_sharing(True)
 
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"), \
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"), \
              mock.patch.object(native_terminals, "is_busy", return_value=False), \
              mock.patch.object(native_terminals, "type_command") as mock_type, \
              mock.patch.object(native_terminals, "read_history") as mock_hist:
@@ -198,7 +198,7 @@ class NativeTerminalsTests(unittest.TestCase):
                 share_enabled=True, allow_commands=True,
                 app="terminal", tty="/dev/ttys001",
             )
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"), \
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"), \
              mock.patch.object(native_terminals, "is_busy", return_value=True), \
              mock.patch.object(native_terminals, "type_command") as mock_type:
 
@@ -215,7 +215,7 @@ class NativeTerminalsTests(unittest.TestCase):
                 share_enabled=True, allow_commands=True,
                 app="terminal", tty="/dev/ttys001",
             )
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"), \
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"), \
              mock.patch.object(native_terminals, "is_busy", return_value=None):
 
             res = server.t_run_terminal(tid, "echo hi", timeout_seconds=1)
@@ -230,7 +230,7 @@ class NativeTerminalsTests(unittest.TestCase):
                 share_enabled=True, allow_commands=True,
                 app="terminal", tty="/dev/ttys001",
             )
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"):
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"):
             res = server.t_run_terminal(tid, "echo 1\necho 2", timeout_seconds=1)
             self.assertIn("[REFUSED]", res)
             self.assertIn("one line only", res)
@@ -247,7 +247,7 @@ class NativeTerminalsTests(unittest.TestCase):
                 share_enabled=True, allow_commands=True, capture_output=False,
                 app="iterm", tty="/dev/ttys002",
             )
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"), \
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"), \
              mock.patch.object(native_terminals, "is_busy", return_value=False), \
              mock.patch.object(native_terminals, "type_command") as mock_type, \
              mock.patch.object(native_terminals, "read_history") as mock_hist:
@@ -272,7 +272,7 @@ class NativeTerminalsTests(unittest.TestCase):
                 share_enabled=True, allow_commands=True, capture_output=True,
                 app="terminal", tty="/dev/ttys001",
             )
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"), \
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"), \
              mock.patch.object(native_terminals, "is_busy", return_value=False), \
              mock.patch.object(native_terminals, "type_command") as mock_type:
 
@@ -323,7 +323,7 @@ class NativeTerminalsTests(unittest.TestCase):
                 share_enabled=True, allow_commands=True,
                 app="terminal", tty="/dev/ttys001",
             )
-        with mock.patch.object(server, "get_permission_mode", return_value="auto_approve"), \
+        with mock.patch.object(server, "get_terminal_mode", return_value="auto_approve"), \
              mock.patch.object(native_terminals, "is_busy", side_effect=PermissionError(expected)):
             res = server.t_run_terminal(tid, "ls")
             self.assertIn(expected, res)
@@ -383,3 +383,27 @@ class AppleScriptCompileTests(unittest.TestCase):
                 self.assertEqual(res.returncode, 0, f"{name}: {res.stderr}")
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
+
+
+class SliceOutputRealHistoryTests(unittest.TestCase):
+    """Text as Terminal.app returns it on the user's Mac, padded with blank lines at the end."""
+    PROMPT = "obafemi@Obafemis-MacBook-Pro ~ % "
+
+    def history(self, *lines):
+        return "\n".join(lines) + "\n\n   \n\n"
+
+    def test_prompt_is_dropped_despite_trailing_blank_lines(self):
+        h = self.history(self.PROMPT + "ls", "Applications\tDocuments", "Desktop\tDownloads", self.PROMPT)
+        self.assertEqual(native_terminals.slice_output(h, "ls"), "Applications\tDocuments\nDesktop\tDownloads")
+
+    def test_command_with_no_output(self):
+        h = self.history(self.PROMPT + "ls", "Applications", self.PROMPT + "false", self.PROMPT)
+        self.assertEqual(native_terminals.slice_output(h, "false"), "")
+
+    def test_error_line_ending_with_the_command_is_output_not_the_command_line(self):
+        h = self.history(self.PROMPT + "flas", "zsh: command not found: flas", self.PROMPT)
+        self.assertEqual(native_terminals.slice_output(h, "flas"), "zsh: command not found: flas")
+
+    def test_prompt_changed_falls_back_to_the_command_line(self):
+        h = self.history(self.PROMPT + "cd /tmp", "obafemi@Obafemis-MacBook-Pro /tmp % ")
+        self.assertEqual(native_terminals.slice_output(h, "cd /tmp"), "")

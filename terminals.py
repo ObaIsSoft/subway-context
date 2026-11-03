@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import time
@@ -296,6 +297,537 @@ def is_safe_command(command: str, safe_list: List[str]) -> bool:
         if cmd == entry or cmd.startswith(entry + " "):
             return True
     return False
+
+
+# --- Command classification: safe / normal / protected -------------------------------
+# Every part of a command is checked, because "ls; npm publish" must not slip through as
+# an "ls" command. Protected commands always ask the user, whatever the terminal mode.
+PROTECTED_DEFAULTS = [
+    "npm publish", "npm unpublish", "npm deprecate", "npm dist-tag", "npm stage approve",
+    "npm stage reject", "npm owner", "npm access", "npm trust", "npm token", "npm login",
+    "npm logout", "npm adduser", "gh release", "gh auth", "gh secret", "gh repo delete",
+    "gh repo edit", "git push", "git reset --hard", "git clean", "git branch -D",
+    "git tag -d", "git filter-branch", "vsce publish", "ovsx publish", "twine upload",
+    "docker push", "cargo publish", "rm -r", "rm -R", "find -delete", "find -exec", "dd",
+    "mkfs", "diskutil", "chmod -R", "chown -R", "sudo", "su", "doas", "launchctl",
+    "crontab", "security", "defaults write", "osascript", "curl", "wget", "ssh", "scp",
+    "rsync", "kill", "killall", "pkill", "shutdown", "reboot",
+]
+PROTECTED_EXCEPTIONS_DEFAULTS = ["npm stage publish"]
+
+# A single-letter entry flag also matches the long form listed here.
+LONG_FLAGS = {"-r": "--recursive", "-f": "--force"}
+
+_PROTECTED_PATHS = [
+    "~/.ssh", "~/.npmrc", "~/.aws", "~/.config/gh", "~/.subway-context", "~/.zshrc",
+    "~/.bashrc", "~/.zprofile", "~/.bash_profile", "~/.gitconfig", "~/Library/Keychains",
+]
+_SEGMENT_SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;", ";&"}
+_PIPES = {"|", "|&"}
+_INLINE_CODE_PROGRAMS = {"python", "python3", "node", "perl", "ruby", "osascript"}
+_INLINE_CODE_FLAGS = {"-c", "-e", "-E", "-p", "--eval", "--print"}
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_PROGRAMS = {"sh", "bash", "zsh", "fish", "dash", "ksh"}
+_INTERPRETER_PROGRAMS = {"sh", "bash", "zsh", "fish", "python", "python3", "node", "perl", "ruby"}
+
+_PROTECTED_REASONS = {
+    "npm publish": "publishes to npm",
+    "npm unpublish": "removes a published npm package",
+    "npm deprecate": "changes an npm package",
+    "npm dist-tag": "changes npm release tags",
+    "npm stage approve": "publishes to npm",
+    "npm stage reject": "changes an npm release",
+    "npm owner": "changes npm package ownership",
+    "npm access": "changes npm package access",
+    "npm trust": "changes npm package trust",
+    "npm token": "changes npm tokens",
+    "npm login": "signs in to npm",
+    "npm logout": "signs out of npm",
+    "npm adduser": "creates an npm account",
+    "gh release": "publishes a GitHub release",
+    "gh auth": "changes GitHub sign-in",
+    "gh secret": "changes GitHub secrets",
+    "gh repo delete": "deletes a GitHub repository",
+    "gh repo edit": "changes GitHub repository settings",
+    "git push": "pushes to a remote",
+    "git reset --hard": "discards local changes",
+    "git clean": "deletes untracked files",
+    "git branch -D": "deletes a branch",
+    "git tag -d": "deletes a tag",
+    "git filter-branch": "rewrites git history",
+    "vsce publish": "publishes to the VS Code marketplace",
+    "ovsx publish": "publishes to Open VSX",
+    "twine upload": "uploads to PyPI",
+    "docker push": "pushes a container image",
+    "cargo publish": "publishes to crates.io",
+    "rm -r": "removes files recursively",
+    "rm -R": "removes files recursively",
+    "find -delete": "deletes files",
+    "find -exec": "runs commands on files",
+    "dd": "writes raw data to a device",
+    "mkfs": "formats a disk",
+    "diskutil": "changes a disk",
+    "chmod -R": "changes permissions recursively",
+    "chown -R": "changes ownership recursively",
+    "sudo": "runs as another user",
+    "su": "switches user",
+    "doas": "runs as another user",
+    "launchctl": "changes macOS services",
+    "crontab": "changes scheduled jobs",
+    "security": "reads or changes the keychain",
+    "defaults write": "changes macOS settings",
+    "osascript": "runs AppleScript",
+    "curl": "reaches the network",
+    "wget": "reaches the network",
+    "ssh": "connects to another machine",
+    "scp": "copies to another machine",
+    "rsync": "copies files, possibly to another machine",
+    "kill": "stops a process",
+    "killall": "stops processes",
+    "pkill": "stops processes",
+    "shutdown": "shuts down the machine",
+    "reboot": "reboots the machine",
+}
+
+
+def _match_paren(text: str, start: int) -> Optional[int]:
+    """Index of the ')' matching the '(' at start, or None when it never closes."""
+    depth = 0
+    quote = ""
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _extract_substitutions(text: str):
+    """Pull $(...), `<...>`, <(...) and >(...) bodies out of a command.
+
+    They are replaced by plain placeholder words so the outer command still tokenises, and
+    every body is classified recursively by the caller."""
+    out: List[str] = []
+    inners: List[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch == "$" and i + 1 < len(text) and text[i + 1] == "(":
+            end = _match_paren(text, i + 1)
+            if end is None:
+                out.append(text[i:])
+                break
+            inners.append(text[i + 2:end])
+            out.append(f" __SUBST{len(inners) - 1}__ ")
+            i = end + 1
+            continue
+        if ch == "`":
+            end = text.find("`", i + 1)
+            if end == -1:
+                out.append(text[i:])
+                break
+            inners.append(text[i + 1:end])
+            out.append(f" __SUBST{len(inners) - 1}__ ")
+            i = end + 1
+            continue
+        if ch in "<>" and i + 1 < len(text) and text[i + 1] == "(":
+            end = _match_paren(text, i + 1)
+            if end is None:
+                out.append(text[i:])
+                break
+            inners.append(text[i + 2:end])
+            out.append(f" __SUBST{len(inners) - 1}__ ")
+            i = end + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), inners
+
+
+def _split_lines_outside_quotes(text: str) -> List[str]:
+    lines: List[str] = []
+    buf: List[str] = []
+    quote = ""
+    escaped = False
+    for ch in text:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            buf.append(ch)
+            escaped = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            buf.append(ch)
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+        elif ch in "\r\n":
+            lines.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    lines.append("".join(buf))
+    return lines
+
+
+def _tokenize(text: str) -> List[str]:
+    lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    return list(lex)
+
+
+def _expand_home(value: str) -> str:
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    expanded = value.replace("${HOME}", home).replace("$HOME", home)
+    if expanded == "~":
+        return home
+    if expanded.startswith("~/"):
+        return home + expanded[1:]
+    return expanded
+
+
+def _touched_protected_path(tokens: List[str]) -> str:
+    for token in tokens:
+        if not token:
+            continue
+        # --file=~/.npmrc style values
+        value = token.split("=", 1)[1] if token.startswith("-") and "=" in token else token
+        if value.startswith("-"):
+            continue
+        expanded = _expand_home(value)
+        if expanded.startswith(os.sep):
+            norm = os.path.normpath(expanded)
+            for display in _PROTECTED_PATHS:
+                root = os.path.normpath(_expand_home(display))
+                if norm == root or norm.startswith(root + os.sep):
+                    return display
+        # Relative paths and globs (cat .npmrc from ~, cat ~/.ss*/id_rsa): match the name itself.
+        # Over-matching is fine here: it only means the user is asked.
+        for display in _PROTECTED_PATHS:
+            marker = display[2:] if display.startswith("~/") else display
+            if marker in value or (any(ch in value for ch in "*?[") and _glob_could_match(value, marker)):
+                return display
+    return ""
+
+
+def _glob_could_match(pattern: str, marker: str) -> bool:
+    """True when a glob in the token could expand to the protected name (e.g. ~/.ss*/id_rsa).
+
+    Every part of a multi-part name has to be matched in order, so `ls *` from ~ doesn't count as
+    touching Library/Keychains while `ls ~/Library/*` does."""
+    import fnmatch
+    names = [n for n in marker.split("/") if n]
+    parts = [p for p in pattern.replace("\\", "/").split("/") if p]
+    for i in range(len(parts) - len(names) + 1):
+        window = parts[i:i + len(names)]
+        if not any(any(ch in part for ch in "*?[") for part in window):
+            continue
+        ok = True
+        for name, part in zip(names, window):
+            if name.startswith(".") and not part.startswith("."):
+                ok = False  # shells don't expand * to dotfiles unless the dot is written
+                break
+            if not fnmatch.fnmatch(name, part):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _peel(tokens: List[str]):
+    """Drop assignments and wrappers (env, command, nohup, time, nice, timeout, xargs, exec).
+
+    Returns (program, args, used_wrapper, bare_env)."""
+    toks = list(tokens)
+    used_wrapper = False
+    while toks:
+        while toks and _ASSIGNMENT_RE.match(toks[0]):
+            toks.pop(0)
+        if not toks:
+            break
+        name = os.path.basename(toks[0])
+        if name == "env":
+            used_wrapper = True
+            toks.pop(0)
+            while toks:
+                if _ASSIGNMENT_RE.match(toks[0]):
+                    toks.pop(0)
+                    continue
+                if toks[0].startswith("-"):
+                    flag = toks.pop(0)
+                    if flag in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and toks:
+                        toks.pop(0)
+                    continue
+                break
+            if not toks:
+                return "", [], used_wrapper, True
+            continue
+        if name in ("command", "nohup", "exec", "time"):
+            used_wrapper = True
+            toks.pop(0)
+            while toks and toks[0].startswith("-"):
+                toks.pop(0)
+            continue
+        if name == "nice":
+            used_wrapper = True
+            toks.pop(0)
+            while toks and toks[0].startswith("-"):
+                flag = toks.pop(0)
+                if flag in ("-n", "--adjustment") and toks:
+                    toks.pop(0)
+            continue
+        if name == "timeout":
+            used_wrapper = True
+            toks.pop(0)
+            while toks and toks[0].startswith("-"):
+                flag = toks.pop(0)
+                if flag in ("-s", "--signal", "-k", "--kill-after") and toks:
+                    toks.pop(0)
+            if toks:
+                toks.pop(0)  # the duration
+            continue
+        if name == "xargs":
+            used_wrapper = True
+            toks.pop(0)
+            while toks and toks[0].startswith("-"):
+                flag = toks.pop(0)
+                if flag in ("-n", "-I", "-P", "-L", "-d", "-s", "-E", "-a") and toks:
+                    toks.pop(0)
+            continue
+        break
+    if not toks:
+        return "", [], used_wrapper, False
+    return os.path.basename(toks[0]), toks[1:], used_wrapper, False
+
+
+def _flag_matches(flag: str, token: str) -> bool:
+    if not token:
+        return False
+    if flag.startswith("--") or (flag.startswith("-") and len(flag) > 2):
+        return token == flag
+    if not flag.startswith("-") or len(flag) != 2:
+        return token == flag
+    if token == LONG_FLAGS.get(flag):
+        return True
+    return token.startswith("-") and not token.startswith("--") and flag[1] in token[1:]
+
+
+def _entry_matches(entry_words: List[str], program: str, args: List[str]) -> bool:
+    if not entry_words:
+        return False
+    if os.path.basename(entry_words[0]) != program:
+        return False
+    position = 0
+    for word in entry_words[1:]:
+        if word.startswith("-"):
+            if not any(_flag_matches(word, token) for token in args):
+                return False
+            continue
+        found = False
+        for i in range(position, len(args)):
+            if args[i] == word:
+                position = i + 1
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+def _exception_matches(exception_words: List[str], program: str, args: List[str]) -> bool:
+    if not exception_words:
+        return False
+    if os.path.basename(exception_words[0]) != program:
+        return False
+    words = exception_words[1:]
+    non_flags = [token for token in args if not token.startswith("-")]
+    return non_flags[:len(words)] == words
+
+
+def _match_protected(program: str, args: List[str], protected_list, exceptions) -> str:
+    entries = [e for e in (protected_list or []) if isinstance(e, str) and e.strip()]
+    exception_words = [e.split() for e in (exceptions or []) if isinstance(e, str) and e.strip()]
+    for entry in entries:
+        words = entry.split()
+        if not _entry_matches(words, program, args):
+            continue
+        waived = False
+        for exc_words in exception_words:
+            # An exception never cancels an entry that spells the same command: if the user
+            # also listed it as protected, the exception cannot unprotect itself.
+            if exc_words == words:
+                continue
+            if _exception_matches(exc_words, program, args):
+                waived = True
+                break
+        if waived:
+            continue
+        return entry
+    return ""
+
+
+def _protected_reason(entry: str) -> str:
+    normalized = " ".join((entry or "").split())
+    if normalized in _PROTECTED_REASONS:
+        return _PROTECTED_REASONS[normalized]
+    words = normalized.split()
+    program = os.path.basename(words[0]) if words else normalized
+    if program == "npm":
+        return "changes npm state"
+    if program in ("gh", "git"):
+        return "changes a repository"
+    return f"matches a protected command ({normalized})"
+
+
+def _is_c_flag(token: str) -> bool:
+    return token == "-c" or (token.startswith("-") and not token.startswith("--") and "c" in token[1:])
+
+
+def classify_command(command, safe_list, protected_list, exceptions):
+    """Classify every part of a command as "safe", "normal" or "protected".
+
+    Returns (kind, reason). A reason is a short phrase safe to show the user. Protected
+    always wins; one unreadable or risky part makes the whole command protected."""
+    return _classify_command(command, safe_list, protected_list, exceptions, 0)
+
+
+def _classify_command(command, safe_list, protected_list, exceptions, depth: int):
+    if depth > 6:
+        return "protected", "could not read the command clearly"
+    if command is None:
+        text = ""
+    elif isinstance(command, str):
+        text = command
+    else:
+        text = str(command)
+    if not text.strip():
+        return "normal", "empty command"
+
+    try:
+        masked, substitutions = _extract_substitutions(text)
+    except Exception:
+        return "protected", "could not read the command clearly"
+
+    for inner in substitutions:
+        kind, reason = _classify_command(inner, safe_list, protected_list, exceptions, depth + 1)
+        if kind == "protected":
+            return "protected", reason
+
+    segments: List[Any] = []
+    separator = ""
+    try:
+        for line in _split_lines_outside_quotes(masked):
+            current: List[str] = []
+            for token in _tokenize(line):
+                if token in _SEGMENT_SEPARATORS:
+                    if current:
+                        segments.append((separator, current))
+                        current = []
+                    separator = token
+                else:
+                    current.append(token)
+            if current:
+                segments.append((separator, current))
+            separator = ";"
+    except ValueError:
+        return "protected", "could not read the command clearly"
+
+    has_redirect = False
+    normal_reason = ""
+    wrapper_seen = False
+
+    for separator_before, tokens in segments:
+        display_path = _touched_protected_path(tokens)
+        if display_path:
+            return "protected", f"touches {display_path}"
+        # Any all-punctuation token with ">" is an output redirect (>, >>, &>, >|, >&).
+        if any(token and set(token) <= set("<>&|") and ">" in token for token in tokens):
+            has_redirect = True
+
+        program, args, used_wrapper, bare_env = _peel(tokens)
+        if bare_env:
+            return "protected", "prints environment variables, which can hold secrets"
+        if used_wrapper:
+            wrapper_seen = True
+        if program == "printenv":
+            return "protected", "prints environment variables, which can hold secrets"
+        if separator_before in _PIPES and program in _INTERPRETER_PROGRAMS:
+            return "protected", "pipes into an interpreter"
+        # sh < script, bash <<< "npm publish", python3 << EOF: input Subway can't read.
+        if program in _INTERPRETER_PROGRAMS and any(
+                token and set(token) <= set("<>&|") and "<" in token for token in args):
+            return "protected", "feeds commands to an interpreter"
+        # python3 -c "...", node -e "...": inline code Subway can't check.
+        if program in _INLINE_CODE_PROGRAMS and any(
+                token in _INLINE_CODE_FLAGS
+                or (token.startswith("-") and not token.startswith("--") and any(ch in token[1:] for ch in "ceE"))
+                for token in args):
+            return "protected", "runs inline code Subway can't check"
+
+        if program in _SHELL_PROGRAMS:
+            index = next((i for i, arg in enumerate(args) if _is_c_flag(arg)), None)
+            if index is not None:
+                if index + 1 >= len(args):
+                    return "protected", "could not read the command clearly"
+                kind, reason = _classify_command(args[index + 1], safe_list, protected_list,
+                                                 exceptions, depth + 1)
+                if kind == "protected":
+                    return "protected", reason
+                normal_reason = normal_reason or "runs a nested command"
+        elif program == "eval":
+            if not args:
+                return "protected", "could not read the command clearly"
+            kind, reason = _classify_command(" ".join(args), safe_list, protected_list,
+                                             exceptions, depth + 1)
+            if kind == "protected":
+                return "protected", reason
+            normal_reason = normal_reason or "runs a nested command"
+
+        entry = _match_protected(program, args, protected_list, exceptions)
+        if entry:
+            return "protected", _protected_reason(entry)
+        if separator_before in _PIPES and not normal_reason:
+            normal_reason = "joins several commands"
+
+    normal = bool(normal_reason) or has_redirect or bool(substitutions) or wrapper_seen
+    if len(segments) > 1:
+        normal = True
+        normal_reason = normal_reason or "joins several commands"
+    if has_redirect and not normal_reason:
+        normal_reason = "writes to a file"
+    if substitutions and not normal_reason:
+        normal_reason = "runs a nested command"
+    if wrapper_seen and not normal_reason:
+        normal_reason = "wraps another command"
+    if normal:
+        return "normal", normal_reason or "runs more than one step"
+    if len(segments) == 1 and is_safe_command(" ".join(segments[0][1]), safe_list):
+        return "safe", ""
+    return "normal", "not on the safe list"
 
 
 RUN_ID_RE = re.compile(r"^run_[0-9a-f]{8}$")

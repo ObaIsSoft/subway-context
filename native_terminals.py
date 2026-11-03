@@ -204,16 +204,31 @@ def slice_output(history: str, command: str) -> str:
     if not history or not command:
         return ""
     lines = history.splitlines()
-    last_idx = -1
-    for i, line in enumerate(lines):
-        if line.endswith(command) or line.rstrip().endswith(command):
-            last_idx = i
-    if last_idx == -1:
+    # Terminal.app pads the end with blank lines; the last real line is the new prompt.
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if len(lines) < 2:
         return ""
-    remaining = lines[last_idx + 1 :]
-    if not remaining:
+    prompt = lines[-1].rstrip()
+    body = lines[:-1]
+    cmd = command.strip()
+    start = -1
+    # The command line is the same prompt followed by the command. Matching the prompt keeps an
+    # output line that merely ends with the command text ("zsh: command not found: flas") out.
+    if prompt:
+        for i in range(len(body) - 1, -1, -1):
+            if body[i].rstrip() in (prompt + " " + cmd, prompt + cmd):
+                start = i
+                break
+    if start == -1:
+        # The prompt changed during the command (cd, a venv): fall back to the last line ending with it.
+        for i in range(len(body) - 1, -1, -1):
+            if body[i].rstrip().endswith(cmd):
+                start = i
+                break
+    if start == -1:
         return ""
-    content = remaining[:-1]
+    content = body[start + 1:]
     while content and not content[-1].strip():
         content.pop()
     return "\n".join(content)

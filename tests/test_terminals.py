@@ -281,7 +281,7 @@ class ServerTerminalWrapperTests(unittest.TestCase):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
         with server._state_lock("config"):
             cfg = server._load_json("config.json")
-            cfg["permission_mode"] = "auto_approve"
+            cfg["terminal_mode"] = "auto_approve"
             server._save_json("config.json", cfg)
 
         def fake_extension():
@@ -308,7 +308,7 @@ class ServerTerminalWrapperTests(unittest.TestCase):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
         with server._state_lock("config"):
             cfg = server._load_json("config.json")
-            cfg["permission_mode"] = "auto_safe"
+            cfg["terminal_mode"] = "auto_safe"
             server._save_json("config.json", cfg)
 
         def fake_extension():
@@ -334,7 +334,7 @@ class ServerTerminalWrapperTests(unittest.TestCase):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
         with server._state_lock("config"):
             cfg = server._load_json("config.json")
-            cfg["permission_mode"] = "auto_safe"
+            cfg["terminal_mode"] = "auto_safe"
             server._save_json("config.json", cfg)
 
         def fake_extension_then_switch_off():
@@ -373,7 +373,7 @@ class ServerTerminalWrapperTests(unittest.TestCase):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
         with server._state_lock("config"):
             cfg = server._load_json("config.json")
-            cfg["permission_mode"] = "ask"
+            cfg["terminal_mode"] = "ask"
             server._save_json("config.json", cfg)
 
         def deny_it():
