@@ -301,7 +301,7 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
-          npm publish "dist/subway-context-$VERSION.tgz" --tag next --access public
+          npm publish "./dist/subway-context-$VERSION.tgz" --tag next --access public
 
       - name: Publish the GitHub pre-release
         env:
@@ -362,7 +362,7 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
-          npm publish "dist/subway-context-$VERSION.tgz" --tag latest --access public
+          npm publish "./dist/subway-context-$VERSION.tgz" --tag latest --access public
 
       - name: Publish the GitHub release
         env:
