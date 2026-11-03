@@ -62,6 +62,7 @@ class TestCopilotWorkers(unittest.TestCase):
                             self.assertIn("--acp", cmd)
                             self.assertNotIn("-p", cmd)
                             self.assertNotIn("--allow-all-tools", cmd)
+                            self.assertNotIn("--sandbox", cmd)
                         elif mode == "auto_safe":
                             self.assertIn("-p", cmd)
                             self.assertNotIn("--acp", cmd)
@@ -78,8 +79,9 @@ class TestCopilotWorkers(unittest.TestCase):
                             shell_rules = {arg for arg in cmd if arg.startswith("--allow-tool=shell(")}
                             self.assertEqual(
                                 shell_rules,
-                                {f"--allow-tool=shell({command}:*)" for command in server.AGY_SAFE_COMMANDS},
+                                {f"--allow-tool=shell({command}:*)" for command in server.AGY_SAFE_COMMANDS + server.COPILOT_SANDBOXED_COMMANDS},
                             )
+                            self.assertIn("--sandbox", cmd)
                         else:
                             self.assertIn("--allow-all-tools", cmd)
                             self.assertNotIn("--acp", cmd)

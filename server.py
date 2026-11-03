@@ -4991,12 +4991,14 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
         if skip_permissions:
             cmd.append("--allow-all-tools")
         elif safe:
+            # OS sandbox: shell commands can only write inside the allowed folders, so python3 is safe to allow below.
+            cmd.append("--sandbox")
             if "files:write" in caps:
                 safe_workdir = os.path.join(SUBWAY_DIR, "worktrees", worker_id) if (isolate or isolated) and worker_id else wd
                 # Copilot matches write(<dir>) only as that exact path; <dir>/** covers files inside it.
                 cmd.append(f"--allow-tool=write({os.path.realpath(safe_workdir)}/**)")
             if "terminal:safe" in caps:
-                cmd.extend(f"--allow-tool=shell({command}:*)" for command in AGY_SAFE_COMMANDS)
+                cmd.extend(f"--allow-tool=shell({command}:*)" for command in AGY_SAFE_COMMANDS + COPILOT_SANDBOXED_COMMANDS)
         return cmd
 
     if provider == "claude":
@@ -5828,6 +5830,9 @@ def thread_permission_rows() -> Dict[str, Any]:
 AGY_SAFE_COMMANDS = ["ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "mkdir", "git status", "git diff", "git log",
                      "pytest", "npm test", "python3 -m pytest", "python3 -m unittest", "python3 --version",
                      "/usr/bin/python3 -m unittest", "/usr/bin/python3 --version"]
+# Copilot matches shell rules on the command name only (plus git/gh subcommands), so "python3 -m unittest" can't
+# be scoped; these are allowed only together with --sandbox.
+COPILOT_SANDBOXED_COMMANDS = ["python3", "/usr/bin/python3"]
 PERMISSION_WAIT = 1800
 
 
