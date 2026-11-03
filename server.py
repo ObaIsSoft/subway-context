@@ -4993,7 +4993,8 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
         elif safe:
             if "files:write" in caps:
                 safe_workdir = os.path.join(SUBWAY_DIR, "worktrees", worker_id) if (isolate or isolated) and worker_id else wd
-                cmd.append(f"--allow-tool=write({os.path.realpath(safe_workdir)})")
+                # Copilot matches write(<dir>) only as that exact path; <dir>/** covers files inside it.
+                cmd.append(f"--allow-tool=write({os.path.realpath(safe_workdir)}/**)")
             if "terminal:safe" in caps:
                 cmd.extend(f"--allow-tool=shell({command}:*)" for command in AGY_SAFE_COMMANDS)
         return cmd
@@ -7396,7 +7397,14 @@ def t_read_terminal(terminal_id: str, since: str = "last", mode: str = "commands
     for c in cmds:
         lines.append(f"$ {c.get('command')}  (exit {c.get('exit_code')})")
         if mode != "commands" and c.get("output"):
-            lines.append(one_line(c["output"], 2000))
+            if mode == "errors":
+                output = terminals.redact_text(terminals.strip_ansi(str(c["output"])))
+                marker = "...[truncated]...\n"
+                if len(output) > 2000:
+                    output = marker + output[-(2000 - len(marker)):]
+                lines.append(output)
+            else:
+                lines.append(one_line(c["output"], 2000))
     return "\n".join(lines)
 
 
@@ -8192,6 +8200,13 @@ def get_stall_timeout(meta: Dict[str, Any]) -> float:
     return timeout
 
 
+def _worker_stall_timeout(meta: Dict[str, Any], proc: Any) -> float:
+    timeout = get_stall_timeout(meta)
+    if meta.get("provider") == "copilot" and proc.poll() is None:
+        return timeout + 10 * 60
+    return timeout
+
+
 def _process_cpu_time(proc: Any) -> Optional[float]:
     """Return user plus system CPU seconds for a live child process when the OS exposes them."""
     pid = getattr(proc, "pid", None)
@@ -8261,6 +8276,34 @@ def _file_activity_signature(path: str) -> Tuple[bool, int, int]:
         return True, stat.st_size, stat.st_mtime_ns
     except OSError:
         return False, 0, 0
+
+
+def _copilot_has_open_tool_execution(events_path: str) -> bool:
+    open_tools: List[Optional[str]] = []
+    try:
+        with open(events_path, "r", encoding="utf-8", errors="replace") as events_file:
+            for line in events_file:
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                data = event.get("data") if isinstance(event.get("data"), dict) else event
+                call_id = str(data.get("toolCallId") or data.get("callId") or data.get("id") or "")
+                if event_type == "tool.execution_start":
+                    open_tools.append(call_id or None)
+                elif event_type == "tool.execution_complete":
+                    if call_id and call_id in open_tools:
+                        open_tools.remove(call_id)
+                    else:
+                        anonymous = next((i for i, active_id in enumerate(open_tools) if active_id is None), None)
+                        if anonymous is not None:
+                            open_tools.pop(anonymous)
+    except OSError:
+        return False
+    return bool(open_tools)
 
 
 def _worker_folder_activity(meta: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
@@ -8345,6 +8388,7 @@ def _collect_worker_activity_signals(meta: Dict[str, Any], proc: Any, started_at
     if meta.get("provider") == "copilot" and meta.get("copilot_session_id"):
         events_path = os.path.join(COPILOT_DIR, "session-state", str(meta["copilot_session_id"]), "events.jsonl")
         signals["copilot_events"] = _file_activity_signature(events_path)
+        signals["copilot_tool_running"] = _copilot_has_open_tool_execution(events_path)
     if meta.get("provider") == "opencode":
         activity = _opencode_worker_session_activity(meta, started_at)
         if activity is not None:
@@ -8391,8 +8435,10 @@ def _update_worker_activity(
     previous.update(current)
 
 
-def _worker_is_stalled(last_active: Dict[str, float], now: float, timeout: float) -> bool:
-    return not last_active or all(now - seen >= timeout for seen in last_active.values())
+def _worker_is_stalled(
+    last_active: Dict[str, float], now: float, timeout: float, active: bool = False,
+) -> bool:
+    return not active and (not last_active or all(now - seen >= timeout for seen in last_active.values()))
 
 
 def _poll_opencode_worker_retry(
@@ -8404,6 +8450,7 @@ def _poll_opencode_worker_retry(
     db_path = os.path.join(OPENCODE_DIR, "opencode.db")
     if not os.path.exists(db_path):
         return None
+
     worker_dir = meta.get("worktree") or meta.get("project_dir") or HOME
     directory = os.path.abspath(worker_dir)
     real_directory = os.path.realpath(directory)
@@ -8483,6 +8530,25 @@ def _poll_opencode_worker_retry(
             str(meta.get("id") or ""), meta, handler_reason, is_stall=False, reset_time=reset_time,
         )
     return {"reason": reason, "quota": quota_error, "result": result}
+
+
+def _reroute_cost_rank(provider: str, model: str) -> Optional[int]:
+    provider = (provider or "").lower()
+    model_name = (model or "").lower().split("/", 1)[-1]
+    if provider == "local":
+        return 0
+    if provider == "opencode" and "free" in model_name:
+        return 1
+    if provider == "antigravity" and "flash" in model_name:
+        return 2
+    if provider == "copilot":
+        return 3
+    if provider == "claude":
+        if "opus" in model_name:
+            return 5
+        if "sonnet" in model_name:
+            return 4
+    return None
 
 
 def _ping_launcher(launcher: str, text: str, from_id: str = "") -> None:
@@ -8574,6 +8640,7 @@ def _handle_worker_exhaustion_or_stall(
     is_god = meta.get("mode") == "god"
     route = route_task(prompt, role=role, private=private, god=is_god)
     picks = route.get("picks", [])
+    original_cost_rank = _reroute_cost_rank(str(meta.get("provider") or ""), model)
 
     excluded = {model.lower(), (model.split("/", 1)[1] if "/" in model else model).lower()}
     binaries = {
@@ -8592,6 +8659,12 @@ def _handle_worker_exhaustion_or_stall(
         cand_m_clean = (cand_m.split("/", 1)[1] if "/" in cand_m else cand_m).lower()
         if cand_m in excluded or cand_m_clean in excluded:
             continue
+        candidate_cost_rank = _reroute_cost_rank(
+            str(cand.get("provider") or ""), str(cand.get("model") or ""),
+        )
+        if (original_cost_rank is None or candidate_cost_rank is None
+                or candidate_cost_rank > original_cost_rank):
+            continue
         if private and cand.get("provider") != "local":
             continue
         if _model_is_bad(cand.get("model") or ""):
@@ -8603,9 +8676,21 @@ def _handle_worker_exhaustion_or_stall(
         break
 
     if not next_cand:
-        no_candidate_reason = route.get("reason", "no candidates")
         if private:
-            no_candidate_reason = f"Private worker cannot leave the local provider; no alternative local model is available. {no_candidate_reason}"
+            no_candidate_reason = (
+                "Private worker cannot leave the local provider; no same-cost or cheaper local model is available. "
+                f"{route.get('reason', 'no candidates')}"
+            )
+        elif original_cost_rank is None:
+            no_candidate_reason = (
+                "The original provider/model cost tier is unknown, so a safe non-more-expensive reroute "
+                f"cannot be established. {route.get('reason', 'no candidates')}"
+            )
+        else:
+            no_candidate_reason = (
+                "No same-cost or cheaper provider/model is available for rerouting. "
+                f"{route.get('reason', 'no candidates')}"
+            )
         fail_msg = f"Model '{model}' {condition} and no alternative model available to reroute: {no_candidate_reason}"
         return fail_worker(fail_msg)
 
@@ -8824,7 +8909,7 @@ def supervise_worker(worker_id: str) -> int:
                     raise
                 current["proc"] = proc
                 pump = None
-                stall_timeout = get_stall_timeout(meta)
+                stall_timeout = _worker_stall_timeout(meta, proc)
                 stall_event = threading.Event()
                 start_time = time.time()
                 next_opencode_check = start_time
@@ -8834,6 +8919,11 @@ def supervise_worker(worker_id: str) -> int:
                 last_activity["start"] = start_time  # Never refreshes: with no other signal, quiet since start is a stall.
                 signal_interval = min(5.0, max(0.05, stall_timeout / 20))
                 next_signal_check = start_time + signal_interval
+                copilot_events_path = (
+                    os.path.join(COPILOT_DIR, "session-state", str(meta["copilot_session_id"]), "events.jsonl")
+                    if meta.get("provider") == "copilot" and meta.get("copilot_session_id") else ""
+                )
+                next_copilot_check = start_time
 
                 def quota_handler(text: str, source: str) -> None:
                     q_err = check_quota_error(str(meta.get("provider") or ""), text, source=source)
@@ -8857,9 +8947,15 @@ def supervise_worker(worker_id: str) -> int:
                             quota_handler(line, "stderr")
 
                 def stall_watchdog() -> None:
-                    nonlocal next_opencode_check, previous_activity, next_signal_check
+                    nonlocal next_opencode_check, previous_activity, next_signal_check, next_copilot_check
                     while not stall_event.is_set() and not stopped["flag"]:
                         now = time.time()
+                        if copilot_events_path and now >= next_copilot_check:
+                            next_copilot_check = now + 0.5
+                            events_signature = _file_activity_signature(copilot_events_path)
+                            if events_signature != previous_activity.get("copilot_events"):
+                                previous_activity["copilot_events"] = events_signature
+                                last_activity["copilot_events"] = now
                         if is_acp and meta.get("provider") == "opencode" and now >= next_opencode_check:
                             next_opencode_check = now + 3
                             retry = _poll_opencode_worker_retry(meta, worker_started_at, opencode_retries_seen)
@@ -8880,17 +8976,24 @@ def supervise_worker(worker_id: str) -> int:
                             next_signal_check = now + signal_interval
                             signals = _worker_activity_signals(meta, proc, worker_started_at)
                             _update_worker_activity(previous_activity, last_activity, signals, now)
-                        if _worker_is_stalled(last_activity, now, stall_timeout):
-                            quiet = ", ".join(sorted(last_activity)) or "no signals"
-                            stopped["stall"] = f"No activity for {int(stall_timeout)}s from any signal ({quiet})."
-                            stopped["flag"] = True
-                            if is_acp and run.get("conversation") and proc.poll() is None:
-                                with contextlib.suppress(Exception):
-                                    proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
-                                    proc.stdin.flush()
-                            if proc.poll() is None:
-                                proc.terminate()
-                            return
+                        if _worker_is_stalled(
+                            last_activity, now, stall_timeout,
+                            active=bool(previous_activity.get("copilot_tool_running")),
+                        ):
+                            if copilot_events_path and _copilot_has_open_tool_execution(copilot_events_path):
+                                previous_activity["copilot_tool_running"] = True
+                                last_activity["copilot_tool_running"] = now
+                            else:
+                                quiet = ", ".join(sorted(last_activity)) or "no signals"
+                                stopped["stall"] = f"No activity for {int(stall_timeout)}s from any signal ({quiet})."
+                                stopped["flag"] = True
+                                if is_acp and run.get("conversation") and proc.poll() is None:
+                                    with contextlib.suppress(Exception):
+                                        proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
+                                        proc.stdin.flush()
+                                if proc.poll() is None:
+                                    proc.terminate()
+                                return
                         stall_event.wait(min(0.5, max(0.05, stall_timeout / 20)))
 
                 stall_thread = threading.Thread(

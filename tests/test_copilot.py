@@ -73,7 +73,7 @@ class TestCopilotWorkers(unittest.TestCase):
                             )
                             self.assertEqual(
                                 write_rules,
-                                [f"--allow-tool=write({os.path.realpath(expected_dir)})"],
+                                [f"--allow-tool=write({os.path.realpath(expected_dir)}/**)"],
                             )
                             shell_rules = {arg for arg in cmd if arg.startswith("--allow-tool=shell(")}
                             self.assertEqual(
@@ -244,7 +244,7 @@ class TestCopilotPermissionFallback(unittest.TestCase):
                 self.assertIn("-p", saved["cmd"])
                 self.assertIn("--allow-tool=shell(ls:*)", saved["cmd"])
                 expected_write = os.path.join(server.SUBWAY_DIR, "worktrees", meta["id"]) if isolate else meta["project_dir"]
-                self.assertIn(f"--allow-tool=write({os.path.realpath(expected_write)})", saved["cmd"])
+                self.assertIn(f"--allow-tool=write({os.path.realpath(expected_write)}/**)", saved["cmd"])
                 self.assertNotIn("--max-ai-credits", saved["cmd"])
 
     def test_acp_handshake_failure_falls_back_and_success_does_not_add_note(self):

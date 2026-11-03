@@ -204,6 +204,24 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         hits = server.t_search_terminal("something")
         self.assertIn("t1", hits)
 
+    def test_errors_read_preserves_redacted_ansi_free_capped_output_tail(self):
+        output = (
+            "old line\n" * 250
+            + "API_KEY=secret_value\n"
+            + "\x1b[31mlast failure\x1b[0m\nfinal line"
+        )
+        with server._state_lock("terminals"):
+            terminals.record_command(
+                server._terminals_dir(), "t1", "npm test", exit_code=1, output=output,
+            )
+
+        errors = server.t_read_terminal("t1", since="0", mode="errors")
+        self.assertIn("...[truncated]...\n", errors)
+        self.assertIn("last failure\nfinal line", errors)
+        self.assertNotIn("secret_value", errors)
+        self.assertNotIn("\x1b[", errors)
+        self.assertLessEqual(len(errors), 2200)
+
     def test_run_terminal_refuses_without_opt_in(self):
         with server._state_lock("terminals"):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", shell_integration=True)
