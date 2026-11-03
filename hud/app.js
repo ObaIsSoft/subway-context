@@ -1,6 +1,6 @@
 /* Shell, routing and polling. */
 import { api, duration, get, h, icon, listen, set, subscribe, tickAll, toast, tokens } from "./lib.js";
-import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, threads, threadsPage, usagePage, workersPage } from "./views.js";
+import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, terminalsPage, terminalsState, threads, threadsPage, usagePage, workersPage } from "./views.js";
 import { helpPage } from "./help.js";
 
 const POLL_MS = 1000;
@@ -8,6 +8,7 @@ const FEED_MS = 3000;
 const PAGES = {
   overview: { label: "Overview", sub: "What needs you, and what's running" },
   threads: { label: "Threads", sub: "Chats across connected coding agents" },
+  terminals: { label: "Terminals", sub: "Commands run in terminals your user has shared" },
   usage: { label: "Usage", sub: "Limits and tokens, as reported by each tool" },
   workers: { label: "Workers", sub: "Delegated agents and their permissions" },
   models: { label: "Models", sub: "How each model is ranked, and where that came from" },
@@ -81,11 +82,13 @@ function render() {
   subheading.textContent = PAGES[page].sub;
   if (!d && page !== "help") return;
   if (page === "threads") loadThreads();
+  if (page === "terminals") loadTerminals();
   if (focusInside()) return; // Never wipe out what someone is typing.
   const open = [...pageBody.querySelectorAll("details[open] summary")].map((x) => x.closest(".card")?.querySelector(".provider-name")?.textContent);
   const views = {
     overview: () => overview(d), usage: () => usagePage(d), workers: () => workersPage(d),
-    threads: () => threadsPage(threads.chats, () => loadThreads(true), threads.error),
+    threads: () => threadsPage(d, threads.chats, () => loadThreads(true), threads.error),
+    terminals: () => terminalsPage(d, terminalsState.rows, () => loadTerminals(true), terminalsState.error, terminalsState.loading, terminalsState.loadedAt > 0 && !terminalsState.error && (Date.now() - terminalsState.loadedAt > 20000), terminalsState.sharing),
     models: () => modelsPage(d),
     leases: () => leasesPage(d), ledger: () => ledgerPage(d, switchTrack),
     help: () => helpPage(),
@@ -121,6 +124,24 @@ async function loadThreads(force = false) {
   } finally {
     threads.loading = false;
     if (currentPage() === "threads") render();
+  }
+}
+
+async function loadTerminals(force = false) {
+  if (terminalsState.loading || (!force && Date.now() - terminalsState.loadedAt < 15000)) return;
+  terminalsState.loading = true;
+  try {
+    const data = await api("/api/terminals");
+    terminalsState.rows = data.terminals || [];
+    terminalsState.sharing = Boolean(data.sharing);
+    terminalsState.loadedAt = Date.now();
+    terminalsState.error = "";
+  } catch (e) {
+    terminalsState.error = String(e);
+    terminalsState.loadedAt = Date.now();
+  } finally {
+    terminalsState.loading = false;
+    if (currentPage() === "terminals") render();
   }
 }
 

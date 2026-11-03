@@ -1306,6 +1306,263 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertTrue(usage["limit_hit"]["recent"])
         self.assertIn("Rate limit exceeded", usage["limit_hit"]["message"])
 
+    def test_opencode_times_support_milliseconds_seconds_and_null(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute(
+                "CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT, time_updated INTEGER, "
+                "cost REAL, agent TEXT, model TEXT, parent_id TEXT)"
+            )
+            con.execute(
+                "CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT, time_created INTEGER, seq INTEGER)"
+            )
+            for sid, updated in (("ms", 1700000000000), ("seconds", 1700000000), ("null", None)):
+                con.execute(
+                    "INSERT INTO session_v2 (id, title, time_updated) VALUES (?, ?, ?)",
+                    (sid, sid, updated),
+                )
+                con.execute(
+                    "INSERT INTO session_message (session_id, type, data, time_created, seq) VALUES (?, ?, ?, ?, ?)",
+                    (sid, "user", json.dumps({"text": sid}), updated, 1),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+        chats = {chat["id"]: chat for chat in server.opencode_list()}
+        self.assertEqual(chats["ms"]["updated"], 1700000000)
+        self.assertEqual(chats["seconds"]["updated"], 1700000000)
+        self.assertIsNone(chats["null"]["updated"])
+        expected_date = _dt.datetime.fromtimestamp(1700000000).strftime("%Y-%m-%d %H:%M")
+        self.assertEqual(server.fmt_ts(chats["ms"]["updated"]), expected_date)
+        self.assertEqual(server.fmt_ts(chats["seconds"]["updated"]), expected_date)
+        for sid in ("ms", "seconds", "null"):
+            turns = server.opencode_read(sid)
+            self.assertEqual(turns[0]["text"], sid)
+            self.assertEqual(turns[0]["ts"], chats[sid]["updated"])
+
+    def test_recent_tool_activity_for_antigravity_and_opencode(self):
+        agy_path = os.path.join(self.test_dir, "transcript.jsonl")
+        with open(agy_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "PLANNER_RESPONSE", "created_at": "2026-10-02T10:02:00Z",
+                "tool_calls": [{"name": "read_file", "args": {"Path": "notes.txt", "token": "private-value"}}],
+            }) + "\n")
+        agy_chat = {"id": "agy-tool-test", "source": "antigravity", "path": agy_path,
+                    "title": "Antigravity tool test"}
+        with mock.patch.object(server, "resolve", return_value=agy_chat):
+            agy_recent = server.t_read_chat("agy-tool-test", source="antigravity", mode="recent")
+        self.assertIn("Last tool: read_file:", agy_recent)
+        self.assertIn("[REDACTED]", agy_recent)
+        self.assertNotIn("private-value", agy_recent)
+
+        con = sqlite3.connect(os.path.join(self.opencode_dir, "opencode.db"))
+        try:
+            con.execute(
+                "CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT, time_created INTEGER, seq INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                ("opencode-tool-test", "assistant", json.dumps({
+                    "content": [{"type": "tool", "name": "read_file",
+                                 "input": {"path": "notes.txt", "token": "private-value"}}],
+                }), 1790935320000, 1),
+            )
+            con.commit()
+        finally:
+            con.close()
+        opencode_chat = {"id": "opencode-tool-test", "source": "opencode",
+                         "title": "OpenCode tool test"}
+        with mock.patch.object(server, "resolve", return_value=opencode_chat):
+            opencode_recent = server.t_read_chat("opencode-tool-test", source="opencode", mode="recent")
+        self.assertIn("Last tool: read_file:", opencode_recent)
+        self.assertIn("[REDACTED]", opencode_recent)
+        self.assertNotIn("private-value", opencode_recent)
+
+    def test_worktree_chats_hidden_from_default_threads_and_remain_resolvable(self):
+        worktree = os.path.join(server.SUBWAY_DIR, "worktrees", "worker_test123")
+        os.makedirs(worktree, exist_ok=True)
+        os.makedirs(server.WORKERS_DIR, exist_ok=True)
+        with open(os.path.join(server.WORKERS_DIR, "worker_test123.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "worker_test123", "session_id": "worker-session-id"}, f)
+
+        chats = {
+            "claude": {"source": "claude", "id": "claude-worktree", "title": "Claude worktree", "project": worktree},
+            "antigravity": {"source": "antigravity", "id": "agy-worktree", "title": "Agy worktree",
+                            "project": "worker_test123", "_project_path": [worktree]},
+            "opencode": {"source": "opencode", "id": "opencode-worktree", "title": "OpenCode worktree",
+                         "project": "worker_test123", "_project_path": worktree},
+            "copilot": {"source": "copilot", "id": "copilot-worktree", "title": "Copilot worktree",
+                        "project": worktree},
+        }
+        record_session = {"source": "copilot", "id": "worker-session-id", "title": "Worker session",
+                          "project": self.test_dir}
+        with mock.patch.object(server, "claude_files", return_value=["claude-file"]), \
+             mock.patch.object(server, "claude_meta", return_value=chats["claude"]), \
+             mock.patch.object(server, "agy_list", return_value=[chats["antigravity"]]), \
+             mock.patch.object(server, "opencode_list", return_value=[chats["opencode"]]), \
+             mock.patch.object(server, "copilot_list", return_value=[chats["copilot"], record_session]):
+            self.assertEqual(server.all_chats(), [])
+            self.assertEqual(server.t_list_chats(), "No chats found across Antigravity, Claude Code, OpenCode, or GitHub Copilot.")
+            visible = server.all_chats(include_subagents=True)
+            self.assertEqual(len(visible), 5)
+            self.assertEqual(server.resolve("worker-session-id")["id"], "worker-session-id")
+            self.assertEqual(server.resolve("agy-worktree")["id"], "agy-worktree")
+
+            class Handler(server.SubwayHUDHandler):
+                def __init__(self):
+                    self.path = "/api/chats"
+
+                def _gate(self, api=True):
+                    return True
+
+                def send_json(self, data, status=200):
+                    self.sent_data = data
+
+            handler = Handler()
+            handler.do_GET()
+            self.assertEqual(handler.sent_data["total"], 0)
+
+    def test_opencode_ollama_error_or_retry_is_never_a_limit_hit(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, model TEXT, time_updated INTEGER)")
+            con.execute("CREATE TABLE session_message (type TEXT, time_created INTEGER, data TEXT)")
+            now_ms = int(time.time() * 1000)
+            retry_data = json.dumps({
+                "retry": {"error": {"type": "rate-limit", "message": "slow down"}, "at": now_ms + 1000},
+                "model": {"providerID": "ollama", "id": "llama3"},
+                "tokens": {"input": 5, "output": 5},
+            })
+            error_data = json.dumps({
+                "finish": "error",
+                "error": json.dumps({"status": 429, "message": "Rate limit exceeded"}),
+                "model": {"providerID": "ollama", "id": "llama3"},
+                "tokens": {"input": 5, "output": 5},
+            })
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, retry_data))
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, error_data))
+            con.commit()
+        finally:
+            con.close()
+
+        usage = server._fetch_opencode_usage()
+        self.assertIsNone(usage.get("limit_hit"))
+        self.assertNotIn("ollama/llama3", usage.get("limited") or {})
+
+    def test_opencode_finish_error_attributed_to_its_own_model(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, model TEXT, time_updated INTEGER)")
+            con.execute("CREATE TABLE session_message (type TEXT, time_created INTEGER, data TEXT)")
+            now_ms = int(time.time() * 1000)
+            error_data = json.dumps({
+                "finish": "error",
+                "error": json.dumps({"status": 429, "message": "Rate limit exceeded"}),
+                "model": {"providerID": "anthropic", "id": "claude-3.5-sonnet"},
+                "tokens": {"input": 10, "output": 20},
+            })
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, error_data))
+            con.commit()
+        finally:
+            con.close()
+
+        usage = server._fetch_opencode_usage()
+        key = "anthropic/claude-3.5-sonnet"
+        self.assertIn(key, usage.get("limited") or {})
+        self.assertEqual(usage["limited"][key]["retry_at"], 0)
+        self.assertEqual(usage["limit_hit"]["model"], key)
+
+    def test_opencode_view_never_names_a_model_that_didnt_hit_limit(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE session_v2 (id TEXT, model TEXT, time_updated INTEGER)")
+            con.execute("CREATE TABLE session_message (type TEXT, time_created INTEGER, data TEXT)")
+            now_ms = int(time.time() * 1000)
+            # The last-used model is local: it never hits a free limit, so it must never be named either.
+            con.execute("INSERT INTO session_v2 (id, model, time_updated) VALUES (?, ?, ?)",
+                        ("s1", json.dumps({"providerID": "ollama", "id": "llama3"}), now_ms))
+            error_data = json.dumps({
+                "finish": "error",
+                "error": json.dumps({"status": 429, "message": "Rate limit exceeded"}),
+                "model": {"providerID": "anthropic", "id": "claude-3.5-sonnet"},
+                "tokens": {"input": 10, "output": 20},
+            })
+            con.execute("INSERT INTO session_message (type, time_created, data) VALUES (?, ?, ?)",
+                        ("assistant", now_ms, error_data))
+            con.commit()
+        finally:
+            con.close()
+
+        view = server._opencode_view({}, True)
+        self.assertIn("anthropic/claude-3.5-sonnet", view["note"])
+        self.assertNotIn("ollama", view["note"])
+        self.assertNotIn("llama3", view["note"])
+
+    def test_darwin_memory_uses_memorystatus_level_when_higher(self):
+        def fake_check_output(cmd, *a, **kw):
+            if cmd == ["sysctl", "-n", "hw.memsize"]:
+                return b"17179869184"
+            if cmd == ["vm_stat"]:
+                return ("Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+                        "Pages free:                              100.\n"
+                        "Pages inactive:                          50.\n"
+                        "Pages speculative:                       10.\n"
+                        "Pages purgeable:                         20.\n")
+            if cmd == ["sysctl", "-n", "kern.memorystatus_level"]:
+                return "80\n"
+            if cmd == ["sysctl", "-n", "vm.swapusage"]:
+                return "total = 2048.00M  used = 512.00M  free = 1536.00M\n"
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        total = 17179869184
+        page_based = (100 + 50 + 10 + 20) * 4096
+        level_based = total * 80 // 100
+        self.assertGreater(level_based, page_based)
+
+        server.memory_snapshot.clear()
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch("server.subprocess.check_output", side_effect=fake_check_output):
+            mem = server.memory_snapshot()
+        self.assertEqual(mem["total"], total)
+        self.assertEqual(mem["available"], level_based)
+        self.assertEqual(mem["swap_used"], int(512.00 * 1024 ** 2))
+
+    def test_darwin_memory_falls_back_to_page_counts_when_level_bad_or_missing(self):
+        vm_stat_out = ("Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+                       "Pages free:                              100.\n"
+                       "Pages inactive:                          50.\n"
+                       "Pages speculative:                       10.\n"
+                       "Pages purgeable:                         20.\n")
+        page_based = (100 + 50 + 10 + 20) * 4096
+
+        for level_behavior in ("command_missing", "non_numeric_output"):
+            def fake_check_output(cmd, *a, _behavior=level_behavior, **kw):
+                if cmd == ["sysctl", "-n", "hw.memsize"]:
+                    return b"17179869184"
+                if cmd == ["vm_stat"]:
+                    return vm_stat_out
+                if cmd == ["sysctl", "-n", "kern.memorystatus_level"]:
+                    if _behavior == "command_missing":
+                        raise FileNotFoundError("sysctl: unknown oid 'kern.memorystatus_level'")
+                    return "not a number\n"
+                if cmd == ["sysctl", "-n", "vm.swapusage"]:
+                    return "total = 2048.00M  used = 0.00M  free = 2048.00M\n"
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            server.memory_snapshot.clear()
+            with mock.patch.object(sys, "platform", "darwin"), \
+                    mock.patch("server.subprocess.check_output", side_effect=fake_check_output):
+                mem = server.memory_snapshot()
+            self.assertEqual(mem["available"], page_based, f"failed for level_behavior={level_behavior}")
+
     def test_private_work_never_reaches_the_cloud(self):
         self.assertEqual(server.route_task("Summarize this confidential contract")["order"], ["local"])
         self.assertEqual(server.route_task("Fix this", private=True)["order"], ["local"])
@@ -1511,6 +1768,82 @@ class TestLocalAndRouting(SubwayTestCase):
         updated = server._load_worker(worker_id)
         self.assertEqual(updated["status"], "budget_stopped")
         self.assertIn("token cap", updated.get("report", ""))
+
+    def _create_fake_agy_headless_denial(self):
+        """Prints Antigravity's headless-mode permission denial and exits clean, with no result event."""
+        script_path = os.path.join(self.test_dir, "fake_agy_denial.py")
+        code = (
+            "import sys\n"
+            "sys.stdout.write('jetski: no output produced \\u2014 a tool required the \"command\" permission "
+            "that headless mode cannot prompt for\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        return script_path
+
+    def _agy_worker_meta(self, worker_id, script_path, project_dir):
+        return {
+            "id": worker_id, "role": "Antigravity Builder", "provider": "antigravity",
+            "cmd": [sys.executable, script_path],
+            "project_dir": project_dir, "log_file": server._log_file(worker_id),
+            "status": "running", "pid": os.getpid(), "prompt": "edit the file",
+            "permission_mode": "auto_safe", "timeout_seconds": 10,
+        }
+
+    def test_headless_command_denial_with_changes_completes_with_warning(self):
+        script_path = self._create_fake_agy_headless_denial()
+        repo = os.path.join(self.test_dir, "agy_repo_with_changes")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        with open(os.path.join(repo, "note.txt"), "w", encoding="utf-8") as f:
+            f.write("a change the worker made\n")
+
+        worker_id = "worker_a9d001"
+        server._save_worker(self._agy_worker_meta(worker_id, script_path, repo))
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("command", updated.get("report", ""))
+
+    def test_headless_command_denial_with_no_changes_stays_failed(self):
+        script_path = self._create_fake_agy_headless_denial()
+        repo = os.path.join(self.test_dir, "agy_repo_no_changes")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+        worker_id = "worker_a9d002"
+        server._save_worker(self._agy_worker_meta(worker_id, script_path, repo))
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "failed")
+        self.assertIn("finished without producing a result", updated.get("report", ""))
+
+    def test_headless_command_denial_outside_git_repo_stays_failed(self):
+        script_path = self._create_fake_agy_headless_denial()
+        plain_dir = os.path.join(self.test_dir, "agy_not_a_repo")
+        os.makedirs(plain_dir)
+
+        worker_id = "worker_a9d003"
+        server._save_worker(self._agy_worker_meta(worker_id, script_path, plain_dir))
+        code = server.supervise_worker(worker_id)
+        self.assertEqual(code, 0)
+        updated = server._load_worker(worker_id)
+        self.assertEqual(updated["status"], "failed")
+
+
+class TestHeadlessPermissionDenialParsing(unittest.TestCase):
+    def test_matches_the_antigravity_headless_denial_text(self):
+        log = ('jetski: no output produced — a tool required the "command" permission '
+               'that headless mode cannot prompt for')
+        self.assertEqual(server._headless_permission_denial(log), "command")
+
+    def test_no_match_on_ordinary_log_text(self):
+        self.assertIsNone(server._headless_permission_denial("Finished. Added the missing test case."))
+        self.assertIsNone(server._headless_permission_denial(""))
+        self.assertIsNone(server._headless_permission_denial(None))
 
 
 class TestIsolatedWorkerOutcome(unittest.TestCase):

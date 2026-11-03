@@ -62,6 +62,7 @@ class TestCopilotWorkers(unittest.TestCase):
                             self.assertIn("--acp", cmd)
                             self.assertNotIn("-p", cmd)
                             self.assertNotIn("--allow-all-tools", cmd)
+                            self.assertNotIn("--sandbox", cmd)
                         elif mode == "auto_safe":
                             self.assertIn("-p", cmd)
                             self.assertNotIn("--acp", cmd)
@@ -73,13 +74,14 @@ class TestCopilotWorkers(unittest.TestCase):
                             )
                             self.assertEqual(
                                 write_rules,
-                                [f"--allow-tool=write({os.path.realpath(expected_dir)})"],
+                                [f"--allow-tool=write({os.path.realpath(expected_dir)}/**)"],
                             )
                             shell_rules = {arg for arg in cmd if arg.startswith("--allow-tool=shell(")}
                             self.assertEqual(
                                 shell_rules,
-                                {f"--allow-tool=shell({command}:*)" for command in server.AGY_SAFE_COMMANDS},
+                                {f"--allow-tool=shell({command}:*)" for command in server.AGY_SAFE_COMMANDS + server.COPILOT_SANDBOXED_COMMANDS},
                             )
+                            self.assertIn("--sandbox", cmd)
                         else:
                             self.assertIn("--allow-all-tools", cmd)
                             self.assertNotIn("--acp", cmd)
@@ -244,7 +246,7 @@ class TestCopilotPermissionFallback(unittest.TestCase):
                 self.assertIn("-p", saved["cmd"])
                 self.assertIn("--allow-tool=shell(ls:*)", saved["cmd"])
                 expected_write = os.path.join(server.SUBWAY_DIR, "worktrees", meta["id"]) if isolate else meta["project_dir"]
-                self.assertIn(f"--allow-tool=write({os.path.realpath(expected_write)})", saved["cmd"])
+                self.assertIn(f"--allow-tool=write({os.path.realpath(expected_write)}/**)", saved["cmd"])
                 self.assertNotIn("--max-ai-credits", saved["cmd"])
 
     def test_acp_handshake_failure_falls_back_and_success_does_not_add_note(self):
@@ -868,9 +870,10 @@ class TestCopilotIntegration(unittest.TestCase):
 class TestCopilotChatTransit(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self.home = os.path.join(self.temp_dir, "home")
         self.copilot_dir = os.path.join(self.temp_dir, "copilot")
         self.workers_dir = os.path.join(self.temp_dir, "workers")
-        self.vscode_user = os.path.join(self.temp_dir, "Code", "User")
+        self.vscode_user = os.path.join(self.home, "Library", "Application Support", "Code", "User")
         cli_dir = os.path.join(self.copilot_dir, "session-state", "copilot-cli-sample")
         workspace = os.path.join(self.vscode_user, "workspaceStorage", "workspace-hash")
         chat_dir = os.path.join(workspace, "chatSessions")
@@ -890,9 +893,19 @@ class TestCopilotChatTransit(unittest.TestCase):
         with open(os.path.join(empty_dir, "copilot-empty-sample.jsonl"), "w", encoding="utf-8") as f:
             f.write(empty_fixture)
         self.patches = [
+            patch.object(server, "HOME", self.home),
+            patch.object(server, "CLAUDE_DIR", os.path.join(self.home, ".claude")),
+            patch.object(server, "CLAUDE_JSON", os.path.join(self.home, ".claude.json")),
+            patch.object(server, "AGY_DIR", os.path.join(self.home, ".gemini", "antigravity")),
+            patch.object(server, "OPENCODE_DIR", os.path.join(self.home, ".local", "share", "opencode")),
+            patch.object(server, "OPENCODE_AGENTS_DIR", os.path.join(self.home, ".config", "opencode", "agents")),
             patch.object(server, "COPILOT_DIR", self.copilot_dir),
-            patch.object(server, "WORKERS_DIR", self.workers_dir),
             patch.object(server, "SUBWAY_DIR", os.path.join(self.temp_dir, "subway")),
+            patch.object(server, "LOCKS_FILE", os.path.join(self.temp_dir, "subway", "locks.json")),
+            patch.object(server, "WORKERS_DIR", self.workers_dir),
+            patch.object(server, "TRACKS_DIR", os.path.join(self.temp_dir, "subway", "tracks")),
+            patch.object(server, "QUOTAS_FILE", os.path.join(self.temp_dir, "subway", "quotas.json")),
+            patch.object(server, "HUD_DIR", os.path.join(self.home, "hud")),
             patch.object(server, "_vscode_user_dirs", return_value=[self.vscode_user]),
         ]
         for item in self.patches:
@@ -905,6 +918,18 @@ class TestCopilotChatTransit(unittest.TestCase):
 
     def _chat(self, chat_id="copilot-cli-sample"):
         return next(c for c in server.copilot_list(include_subagents=True) if c["id"] == chat_id)
+
+    def _vscode_transcript_path(self):
+        workspace = os.path.join(self.vscode_user, "workspaceStorage", "workspace-hash")
+        return os.path.join(workspace, "GitHub.copilot-chat", "transcripts",
+                            "copilot-vscode-sample.jsonl")
+
+    def _write_vscode_transcript(self, events):
+        path = self._vscode_transcript_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(events) + ("\n" if events else ""))
+        return path
 
     def test_list_read_search_segments_and_token_usage(self):
         chats = server.copilot_list()
@@ -941,6 +966,65 @@ class TestCopilotChatTransit(unittest.TestCase):
         self.assertTrue(any("compaction boundary" in turn["text"] for turn in all_segments[0]
                             if turn["role"] == "summary"))
         self.assertIn("Review the synthetic parser fixture.", server.t_search_chat(quote="read-only", source="copilot"))
+
+    def test_vscode_transcript_updates_activity_and_supplies_tools_and_missing_messages(self):
+        vscode_path = os.path.join(self.vscode_user, "workspaceStorage", "workspace-hash",
+                                   "chatSessions", "copilot-vscode-sample.jsonl")
+        with open(vscode_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": 1, "k": ["requests", "0", "timestamp"],
+                                "v": "2026-10-04T10:00:00Z"}) + "\n")
+        newest_ms = int(server.sort_key_ts("2026-10-06T10:00:00Z") * 1000)
+        events = [
+            {"type": "user.message", "timestamp": "2026-10-04T10:00:01Z",
+             "data": {"content": "Explain the synthetic patch stream."}},
+            {"type": "assistant.message", "timestamp": "2026-10-04T10:00:02Z",
+             "data": {"content": "This is a synthetic Copilot response."}},
+            {"type": "tool.execution_start", "timestamp": "2026-10-04T10:01:00Z",
+             "data": {"toolName": "read_file", "toolCallId": "tool-1",
+                      "arguments": {"path": "notes.txt", "password": "top-secret-value",
+                                    "payload": "x" * 220}}},
+            {"type": "tool.execution_complete", "timestamp": newest_ms,
+             "data": {"toolName": "read_file", "toolCallId": "tool-1", "success": True}},
+            {"type": "assistant.message", "timestamp": "2026-10-05T10:00:00Z",
+             "data": {"content": "Transcript-only follow-up."}},
+        ]
+        transcript_path = self._write_vscode_transcript([json.dumps(event) for event in events])
+        old_mtime = server.sort_key_ts("2026-10-03T10:00:00Z")
+        os.utime(transcript_path, (old_mtime, old_mtime))
+
+        chat = next(c for c in server.copilot_list() if c["id"] == "copilot-vscode-sample")
+        self.assertEqual(chat["updated"], newest_ms / 1000)
+        result = server.t_read_chat("copilot-vscode-sample", source="copilot", mode="recent")
+        self.assertIn("[tool read_file] input:", result)
+        self.assertIn("[REDACTED]", result)
+        self.assertNotIn("top-secret-value", result)
+        self.assertIn("Transcript-only follow-up.", result)
+        tool_turn = next(turn for segment in server.copilot_read_segments(chat)[0]
+                         for turn in segment if turn.get("tool_name") == "read_file")
+        self.assertEqual(len(tool_turn["text"].split("input: ", 1)[1]), 120)
+        self.assertTrue(result.rstrip().splitlines()[-1].startswith("Last tool: read_file:"))
+        self.assertIn("notes.txt", result.rstrip().splitlines()[-1])
+
+    def test_vscode_missing_empty_and_malformed_transcripts_are_safe(self):
+        vscode_chat = next(c for c in server.copilot_list() if c["id"] == "copilot-vscode-sample")
+        before = server.copilot_read_segments(vscode_chat)
+        read_before = server.t_read_chat("copilot-vscode-sample", source="copilot", mode="recent")
+        self.assertNotIn("Last tool:", read_before)
+        empty_path = self._write_vscode_transcript([])
+        self.assertEqual(server.copilot_read_segments(vscode_chat), before)
+        self.assertIn("This is a synthetic Copilot response.",
+                      server.t_read_chat("copilot-vscode-sample", source="copilot", mode="recent"))
+        with open(empty_path, "w", encoding="utf-8") as f:
+            f.write("{malformed json\n")
+            f.write(json.dumps({
+                "type": "tool.execution_start", "timestamp": "2026-10-04T11:00:00Z",
+                "data": {"toolName": "safe_tool", "arguments": {"query": "hello"}},
+            }) + "\n")
+        listed = server.copilot_list()
+        self.assertTrue(any(chat["id"] == "copilot-vscode-sample" for chat in listed))
+        result = server.t_read_chat("copilot-vscode-sample", source="copilot", mode="recent")
+        self.assertIn("[tool safe_tool] input:", result)
+        self.assertTrue(result.rstrip().splitlines()[-1].startswith("Last tool: safe_tool:"))
 
     def test_subway_worker_sessions_are_hidden_unless_requested(self):
         worker_id = "copilot-worker-sample"
@@ -989,7 +1073,25 @@ class TestCopilotChatTransit(unittest.TestCase):
 
         chat = next(c for c in server.copilot_list() if c["id"] == "copilot-cli-sample")
         self.assertEqual(chat["project"], "/indexed/copilot-project")
-        self.assertEqual(chat["updated"], "2026-10-03T10:00:00Z")
+        self.assertEqual(chat["updated"], "2026-10-01T10:06:00Z")
+
+    def test_cli_last_active_uses_newest_event_or_file_mtime(self):
+        events_path = os.path.join(self.temp_dir, "session-state-test.jsonl")
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session.start", "timestamp": "2026-10-01T10:00:00Z",
+                                "data": {"sessionId": "session-time-test"}}) + "\n")
+            f.write(json.dumps({"type": "result", "timestamp": "2026-10-01T10:08:00Z",
+                                "sessionId": "session-time-test"}) + "\n")
+        meta = server._copilot_cli_meta(
+            events_path, {"session-time-test": {"updated_at": "2026-11-01T00:00:00Z"}}, {}, set()
+        )
+        self.assertEqual(meta["updated"], "2026-10-01T10:08:00Z")
+
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session.start", "data": {"sessionId": "session-time-test"}}) + "\n")
+        with patch("server.os.path.getmtime", return_value=1800000000):
+            meta = server._copilot_cli_meta(events_path, {}, {}, set())
+        self.assertEqual(meta["updated"], 1800000000)
 
     def test_alias_resolution_and_threads_api(self):
         with patch.object(server, "all_chats", return_value=server.copilot_list(include_subagents=True)):
@@ -1023,6 +1125,79 @@ class TestCopilotChatTransit(unittest.TestCase):
         with patch.object(server, "COPILOT_DIR", missing), patch.object(server, "_vscode_user_dirs", return_value=[missing]):
             self.assertEqual(server.copilot_list(), [])
             self.assertIsNone(server.chat_tokens_used("missing-session"))
+
+    def test_copilot_reader_tool_calls_permissions_subagents_and_summary_text(self):
+        sample_dir = os.path.join(self.copilot_dir, "session-state", "copilot-gaps-sample")
+        os.makedirs(sample_dir)
+        events = [
+            {"type": "session.start", "timestamp": "2026-10-02T10:00:00Z",
+             "data": {"sessionId": "copilot-gaps-sample", "selectedModel": "gpt-synthetic"}},
+            {"type": "user.message", "timestamp": "2026-10-02T10:01:00Z",
+             "data": {"content": "Run the task and fetch api data."}},
+            {"type": "tool.execution_start", "timestamp": "2026-10-02T10:02:00Z",
+             "data": {"toolName": "fetch_api", "toolCallId": "call_123",
+                      "arguments": {"endpoint": "/v1/data", "token": "ghp_1234567890abcdef123456"}}},
+            {"type": "tool.execution_complete", "timestamp": "2026-10-02T10:02:10Z",
+             "data": {"toolCallId": "call_123", "success": True,
+                      "result": "Fetched data safely with password=supersecretpassword"}},
+            {"type": "permission.requested", "timestamp": "2026-10-02T10:03:00Z",
+             "data": {"command": "curl -H 'Authorization: Bearer secrettoken123' https://api.com"}},
+            {"type": "permission.completed", "timestamp": "2026-10-02T10:03:05Z",
+             "data": {"decision": "allow"}},
+            {"type": "subagent.started", "timestamp": "2026-10-02T10:04:00Z",
+             "data": {"subagentId": "sub_1", "role": "Analyzer", "description": "Analyzing payload"}},
+            {"type": "subagent.finish", "timestamp": "2026-10-02T10:04:30Z",
+             "data": {"subagentId": "sub_1", "role": "Analyzer", "status": "completed"}},
+            {"type": "summary_text", "timestamp": "2026-10-02T10:05:00Z",
+             "data": {"text": "summary_text line that is not compaction"}},
+            {"type": "assistant.message", "timestamp": "2026-10-02T10:06:00Z",
+             "data": {"content": "DECISION: We will proceed with the verified payload."}},
+        ]
+        events_path = os.path.join(sample_dir, "events.jsonl")
+        with open(events_path, "w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+
+        chat = {"id": "copilot-gaps-sample", "source": "copilot", "path": events_path}
+
+        # 1. Test copilot_read_segments directly
+        segs_full, has_markers_full = server.copilot_read_segments(dict(chat, mode="full"))
+        # summary_text must not create compaction boundary
+        self.assertFalse(has_markers_full)
+        self.assertEqual(len(segs_full), 1)
+
+        # 2. Test read_chat mode "full"
+        full_output = server.t_read_chat("copilot-gaps-sample", source="copilot", mode="full")
+        # Check tool input and complete result
+        self.assertIn("[tool fetch_api]", full_output)
+        self.assertIn("/v1/data", full_output)
+        self.assertIn("[success]", full_output)
+        # Secrets redacted
+        self.assertNotIn("ghp_1234567890abcdef123456", full_output)
+        self.assertNotIn("supersecretpassword", full_output)
+        self.assertNotIn("secrettoken123", full_output)
+        self.assertIn("[REDACTED]", full_output)
+
+        # Check permissions
+        self.assertIn("[permission requested]", full_output)
+        self.assertIn("[permission completed] allow", full_output)
+
+        # Check subagents
+        self.assertIn("[subagent start]", full_output)
+        self.assertIn("[subagent finish]", full_output)
+        self.assertIn("Analyzer", full_output)
+
+        # 3. Test read_chat mode "decisions"
+        decisions_output = server.t_read_chat("copilot-gaps-sample", source="copilot", mode="decisions")
+        # Mode decisions keeps names only, does not show raw input/result dumps
+        self.assertNotIn("/v1/data", decisions_output)
+        self.assertNotIn("Fetched data safely", decisions_output)
+        self.assertIn("proceed with the verified payload", decisions_output)
+
+        recent_output = server.t_read_chat("copilot-gaps-sample", source="copilot", mode="recent")
+        self.assertIn("Last tool: fetch_api:", recent_output)
+        self.assertIn("[REDACTED]", recent_output)
+        self.assertNotIn("ghp_1234567890abcdef123456", recent_output)
 
 
 if __name__ == "__main__":

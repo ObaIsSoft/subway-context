@@ -1,0 +1,373 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        type: choice
+        options:
+          - preview
+          - production
+        default: preview
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          # Tests and npx vsce run in this job; don't leave a write token in .git/config.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install npm
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.16.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Check production branch
+        if: inputs.channel == 'production' && github.ref != 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          echo "Production releases run from main only." >&2
+          exit 1
+
+      - name: Check version numbers match
+        run: |
+          set -euo pipefail
+          BASE="$(node -p "require('./package.json').version")"
+          if [ -z "$BASE" ] || [ "$BASE" = "undefined" ]; then
+            echo "Could not read the version from package.json." >&2
+            exit 1
+          fi
+          python3 - "$BASE" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          base = sys.argv[1]
+          server = pathlib.Path("server.py").read_text(encoding="utf-8")
+          match = re.search(r'^VERSION = "([^"]+)"$', server, re.MULTILINE)
+          if match is None:
+              raise SystemExit("Could not find the VERSION line in server.py.")
+          if match.group(1) != base:
+              raise SystemExit(f"server.py VERSION is {match.group(1)}, but package.json is {base}.")
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          if not any(line.startswith(f"## {base} ") for line in changelog):
+              raise SystemExit(f"CHANGELOG.md has no section for {base}.")
+          PY
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          SUBWAY_NO_NOTIFY=1 python3 -m unittest discover -s tests
+
+      - name: Choose release version
+        id: version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          published_version() {
+            local spec="$1"
+            local err status out
+            err="$(mktemp)"
+            set +e
+            out="$(npm view "$spec" version 2>"$err")"
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ]; then
+              rm -f "$err"
+              printf '%s\n' "$out"
+              return 0
+            fi
+            if grep -q "E404" "$err"; then
+              rm -f "$err"
+              return 0
+            fi
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
+          }
+
+          if ! PUBLISHED="$(published_version "subway-context@$BASE")"; then
+            echo "Could not check npm for subway-context $BASE." >&2
+            exit 1
+          fi
+          if [ "$PUBLISHED" = "$BASE" ]; then
+            if [ "$CHANNEL" = "production" ]; then
+              echo "subway-context $BASE is already on npm." >&2
+            else
+              echo "subway-context $BASE is already on npm, so no previews can be made for it." >&2
+            fi
+            exit 1
+          fi
+
+          if [ "$CHANNEL" = "production" ]; then
+            if gh release view "v$BASE" >/dev/null 2>&1; then
+              echo "GitHub release v$BASE already exists." >&2
+              exit 1
+            fi
+            VERSION="$BASE"
+          else
+            VERSIONS_FILE="$(mktemp)"
+            trap 'rm -f "$VERSIONS_FILE"' EXIT
+            if ! npm view subway-context versions --json > "$VERSIONS_FILE"; then
+              echo "Could not read the published versions from npm." >&2
+              exit 1
+            fi
+            VERSION="$(python3 - "$BASE" "$VERSIONS_FILE" <<'PY'
+          import json
+          import re
+          import sys
+
+          base, path = sys.argv[1], sys.argv[2]
+          with open(path, encoding="utf-8") as handle:
+              data = json.load(handle)
+          if isinstance(data, str):
+              versions = [data]
+          elif isinstance(data, list):
+              versions = [item for item in data if isinstance(item, str)]
+          else:
+              raise SystemExit("Unexpected output from npm view.")
+          pattern = re.compile(r"^" + re.escape(base) + r"-rc\.(\d+)$")
+          numbers = []
+          for version in versions:
+              match = pattern.match(version)
+              if match:
+                  numbers.append(int(match.group(1)))
+          print(f"{base}-rc.{max(numbers) + 1 if numbers else 1}")
+          PY
+            )"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "Could not work out the release version." >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set preview version in the checkout
+        if: inputs.channel == 'preview'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version "$VERSION" --no-git-tag-version
+          python3 -c '
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          path = pathlib.Path("server.py")
+          text = path.read_text(encoding="utf-8")
+          pattern = re.compile(r"^VERSION = \"[^\"]*\"$", re.MULTILINE)
+          updated, count = pattern.subn("VERSION = \"" + version + "\"", text)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one VERSION line in server.py, found {count}.")
+          path.write_text(updated, encoding="utf-8")
+          ' "$VERSION"
+          COUNT="$(grep -c '^VERSION = "' server.py)"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "Expected exactly one VERSION line in server.py, found $COUNT." >&2
+            exit 1
+          fi
+
+      - name: Build release files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          npm pack --pack-destination dist
+          if [ ! -f vscode/subway-context.vsix ]; then
+            echo "vscode/subway-context.vsix was not built by npm pack." >&2
+            exit 1
+          fi
+          cp vscode/subway-context.vsix "dist/subway-context-$VERSION.vsix"
+          if [ ! -f "dist/subway-context-$VERSION.tgz" ]; then
+            echo "dist/subway-context-$VERSION.tgz is missing." >&2
+            exit 1
+          fi
+          if [ ! -f "dist/subway-context-$VERSION.vsix" ]; then
+            echo "dist/subway-context-$VERSION.vsix is missing." >&2
+            exit 1
+          fi
+
+      - name: Write release notes
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          python3 - "$BASE" "$CHANNEL" <<'PY'
+          import pathlib
+          import sys
+
+          base, channel = sys.argv[1], sys.argv[2]
+          lines = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          start = None
+          for index, line in enumerate(lines):
+              if line.startswith(f"## {base} "):
+                  start = index
+                  break
+          if start is None:
+              raise SystemExit(f"CHANGELOG.md has no section for {base}.")
+          body = []
+          for line in lines[start + 1:]:
+              if line.startswith("## "):
+                  break
+              body.append(line)
+          while body and not body[0].strip():
+              body.pop(0)
+          while body and not body[-1].strip():
+              body.pop()
+          notes = []
+          if channel == "preview":
+              notes.append("Preview build. Install with `npm i -g subway-context@next`. The normal install still gets the current release.")
+              notes.append("")
+          notes.extend(body)
+          pathlib.Path("dist/notes.md").write_text("\n".join(notes) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          retention-days: 30
+
+      - name: Create draft GitHub release
+        if: inputs.channel == 'production'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" dist/*.tgz dist/*.vsix --draft --target "$GITHUB_SHA" --title "v$VERSION" --notes-file dist/notes.md
+
+  publish-preview:
+    needs: check
+    if: inputs.channel == 'preview'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install npm
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.16.0
+
+      - name: Publish to npm under next
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm publish "dist/subway-context-$VERSION.tgz" --tag next --access public
+
+      - name: Publish the GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" "dist/subway-context-$VERSION.tgz" "dist/subway-context-$VERSION.vsix" --prerelease --target "$GITHUB_SHA" --title "v$VERSION (preview)" --notes-file dist/notes.md --repo "$GITHUB_REPOSITORY"
+
+  publish-production:
+    needs: check
+    if: inputs.channel == 'production'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install npm
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.16.0
+
+      - name: Check the version is still unpublished
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          ERR="$(mktemp)"
+          trap 'rm -f "$ERR"' EXIT
+          set +e
+          OUT="$(npm view "subway-context@$VERSION" version 2>"$ERR")"
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ] && [ "$OUT" = "$VERSION" ]; then
+            echo "subway-context $VERSION was published while this run waited." >&2
+            exit 1
+          fi
+          if [ "$STATUS" -ne 0 ] && ! grep -q "E404" "$ERR"; then
+            echo "Could not check npm for subway-context $VERSION." >&2
+            cat "$ERR" >&2
+            exit 1
+          fi
+
+      - name: Publish to npm under latest
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm publish "dist/subway-context-$VERSION.tgz" --tag latest --access public
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release edit "v$VERSION" --draft=false --latest --repo "$GITHUB_REPOSITORY"

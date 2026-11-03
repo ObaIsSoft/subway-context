@@ -31,10 +31,104 @@ export function modeControl(settings) {
   const current = settings.permission_mode;
   return h("section", { class: "card", "aria-labelledby": "mode-title" },
     h("div", {}, h("h2", { class: "card-title", id: "mode-title" }, "Worker permissions"),
-      h("div", { class: "card-sub" }, "How spun agents get permission to act. You can override this per worker.")),
+      h("div", { class: "card-sub" }, "How spun agents get permission to act. Any chat can override this for itself on the Chat threads page; a chat's override always wins over this universal default.")),
     h("div", { class: "seg", role: "group", "aria-labelledby": "mode-title" }, Object.entries(modes).map(([key, label]) =>
       h("button", { type: "button", "aria-pressed": String(key === current), on: { click: () => act("/api/settings", { permission_mode: key }) } }, label))),
     current === "auto_approve" ? h("div", { class: "err" }, "Workers will not ask before running commands.") : null);
+}
+
+/* ---- Terminal commands: a mode of its own, plus the protected list ---- */
+export function terminalCommandsCard(settings) {
+  const s = settings || {};
+  const modes = s.permission_modes || {
+    ask: "Approve everything",
+    auto_safe: "Auto-approve safe commands",
+    auto_approve: "Auto-approve everything",
+  };
+  const current = s.terminal_mode || "ask";
+  const protectedCommands = Array.isArray(s.protected_commands) ? s.protected_commands : [];
+  const exceptions = Array.isArray(s.protected_exceptions) ? s.protected_exceptions : [];
+  const post = (body) => act("/api/settings", body);
+
+  const listEditor = (title, hint, key, items) => {
+    const input = h("input", {
+      type: "text",
+      value: "",
+      placeholder: "e.g. npm publish",
+      "aria-label": `Add an entry to ${title}`,
+    });
+    const add = () => {
+      const value = input.value.trim();
+      if (!value) return;
+      if (items.includes(value)) {
+        input.value = "";
+        return;
+      }
+      post({ [key]: [...items, value] });
+    };
+    const chips = items.length
+      ? h("div", { class: "btns" }, items.map((item) => h("span", { class: "tag" }, item,
+          h("button", {
+            class: "btn",
+            type: "button",
+            "aria-label": `Remove ${item}`,
+            on: { click: () => post({ [key]: items.filter((value) => value !== item) }) },
+          }, "×"))))
+      : h("div", { class: "row-sub" }, "None.");
+    return h("div", { class: "field full" },
+      h("div", { class: "label" }, title),
+      h("div", { class: "row-sub" }, hint),
+      chips,
+      h("div", { class: "btns" },
+        h("div", { class: "field", style: "flex: 1 1 220px;" }, input),
+        h("button", { class: "btn", type: "button", on: { click: add } }, "Add")));
+  };
+
+  let confirming = false;
+  const resetArea = h("div", { class: "btns" });
+  const renderReset = () => {
+    resetArea.replaceChildren();
+    if (!confirming) {
+      resetArea.append(h("button", {
+        class: "btn",
+        type: "button",
+        on: { click: () => { confirming = true; renderReset(); } },
+      }, "Reset to defaults"));
+      return;
+    }
+    resetArea.append(
+      h("div", { class: "row-sub", role: "status" }, "Reset both lists to the defaults?"),
+      h("button", {
+        class: "btn primary",
+        type: "button",
+        on: { click: () => { confirming = false; post({ protected_reset: true }); renderReset(); } },
+      }, "Reset"),
+      h("button", {
+        class: "btn",
+        type: "button",
+        on: { click: () => { confirming = false; renderReset(); } },
+      }, "Cancel"));
+  };
+  renderReset();
+
+  return h("section", { class: "card", "aria-labelledby": "terminal-mode-title" },
+    h("div", { class: "card-head" },
+      h("div", {},
+        h("h2", { class: "card-title", id: "terminal-mode-title" }, "Terminal commands"),
+        h("div", { class: "card-sub" }, "Separate from worker permissions. Protected commands below always ask."))),
+    h("div", { class: "seg", role: "group", "aria-labelledby": "terminal-mode-title" },
+      Object.entries(modes).map(([key, label]) => h("button", {
+        type: "button",
+        "aria-pressed": String(key === current),
+        style: "min-height: 44px;",
+        on: { click: () => post({ terminal_mode: key }) },
+      }, label))),
+    current === "auto_approve"
+      ? h("div", { class: "err" }, "Terminal commands will run without asking, except protected commands.")
+      : null,
+    listEditor("Protected commands", "These always ask, in every mode.", "protected_commands", protectedCommands),
+    listEditor("Allowed without asking (exceptions)", "A command here skips its matching protected rule, never the others.", "protected_exceptions", exceptions),
+    resetArea);
 }
 
 export function settingsCard(settings) {
@@ -364,7 +458,9 @@ function workerTags(w) {
     }
   }
   const u = w.usage;
-  if (u && (u.input || u.output)) tags.push(h("span", { class: "tag num" }, `${tokens(u.input)} in, ${tokens(u.output)} out`));
+  const isEstimate = Boolean(w.estimate || (u && u.estimate));
+  if (u && (u.input || u.output)) tags.push(h("span", { class: "tag num" }, `${tokens(u.input)} in, ${tokens(u.output)} out${isEstimate ? " (estimate)" : ""}`));
+  else if (isEstimate) tags.push(h("span", { class: "tag" }, "estimate"));
   return tags;
 }
 
@@ -488,7 +584,7 @@ function workerRow(w, past) {
     logPre);
 }
 
-function openDelegate(d) {
+export function openDelegate(d, prefillPrompt = "") {
   const choices = d.quotas.providers.filter((p) => p.client && p.client.dispatchable);
   const provider = h("select", {}, h("option", { value: "auto" }, "Auto (first with budget)"), choices.map((p) => h("option", { value: p.id }, p.name)));
   const modes = d.settings.permission_modes;
@@ -505,7 +601,7 @@ function openDelegate(d) {
   const usd = input({ type: "number", min: 0, step: 0.5 });
   const maxTokens = input({ type: "number", min: 0 });
   const keepPrivate = h("input", { type: "checkbox" });
-  const prompt = h("textarea", { required: true });
+  const prompt = h("textarea", { required: true, value: prefillPrompt });
   const god = h("input", { type: "checkbox" });
   const verdict = h("div", { class: "verdict field full", role: "status" }, "Choose an agent to check its real limits.");
   const num = (el) => (el.value === "" ? null : parseFloat(el.value));
@@ -946,7 +1042,7 @@ export function workersPage(d) {
 
   return [
     permissionsCard(d.permissions || []),
-    h("div", { class: "controls-grid" }, modeControl(d.settings), settingsCard(d.settings)),
+    h("div", { class: "controls-grid" }, modeControl(d.settings), settingsCard(d.settings), terminalCommandsCard(d.settings)),
     hasChatScope ? null : chatBudgetCard,
     h("section", { class: "card" },
       h("div", { class: "card-head" },
@@ -1005,7 +1101,10 @@ export function leasesPage(d) {
 /* Copilot and other provider chat sessions, loaded from the read-only threads API. */
 export const threads = { chats: [], loadedAt: 0, loading: false, error: "" };
 
-export function threadsPage(chats, onRefresh, error = "") {
+export function threadsPage(d, chats, onRefresh, error = "") {
+  const settings = (d && d.settings) || {};
+  const modes = settings.permission_modes || {};
+  const universal = settings.permission_mode;
   const rows = (chats || []).map((chat) => {
     const updated = chat.updated
       ? new Date(typeof chat.updated === "number" ? chat.updated * 1000 : chat.updated).toLocaleString()
@@ -1016,19 +1115,359 @@ export function threadsPage(chats, onRefresh, error = "") {
       chat.model || "",
       chat.tokens != null ? `${tokens(chat.tokens)} tokens` : "",
     ].filter(Boolean);
+    const override = chat.permission_override;
+    const permSelect = chat.id ? h("select", {
+      "aria-label": `Permission mode for ${chat.title || chat.id}`,
+      on: { change: (ev) => act("/api/settings", { permission_mode: ev.target.value, thread: chat.id }) },
+    },
+      h("option", { value: "", selected: !override }, `Default: ${modes[universal] || universal || "?"}`),
+      Object.entries(modes).map(([key, label]) => h("option", { value: key, selected: key === override }, label))) : null;
+    const resetBtn = override ? h("button", {
+      class: "btn", type: "button",
+      on: { click: () => act("/api/settings", { permission_mode: "", thread: chat.id }) },
+    }, "Reset to universal") : null;
     return h("div", { class: "row" },
       h("div", {},
         h("b", {}, chat.title || "(untitled)"),
         h("div", { class: "row-sub" }, `${chat.source || ""} · ${chat.project || "No workspace"}${updated ? ` · ${updated}` : ""}`)),
-      labels.length ? h("div", { class: "tags" }, labels.map((label) => h("span", { class: "tag" }, label))) : null);
+      labels.length ? h("div", { class: "tags" }, labels.map((label) => h("span", { class: "tag" }, label))) : null,
+      permSelect ? h("div", { class: "thread-perm-actions" }, permSelect, resetBtn) : null);
   });
   return h("section", { class: "card" },
     h("div", { class: "card-head" },
       h("div", {}, h("h2", { class: "card-title" }, "Chat threads"),
-        h("div", { class: "card-sub" }, "Readable history is available on demand with read_chat; worker sessions are hidden by default.")),
+        h("div", { class: "card-sub" }, "Readable history is available on demand with read_chat; worker sessions are hidden by default. Each chat's permission mode can override the universal default.")),
       h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
     error ? h("div", { class: "err" }, `Could not refresh chat threads: ${error}`) : null,
     h("div", { class: "rows" }, rows.length ? rows : h("div", { class: "empty" }, "No chat threads found.")));
+}
+
+/* Terminals */
+export const terminalsState = { rows: [], sharing: false, loadedAt: 0, loading: false, error: "" };
+
+function terminalRowTags(t) {
+  const tags = [];
+  if (t.closed) tags.push(h("span", { class: "tag bad" }, "closed"));
+  if (t.source === "hook") {
+    if (t.app === "terminal") {
+      tags.push(h("span", { class: "tag" }, "Terminal.app"));
+    } else if (t.app === "iterm") {
+      tags.push(h("span", { class: "tag" }, "iTerm2"));
+    } else {
+      tags.push(h("span", { class: "tag" }, "shell hook: commands and exit codes, no output"));
+    }
+  }
+  if (t.shell_integration === false) tags.push(h("span", { class: "tag" }, "no shell integration"));
+  const canRun = t.source !== "hook" || t.app === "terminal" || t.app === "iterm";
+  if (t.allow_commands && canRun) tags.push(h("span", { class: "tag" }, "commands allowed"));
+  if (t.failures) tags.push(h("span", { class: "tag bad" }, `${t.failures} failing`));
+  return tags;
+}
+
+async function openTerminalDetail(t) {
+  const body = h("div", { class: "rows" }, h("div", { class: "empty" }, "Loading…"));
+  const dlg = modal(t.name || t.id, body);
+  try {
+    const data = await api(`/api/terminal?id=${encodeURIComponent(t.id)}`);
+    const rec = data.terminal || {};
+    const commands = rec.commands || [];
+    const rows = commands.length ? commands.slice().reverse().map((c) => {
+      const failed = c.exit_code !== 0 && c.exit_code !== null && c.exit_code !== undefined;
+      const outputPre = h("pre", { hidden: true }, c.output || "(no output)");
+      const toggle = h("button", {
+        class: "link-btn", type: "button",
+        on: { click: () => { outputPre.hidden = !outputPre.hidden; } },
+      }, "Show output");
+      const handBtn = failed ? h("button", {
+        class: "btn", type: "button",
+        on: {
+          click: () => {
+            dlg.close();
+            openDelegate(get("status"),
+              `Terminal \`${rec.name || rec.id}\` ran \`${c.command}\` (exit ${c.exit_code}) in ${rec.folder || "an unknown folder"}:\n\n${(c.output || "").slice(0, 4000)}`);
+          },
+        },
+      }, "Hand to worker") : null;
+      return h("div", { class: `row${failed ? " alert" : ""}` },
+        h("div", {},
+          h("div", { class: "mono" }, `$ ${c.command}`),
+          h("div", { class: "row-sub" }, `exit ${c.exit_code ?? "?"}${c.ts ? ` · ${new Date(c.ts * 1000).toLocaleString()}` : ""}`)),
+        h("div", { class: "btns" }, toggle, handBtn),
+        outputPre);
+    }) : [h("div", { class: "empty" }, "No commands recorded yet.")];
+    body.replaceChildren(...rows);
+  } catch (e) {
+    body.replaceChildren(h("div", { class: "err" }, `Could not load terminal: ${e.message}`));
+  }
+}
+
+const terminalConfirm = new Set();
+const terminalCaptureConfirm = new Set();
+// Closed-log cleanup: which row(s) are asking for a delete confirmation. Survives re-renders.
+const terminalClosedConfirm = new Set();
+const CLOSED_ALL = "*all*";
+
+function terminalClosedStamp(t) {
+  if (typeof t.closed_at === "number" && t.closed_at > 0) return new Date(t.closed_at * 1000).toLocaleString();
+  return terminalStamp(t);
+}
+
+function terminalInlineConfirm(kind, key, label, danger, question, onYes) {
+  return h("div", { class: "term-confirm", role: "group", "aria-label": `${kind} ${label}` },
+    h("div", { class: "term-confirm-text" }, question),
+    h("div", { class: "btns" },
+      h("button", {
+        class: `btn ${danger ? "danger" : "primary"}`, type: "button",
+        "aria-label": `${danger ? "Yes, delete" : "Yes, archive"} ${label}`,
+        on: {
+          click: () => {
+            terminalClosedConfirm.delete(key);
+            onYes();
+          },
+        },
+      }, danger ? "Yes, delete" : "Yes, archive"),
+      h("button", {
+        class: "btn", type: "button", "aria-label": `Cancel ${kind.toLowerCase()} of ${label}`,
+        on: {
+          click: () => {
+            terminalClosedConfirm.delete(key);
+            rerenderTerminals();
+          },
+        },
+      }, "Cancel")));
+}
+
+/* Closed terminals keep only their log: no switches, no tags, just open/archive/delete. */
+function terminalClosedRow(t, onRefresh) {
+  const name = t.name || t.id;
+  const stamp = terminalClosedStamp(t);
+  const last = t.last_command ? String(t.last_command) : "";
+  const confirming = terminalClosedConfirm.has(t.id);
+  const openLog = () => openTerminalDetail(t);
+  return h("div", { class: "row term-row term-closed-row" },
+    h("div", {
+      class: "term-main", tabindex: "0", role: "button", "aria-label": `Open log for ${name}`,
+      on: {
+        click: openLog,
+        keydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openLog(); } },
+      },
+    },
+      h("b", { class: "row-title" }, name),
+      last ? h("div", { class: "row-sub mono" }, `$ ${last}`) : null,
+      h("div", { class: "row-sub" }, stamp ? `closed ${stamp}` : "closed")),
+    h("div", { class: "term-controls" },
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn", type: "button", "aria-label": `Archive ${name}`,
+          on: { click: () => postTerminal("/api/terminal_log", { terminal_id: t.id, action: "archive" }, onRefresh) },
+        }, "Archive"),
+        h("button", {
+          class: "btn danger", type: "button", "aria-label": `Delete ${name}`,
+          on: {
+            click: () => {
+              terminalClosedConfirm.add(t.id);
+              rerenderTerminals();
+            },
+          },
+        }, "Delete")),
+      confirming ? terminalInlineConfirm("Delete", t.id, name, true,
+        `Delete the closed log for ${name}? This can't be undone.`,
+        () => postTerminal("/api/terminal_log", { terminal_id: t.id, action: "delete" }, onRefresh)) : null));
+}
+
+function terminalClosedGroup(closed, onRefresh) {
+  const confirmingAll = terminalClosedConfirm.has(CLOSED_ALL);
+  return h("details", { class: "term-closed" },
+    h("summary", {}, `Closed (${closed.length})`),
+    h("div", { class: "term-closed-body" },
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn", type: "button", "aria-label": `Archive all ${closed.length} closed terminals`,
+          on: { click: () => postTerminal("/api/terminal_log", { all_closed: true, action: "archive" }, onRefresh) },
+        }, "Archive all"),
+        h("button", {
+          class: "btn danger", type: "button", "aria-label": `Delete all ${closed.length} closed terminals`,
+          on: {
+            click: () => {
+              terminalClosedConfirm.add(CLOSED_ALL);
+              rerenderTerminals();
+            },
+          },
+        }, "Delete all")),
+      confirmingAll ? terminalInlineConfirm("Delete", CLOSED_ALL, `all ${closed.length} closed logs`, true,
+        `Delete all ${closed.length} closed logs? This can't be undone.`,
+        () => postTerminal("/api/terminal_log", { all_closed: true, action: "delete" }, onRefresh)) : null,
+      h("div", { class: "rows" }, closed.map((t) => terminalClosedRow(t, onRefresh)))));
+}
+
+/* Switches are real buttons, so keyboard and screen readers get the same control as touch. */
+function terminalSwitch(label, checked, onToggle, disabled = false) {
+  const btn = h("button", {
+    class: "tgl", type: "button", role: "switch",
+    "aria-checked": String(!!checked), "aria-label": label,
+    "aria-disabled": disabled ? "true" : undefined,
+    disabled: disabled || undefined,
+    on: { click: () => { if (!disabled) onToggle(); } },
+  }, h("span", { class: "tgl-track", "aria-hidden": "true" }, h("span", { class: "tgl-knob" })));
+  return h("div", { class: `tgl-field${disabled ? " disabled" : ""}` }, h("span", { class: "tgl-label" }, label), btn);
+}
+
+function postTerminal(path, body, onRefresh) {
+  return act(path, body).finally(() => onRefresh());
+}
+
+function rerenderTerminals() {
+  document.dispatchEvent(new Event("subway:rerender"));
+}
+
+function terminalStamp(t) {
+  const at = t.updated_at || t.last_ts;
+  return at ? new Date(at * 1000).toLocaleString() : "";
+}
+
+export function terminalsPage(d, rows, onRefresh, error = "", loading = false, stale = false, sharing = false) {
+  const all = rows || [];
+  const list = all.filter((t) => !t.closed);
+  const closed = all.filter((t) => Boolean(t.closed));
+  const masterOn = Boolean(sharing);
+  const sharingCard = h("section", { class: "card", "aria-labelledby": "terminal-sharing-title" },
+    h("div", { class: "card-head" },
+      h("div", {},
+        h("h2", { class: "card-title", id: "terminal-sharing-title" }, "Terminal sharing"),
+        h("div", { class: "card-sub" }, masterOn
+          ? "On. Agents can read terminals you share below."
+          : "Off. Agents can't see or use any terminal.")),
+      terminalSwitch("Terminal sharing", masterOn, () => {
+        if (masterOn) {
+          terminalConfirm.clear();
+          terminalCaptureConfirm.clear();
+          terminalClosedConfirm.clear();
+        }
+        postTerminal("/api/terminal_sharing", { enabled: !masterOn }, onRefresh);
+      })));
+  const bodyRows = list.map((t) => {
+    const shared = Boolean(t.share_enabled);
+    const isHook = t.source === "hook";
+    const isNativeHook = isHook && (t.app === "terminal" || t.app === "iterm");
+    const isOtherHook = isHook && !isNativeHook;
+    // A greyed-out switch can still be turned off; it only can't be turned on.
+    const allowDisabled = (!masterOn || !shared || isOtherHook) && !t.allow_commands;
+    const captureDisabled = (!masterOn || !shared) && !t.capture_output;
+    const confirming = terminalConfirm.has(t.id) && !allowDisabled;
+    const captureConfirming = terminalCaptureConfirm.has(t.id) && !captureDisabled;
+    const stamp = terminalStamp(t);
+    const sharedSwitch = terminalSwitch("Shared", shared, () => {
+      if (shared) {
+        terminalConfirm.delete(t.id);
+        terminalCaptureConfirm.delete(t.id);
+      }
+      postTerminal("/api/terminal_opt_in", { terminal_id: t.id, share_enabled: !shared }, onRefresh);
+    });
+    const allowSwitch = terminalSwitch("Agents may run commands", Boolean(t.allow_commands), () => {
+      if (t.allow_commands) {
+        postTerminal("/api/terminal_opt_in", { terminal_id: t.id, allow_commands: false }, onRefresh);
+      } else if (!terminalConfirm.has(t.id)) {
+        terminalConfirm.add(t.id);
+        rerenderTerminals();
+      }
+    }, allowDisabled);
+    const captureSwitch = isNativeHook ? terminalSwitch("Capture output", Boolean(t.capture_output), () => {
+      if (t.capture_output) {
+        postTerminal("/api/terminal_opt_in", { terminal_id: t.id, capture_output: false }, onRefresh);
+      } else if (!terminalCaptureConfirm.has(t.id)) {
+        terminalCaptureConfirm.add(t.id);
+        rerenderTerminals();
+      }
+    }, captureDisabled) : null;
+    const hookNote = isOtherHook
+      ? h("div", { class: "row-sub" }, "Needs an editor terminal with the Subway extension.")
+      : null;
+    const appLabel = t.app === "terminal" ? "Terminal.app" : "iTerm2";
+    const macNote = isNativeHook
+      ? h("div", { class: "row-sub" }, `macOS will ask once to let Subway control ${appLabel}.`)
+      : null;
+    const confirm = confirming ? h("div", {
+      class: "term-confirm", role: "group", "aria-label": `Allow commands in ${t.name || t.id}`,
+    },
+      h("div", { class: "term-confirm-text" }, `Agents will be able to run commands in ${t.name || t.id}. Allow?`),
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn primary", type: "button",
+          on: {
+            click: () => {
+              terminalConfirm.delete(t.id);
+              postTerminal("/api/terminal_opt_in", { terminal_id: t.id, allow_commands: true }, onRefresh);
+            },
+          },
+        }, "Allow"),
+        h("button", {
+          class: "btn", type: "button",
+          on: {
+            click: () => {
+              terminalConfirm.delete(t.id);
+              rerenderTerminals();
+            },
+          },
+        }, "Cancel"))) : null;
+    const captureConfirm = captureConfirming ? h("div", {
+      class: "term-confirm", role: "group", "aria-label": `Capture output in ${t.name || t.id}`,
+    },
+      h("div", { class: "term-confirm-text" }, "Subway will read this terminal's text after each command (secrets are redacted). Allow?"),
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn primary", type: "button",
+          on: {
+            click: () => {
+              terminalCaptureConfirm.delete(t.id);
+              postTerminal("/api/terminal_opt_in", { terminal_id: t.id, capture_output: true }, onRefresh);
+            },
+          },
+        }, "Allow"),
+        h("button", {
+          class: "btn", type: "button",
+          on: {
+            click: () => {
+              terminalCaptureConfirm.delete(t.id);
+              rerenderTerminals();
+            },
+          },
+        }, "Cancel"))) : null;
+    return h("div", { class: "row term-row" },
+      h("div", {
+        class: "term-main", tabindex: "0", role: "button",
+        on: {
+          click: () => openTerminalDetail(t),
+          keydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openTerminalDetail(t); } },
+        },
+      },
+        h("b", {}, t.name || t.id),
+        h("div", { class: "row-sub" }, `${t.folder || "Unknown folder"}${stamp ? ` · ${stamp}` : ""}`),
+        t.last_command ? h("div", { class: "row-sub mono" }, `$ ${t.last_command}`) : null),
+      h("div", { class: "term-controls" },
+        h("div", { class: "term-switches" }, sharedSwitch, h("div", {}, allowSwitch, hookNote), captureSwitch ? h("div", {}, captureSwitch) : null),
+        macNote,
+        h("div", { class: "tags" }, terminalRowTags(t)),
+        confirm,
+        captureConfirm));
+  });
+  return [
+    sharingCard,
+    h("section", { class: "card" },
+      h("div", { class: "card-head" },
+        h("div", {}, h("h2", { class: "card-title" }, "Terminals"),
+          stale && !error ? h("span", { class: "tag" }, "stale") : null,
+          h("div", { class: "card-sub" }, "Commands run in terminals your user has shared. Nothing is captured until they opt in.")),
+        h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
+      error ? h("div", { class: "err" }, `Could not refresh terminals: ${error}`) : null,
+      closed.length && !bodyRows.length && !loading ? h("div", { class: "card-sub" }, "No open terminals; closed logs are under \"Closed\" below.") : null,
+      h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" },
+        loading && !closed.length ? "Loading…" : h("div", { class: "term-empty" },
+          h("p", {}, "No terminals have been shared yet."),
+          h("p", {}, "To start sharing, either:"),
+          h("code", { class: "term-hint" }, "VS Code: run 'Subway: Share Terminal' in a terminal"),
+          h("code", { class: "term-hint" }, "Shell: python3 server.py terminal hook install, then open a new terminal")))),
+      closed.length ? terminalClosedGroup(closed, onRefresh) : null),
+  ];
 }
 
 /* Ledger */

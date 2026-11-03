@@ -26,6 +26,7 @@ class TestStallAndReroute(unittest.TestCase):
         self.orig_claude_json = server.CLAUDE_JSON
         self.orig_agy_dir = server.AGY_DIR
         self.orig_opencode_agents_dir = server.OPENCODE_AGENTS_DIR
+        self.orig_copilot_dir = server.COPILOT_DIR
         self.orig_tracks_dir = server.TRACKS_DIR
         self.orig_hud_dir = server.HUD_DIR
         server.SUBWAY_DIR = self.temp_dir
@@ -36,6 +37,7 @@ class TestStallAndReroute(unittest.TestCase):
         server.AGY_DIR = os.path.join(self.temp_dir, ".gemini", "antigravity")
         server.OPENCODE_DIR = os.path.join(self.temp_dir, ".local", "share", "opencode")
         server.OPENCODE_AGENTS_DIR = os.path.join(self.temp_dir, ".config", "opencode", "agents")
+        server.COPILOT_DIR = os.path.join(self.temp_dir, ".copilot")
         server.TRACKS_DIR = os.path.join(self.temp_dir, "tracks")
         server.HUD_DIR = os.path.join(self.temp_dir, "hud")
         os.makedirs(server.WORKERS_DIR, exist_ok=True)
@@ -51,6 +53,7 @@ class TestStallAndReroute(unittest.TestCase):
         server.AGY_DIR = self.orig_agy_dir
         server.OPENCODE_DIR = self.orig_opencode_dir
         server.OPENCODE_AGENTS_DIR = self.orig_opencode_agents_dir
+        server.COPILOT_DIR = self.orig_copilot_dir
         server.TRACKS_DIR = self.orig_tracks_dir
         server.HUD_DIR = self.orig_hud_dir
         server._model_catalog.clear()
@@ -281,6 +284,123 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(last_active["output"], 10.0)
         self.assertFalse(server._worker_is_stalled(last_active, 100.0, 300.0))
 
+    def test_open_copilot_tool_execution_prevents_stall(self):
+        session_id = "f12b7af4-f647-4ec1-a404-87eac8a7ae77"
+        copilot_dir = os.path.join(self.temp_dir, ".copilot")
+        events = os.path.join(copilot_dir, "session-state", session_id, "events.jsonl")
+        os.makedirs(os.path.dirname(events))
+        with open(events, "w", encoding="utf-8") as file:
+            file.write(json.dumps({
+                "type": "tool.execution_start",
+                "data": {"toolCallId": "tool-1", "toolName": "shell"},
+            }) + "\n")
+        meta = {"provider": "copilot", "copilot_session_id": session_id}
+        with mock.patch.object(server, "COPILOT_DIR", copilot_dir):
+            signals = server._worker_activity_signals(meta, mock.Mock(pid=123), 0)
+
+        self.assertTrue(signals["copilot_tool_running"])
+        last_active = {key: 1.0 for key in signals}
+        self.assertFalse(server._worker_is_stalled(
+            last_active, 10_000.0, 300.0, active=signals["copilot_tool_running"],
+        ))
+
+    def test_copilot_tool_execution_event_matching(self):
+        test_cases = (
+            (
+                "identified start followed by id-less completion",
+                [
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1"}},
+                    {"type": "tool.execution_complete"},
+                ],
+                False,
+            ),
+            (
+                "starts completed by id",
+                [
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1"}},
+                    {"type": "tool.execution_start", "data": {"id": "tool-2"}},
+                    {"type": "tool.execution_complete", "data": {"call_id": "tool-1"}},
+                    {"type": "tool.execution_complete", "data": {"callId": "tool-2"}},
+                ],
+                False,
+            ),
+            (
+                "one start still open",
+                [
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1"}},
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-2"}},
+                    {"type": "tool.execution_complete", "data": {"toolCallId": "tool-1"}},
+                ],
+                True,
+            ),
+        )
+        events_path = os.path.join(self.temp_dir, ".copilot", "events.jsonl")
+        os.makedirs(os.path.dirname(events_path), exist_ok=True)
+        for name, events, expected in test_cases:
+            with self.subTest(name=name):
+                with open(events_path, "w", encoding="utf-8") as event_file:
+                    event_file.write("{malformed json}\n")
+                    for event in events:
+                        event_file.write(json.dumps(event) + "\n")
+                self.assertEqual(server._copilot_has_open_tool_execution(events_path), expected)
+
+    def test_live_copilot_silence_gets_ten_extra_minutes(self):
+        meta = {"provider": "copilot", "stall_timeout": 300}
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        timeout = server._worker_stall_timeout(meta, proc)
+        self.assertEqual(timeout, 900)
+        self.assertFalse(server._worker_is_stalled({"start": 0.0}, 899.0, timeout))
+        self.assertTrue(server._worker_is_stalled({"start": 0.0}, 900.0, timeout))
+
+    def _run_silent_copilot_stall(self, route, new_worker_id):
+        worker_id = "worker_242424"
+        session_id = "2eb1e932-c4c7-4a56-a708-72507680dd6a"
+        meta = {
+            "id": worker_id, "role": "Worker", "provider": "copilot", "model": "gpt-6-luna",
+            "copilot_session_id": session_id, "prompt": "Make the requested change",
+            "project_dir": self.temp_dir, "timeout_seconds": 30, "stall_timeout": 0.3,
+            "status": "running", "cmd": [
+                sys.executable, "-c", "import threading; threading.Event().wait()",
+            ], "log_file": server._log_file(worker_id),
+        }
+        server._save_worker(meta)
+        with mock.patch.object(server, "route_task", return_value=route), \
+             mock.patch.object(server, "find_copilot_binary", return_value="/mock/copilot"), \
+             mock.patch.object(server, "_worker_stall_timeout", return_value=0.1), \
+             mock.patch.object(server, "t_spin_worker", return_value=f"Worker `{new_worker_id}` queued") as spin, \
+             mock.patch.object(server, "t_broadcast_track"), \
+             mock.patch.object(server, "notify_desktop_event"), \
+             mock.patch.object(server, "_ping_launcher"):
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+
+        with open(server._exit_file(worker_id), encoding="utf-8") as exit_file:
+            exit_result = json.load(exit_file)
+        return exit_result, spin
+
+    def test_silent_copilot_with_no_activity_is_stalled_rerouted_not_exhausted(self):
+        exit_result, spin = self._run_silent_copilot_stall({
+            "picks": [{"provider": "copilot", "model": "gpt-6-luna-alt"}],
+            "reason": "alternate",
+        }, "worker_252525")
+
+        self.assertIn("worker_252525", exit_result["reason"])
+        self.assertIn("stalled", exit_result["reason"])
+        self.assertEqual(spin.call_args.kwargs["provider"], "copilot")
+        self.assertEqual(spin.call_args.kwargs["model"], "gpt-6-luna-alt")
+        self.assertNotIn("gpt-6-luna", server._load_json("bad_models.json"))
+        self.assertIn("gpt-6-luna", server._load_json("stall_cooldowns.json"))
+
+    def test_silent_copilot_without_same_cost_reroute_is_not_restarted(self):
+        exit_result, spin = self._run_silent_copilot_stall({
+            "picks": [{"provider": "claude", "model": "opus"}],
+            "reason": "Only Claude models are available.",
+        }, "worker_252525")
+
+        self.assertIn("no same-cost or cheaper provider/model is available", exit_result["reason"].lower())
+        self.assertIn("stalled", exit_result["reason"])
+        spin.assert_not_called()
+
     def test_missing_copilot_events_falls_back_to_output_activity(self):
         log_file = os.path.join(self.temp_dir, "worker.log")
         with open(log_file, "w", encoding="utf-8") as file:
@@ -289,7 +409,9 @@ class TestStallAndReroute(unittest.TestCase):
             "provider": "copilot", "copilot_session_id": "missing-session",
             "project_dir": self.temp_dir, "log_file": log_file,
         }
+        copilot_dir = os.path.join(self.temp_dir, ".copilot")
         with mock.patch.object(server, "_worker_folder_activity", return_value=None), \
+             mock.patch.object(server, "COPILOT_DIR", copilot_dir), \
              mock.patch.object(server, "_process_cpu_time", return_value=None):
             previous = server._worker_activity_signals(meta, mock.Mock(pid=123), 0)
             last_active = {key: 1.0 for key in previous}
@@ -304,46 +426,18 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(last_active["output"], 2.0)
         self.assertFalse(server._worker_is_stalled(last_active, 3.0, 120.0))
 
-    def test_silent_copilot_with_no_activity_is_stalled_rerouted_not_exhausted(self):
-        worker_id = "worker_242424"
-        new_worker_id = "worker_252525"
-        session_id = "2eb1e932-c4c7-4a56-a708-72507680dd6a"
-        meta = {
-            "id": worker_id, "role": "Worker", "provider": "copilot", "model": "gpt-6-luna",
-            "copilot_session_id": session_id, "prompt": "Make the requested change",
-            "project_dir": self.temp_dir, "timeout_seconds": 30, "stall_timeout": 0.3,
-            "status": "running", "cmd": [
-                sys.executable, "-c", "import threading; threading.Event().wait()",
-            ], "log_file": server._log_file(worker_id),
-        }
-        server._save_worker(meta)
-        with mock.patch.object(server, "route_task", return_value={
-            "picks": [{"provider": "claude", "model": "sonnet"}], "reason": "alternate",
-        }), mock.patch.object(server, "find_claude_binary", return_value="/mock/claude"), \
-             mock.patch.object(server, "t_spin_worker", return_value=f"Worker `{new_worker_id}` queued"), \
-             mock.patch.object(server, "t_broadcast_track"), \
-             mock.patch.object(server, "notify_desktop_event"), \
-             mock.patch.object(server, "_ping_launcher"):
-            self.assertEqual(server.supervise_worker(worker_id), 0)
-
-        with open(server._exit_file(worker_id), encoding="utf-8") as exit_file:
-            exit_result = json.load(exit_file)
-        self.assertIn(new_worker_id, exit_result["reason"])
-        self.assertIn("stalled", exit_result["reason"])
-        self.assertNotIn("gpt-6-luna", server._load_json("bad_models.json"))
-        self.assertIn("gpt-6-luna", server._load_json("stall_cooldowns.json"))
-
     def test_opencode_session_message_update_counts_as_activity(self):
         worker_dir = os.path.join(self.temp_dir, "worktree")
         os.makedirs(worker_dir)
         started_at = time.time() - 2
+        message_updated_ms = int((started_at + 1) * 1000)
         meta = {"provider": "opencode", "project_dir": worker_dir}
         self._create_opencode_retry_db(
-            worker_dir, {"tokens": {"input": 1}}, int((started_at + 1) * 1000),
+            worker_dir, {"tokens": {"input": 1}}, message_updated_ms,
         )
         self.assertEqual(
             server._opencode_worker_session_activity(meta, started_at),
-            ("opencode-session", int((started_at + 1) * 1000)),
+            ("opencode-session", message_updated_ms / 1000),
         )
         db_path = os.path.join(server.OPENCODE_DIR, "opencode.db")
         con = sqlite3.connect(db_path)
@@ -354,7 +448,7 @@ class TestStallAndReroute(unittest.TestCase):
             con.close()
         self.assertEqual(
             server._opencode_worker_session_activity(meta, started_at),
-            ("opencode-session", int((started_at + 1) * 1000) + 1000),
+            ("opencode-session", (message_updated_ms + 1000) / 1000),
         )
 
     def test_opencode_activity_tolerates_corrupt_or_locked_database(self):
@@ -533,20 +627,50 @@ class TestStallAndReroute(unittest.TestCase):
         }
         new_meta = {"id": new_worker_id}
         with mock.patch.object(server, "route_task", return_value={
-            "picks": [{"provider": "claude", "model": "sonnet"}], "reason": "alternate",
+            "picks": [
+                {"provider": "claude", "model": "opus"},
+                {"provider": "claude", "model": "sonnet"},
+                {"provider": "copilot", "model": "gpt-6-luna-alt"},
+            ], "reason": "alternate",
         }), mock.patch.object(server, "find_claude_binary", return_value="/mock/claude"), \
-             mock.patch.object(server, "t_spin_worker", return_value=f"Worker `{new_worker_id}` queued"), \
+             mock.patch.object(server, "find_copilot_binary", return_value="/mock/copilot"), \
+             mock.patch.object(server, "t_spin_worker", return_value=f"Worker `{new_worker_id}` queued") as spin, \
              mock.patch.object(server, "_load_worker", return_value=new_meta), \
              mock.patch.object(server, "_save_worker"), mock.patch.object(server, "_ping_launcher"), \
              mock.patch.object(server, "t_broadcast_track"):
             result = server._handle_worker_exhaustion_or_stall(worker_id, meta, "stalled", is_stall=True)
 
+        self.assertEqual(spin.call_args.kwargs["provider"], "copilot")
+        self.assertEqual(spin.call_args.kwargs["model"], "gpt-6-luna-alt")
         self.assertEqual(result["status"], "stopped")
         self.assertIn("stalled", result["reason"])
         self.assertNotIn("gpt-6-luna", server._load_json("bad_models.json"))
         cooldown = server._load_json("stall_cooldowns.json")["gpt-6-luna"]
         self.assertGreater(cooldown["until"], time.time())
         self.assertLessEqual(cooldown["until"], time.time() + 15 * 60)
+
+    def test_copilot_with_no_same_cost_reroute_stops_with_reason(self):
+        worker_id = "worker_242424"
+        meta = {
+            "id": worker_id, "provider": "copilot", "model": "gpt-6-luna",
+            "prompt": "Make the requested change", "project_dir": self.temp_dir,
+        }
+        with mock.patch.object(server, "route_task", return_value={
+            "picks": [
+                {"provider": "claude", "model": "opus"},
+                {"provider": "claude", "model": "sonnet"},
+            ], "reason": "Only Claude models are available.",
+        }), mock.patch.object(server, "find_claude_binary", return_value="/mock/claude"), \
+             mock.patch.object(server, "t_spin_worker") as spin, \
+             mock.patch.object(server, "_ping_launcher"), \
+             mock.patch.object(server, "notify_desktop_event"):
+            result = server._handle_worker_exhaustion_or_stall(
+                worker_id, meta, "stalled", is_stall=True,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("No same-cost or cheaper provider/model is available", result["reason"])
+        spin.assert_not_called()
 
     def test_corrupt_quota_and_stall_json_are_recovered(self):
         for filename in ("bad_models.json", "stall_cooldowns.json"):
@@ -695,6 +819,7 @@ class TestStallAndReroute(unittest.TestCase):
             "order": ["claude", "opencode"],
             "picks": [
                 {"provider": "opencode", "model": "free-oc-model-1"},
+                {"provider": "opencode", "model": "alternate-free-model"},
                 {"provider": "claude", "model": "sonnet"},
             ],
             "tier": "medium",
@@ -728,8 +853,8 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(w2["status"], "pending_approval")
         self.assertTrue(w2["prompt"].startswith(prompt_text))
         self.assertEqual(w2["prompt"].count("SUBWAY STANDING RULES"), 1)
-        self.assertEqual(w2["model"], "sonnet")
-        self.assertEqual(w2["provider"], "claude")
+        self.assertEqual(w2["model"], "alternate-free-model")
+        self.assertEqual(w2["provider"], "opencode")
         self.assertEqual(w2["rerouted_from"], worker_id)
         self.assertEqual(w2["launched_by"], "ses_test_launcher")
         self.assertEqual(w2["priority"], "urgent")
@@ -750,7 +875,7 @@ class TestStallAndReroute(unittest.TestCase):
             "id": worker_id,
             "role": "Database Architect",
             "provider": "opencode",
-            "model": "silent-model-x",
+            "model": "silent-free-model",
             "prompt": prompt_text,
             "project_dir": self.temp_dir,
             "timeout_seconds": 60,
@@ -768,7 +893,8 @@ class TestStallAndReroute(unittest.TestCase):
         mock_route = {
             "order": ["claude"],
             "picks": [
-                {"provider": "opencode", "model": "silent-model-x"},
+                {"provider": "opencode", "model": "silent-free-model"},
+                {"provider": "opencode", "model": "alternate-free-model"},
                 {"provider": "claude", "model": "opus"},
             ],
             "tier": "high",
@@ -795,9 +921,9 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(updated_w1.get("status"), "stopped")
 
         # A stall gets a short routing cooldown, never quota exhaustion.
-        self.assertFalse(server._load_json("bad_models.json").get("silent-model-x"))
-        self.assertTrue(server._model_is_bad("silent-model-x"))
-        self.assertIn("silent-model-x", server._load_json("stall_cooldowns.json"))
+        self.assertFalse(server._load_json("bad_models.json").get("silent-free-model"))
+        self.assertTrue(server._model_is_bad("silent-free-model"))
+        self.assertIn("silent-free-model", server._load_json("stall_cooldowns.json"))
 
         # 3. New worker queued on different model
         all_workers = server._all_workers()
@@ -807,7 +933,8 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertEqual(w2["status"], "pending_approval")
         self.assertTrue(w2["prompt"].startswith(prompt_text))
         self.assertEqual(w2["prompt"].count("SUBWAY STANDING RULES"), 1)
-        self.assertEqual(w2["model"], "opus")
+        self.assertEqual(w2["model"], "alternate-free-model")
+        self.assertEqual(w2["provider"], "opencode")
         self.assertEqual(w2["rerouted_from"], worker_id)
 
     def test_second_exhaustion_does_not_reroute_again(self):
@@ -957,8 +1084,6 @@ class TestStallAndReroute(unittest.TestCase):
         self.assertIn("no alternative model", updated.get("report", ""))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestActivitySignalHelpers(unittest.TestCase):
@@ -990,3 +1115,27 @@ class TestActivitySignalHelpers(unittest.TestCase):
             second = server._worker_folder_activity({"project_dir": folder})
             self.assertEqual(first[0], "git")
             self.assertNotEqual(first, second)
+
+
+class SubworkerActivityTests(unittest.TestCase):
+    def test_lead_waiting_on_subworker_counts_as_active(self):
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(server, "WORKERS_DIR", tmp):
+            lead = {"id": "worker_lead1", "provider": "claude"}
+            self.assertEqual(server._active_subworkers("worker_lead1"), [])
+            for wid, status, parent in (("worker_sub1", "running", "worker_lead1"),
+                                        ("worker_sub2", "completed", "worker_lead1"),
+                                        ("worker_other", "running", "worker_x")):
+                with open(os.path.join(tmp, f"{wid}.json"), "w") as f:
+                    _json.dump({"id": wid, "status": status, "launched_by": parent}, f)
+            with open(os.path.join(tmp, "worker_bad.json"), "w") as f:
+                f.write("{corrupt")
+            self.assertEqual(server._active_subworkers("worker_lead1"), ["worker_sub1"])
+            self.assertEqual(server._active_subworkers(""), [])
+            with mock.patch.object(server, "_worker_folder_activity", return_value=None), \
+                    mock.patch.object(server, "_process_cpu_time", return_value=None):
+                signals = server._collect_worker_activity_signals(lead, None, 0)
+            self.assertEqual(signals["subworkers"][0], ("worker_sub1",))
+
+if __name__ == "__main__":
+    unittest.main()

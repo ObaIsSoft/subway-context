@@ -136,6 +136,7 @@ svg { display: block; }
 .tag.bad { color: var(--red); border-color: var(--red); background: var(--red-soft); }
 .tag.gold { color: var(--gold); border-color: var(--gold-line); background: var(--gold-soft); }
 .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.thread-perm-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
 /* Buttons and forms */
 .btn { min-height: 44px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--raised); color: var(--strong); font-size: 13px; font-weight: 600; cursor: pointer; }
@@ -239,6 +240,44 @@ details ul { list-style: none; padding-top: 4px; font-size: 11px; color: var(--m
 .rows { display: flex; flex-direction: column; gap: 10px; }
 .row { padding: 14px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--raised); display: grid; gap: 10px; min-width: 0; }
 .row-title { font-weight: 600; color: var(--strong); overflow-wrap: anywhere; }
+
+/* Terminals: switches stack under the terminal on phones, then move beside it. */
+.term-main { display: grid; gap: 6px; min-width: 0; cursor: pointer; border-radius: var(--radius-sm); }
+.term-main:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.term-controls { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.term-switches { display: flex; flex-direction: column; gap: 4px; }
+.term-confirm { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--gold-line); border-radius: var(--radius-sm); background: var(--gold-soft); }
+.term-confirm-text { font-size: 13px; color: var(--strong); overflow-wrap: anywhere; }
+.term-empty { display: flex; flex-direction: column; gap: 10px; }
+.term-empty p { margin: 0; }
+.term-hint { display: block; padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--bg); color: var(--strong); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
+/* Closed terminals: one collapsed group, log-only rows, no switches. */
+.term-closed { min-width: 0; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--raised); padding: 0 14px; }
+.term-closed > summary { min-height: 44px; display: flex; align-items: center; font-size: 13px; color: var(--strong); }
+.term-closed > summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.term-closed-body { display: flex; flex-direction: column; gap: 10px; padding-bottom: 14px; min-width: 0; }
+.term-closed .btns .btn { min-height: 44px; margin: 0; }
+.term-closed-row .btns .btn { margin: 0; }
+.tgl-field { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; }
+.tgl-label { font-size: 13px; color: var(--strong); font-weight: 500; }
+.tgl-field.disabled .tgl-label { color: var(--muted); }
+.tgl { flex: none; min-width: 44px; min-height: 44px; margin: 0; padding: 10px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: var(--radius-sm); background: none; color: inherit; cursor: pointer; }
+.tgl-track { position: relative; display: block; width: 44px; height: 24px; border: 1px solid var(--line); border-radius: 24px; background: var(--line-soft); transition: background-color .2s, border-color .2s; }
+.tgl-knob { position: absolute; left: 3px; bottom: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); transition: transform .2s, background-color .2s; }
+.tgl[aria-checked="true"] .tgl-track { background: var(--gold-soft); border-color: var(--gold); }
+.tgl[aria-checked="true"] .tgl-knob { transform: translateX(20px); background: var(--gold); }
+.tgl:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.tgl:disabled { opacity: .45; cursor: default; }
+@media (min-width: 640px) {
+  .row.term-row { align-items: start; }
+  .term-controls { align-items: flex-end; }
+  .term-switches { align-items: flex-end; }
+  .term-confirm { align-self: stretch; }
+}
+@media (min-width: 1024px) {
+  .term-switches { flex-direction: row; flex-wrap: wrap; justify-content: flex-end; gap: 4px 16px; }
+  .tgl-field { gap: 10px; }
+}
 .row-sub { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .row-sub.clamped { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .inline-log { grid-column: 1 / -1; margin-top: 8px; }
