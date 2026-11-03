@@ -1053,6 +1053,8 @@ if __name__ == "__main__":
 
 _ZSH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
+  # $EPOCHREALTIME is empty until zsh/datetime is loaded; without it every command took no time.
+  zmodload zsh/datetime 2>/dev/null
   ( python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
   _subway_preexec() {
     SUBWAY_CMD_START=$EPOCHREALTIME
@@ -1080,13 +1082,13 @@ _BASH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   _subway_preexec() {
     if [ -n "$_subway_prev_debug_cmd" ]; then eval "$_subway_prev_debug_cmd"; fi
     SUBWAY_CMD="$BASH_COMMAND"
-    SUBWAY_CMD_START=$(date +%s.%N)
+    SUBWAY_CMD_START=${EPOCHREALTIME:-$(date +%s)}
   }
   trap '_subway_preexec' DEBUG
   _subway_precmd() {
     local code=$?
     if [ -n "$SUBWAY_CMD" ]; then
-      ( python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$(date +%s.%N)" "$PWD" >/dev/null 2>&1 & )
+      ( python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "${EPOCHREALTIME:-$(date +%s)}" "$PWD" >/dev/null 2>&1 & )
       unset SUBWAY_CMD
     fi
     return $code

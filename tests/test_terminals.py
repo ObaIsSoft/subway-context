@@ -664,6 +664,12 @@ class TerminalHookTests(unittest.TestCase):
             zsh_content = f.read()
             self.assertIn("preexec_functions+=(_subway_preexec)", zsh_content)
 
+    def test_hook_blocks_send_real_start_times(self):
+        """zsh needs zsh/datetime for $EPOCHREALTIME; macOS date has no %N, so bash must not use it."""
+        self.assertIn("zmodload zsh/datetime", terminals._ZSH_BLOCK)
+        self.assertNotIn("%N", terminals._BASH_BLOCK)
+        self.assertIn("${EPOCHREALTIME:-$(date +%s)}", terminals._BASH_BLOCK)
+
     def test_hook_optin_payload_has_no_allow_commands(self):
         terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
         script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
