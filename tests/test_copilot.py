@@ -989,7 +989,25 @@ class TestCopilotChatTransit(unittest.TestCase):
 
         chat = next(c for c in server.copilot_list() if c["id"] == "copilot-cli-sample")
         self.assertEqual(chat["project"], "/indexed/copilot-project")
-        self.assertEqual(chat["updated"], "2026-10-03T10:00:00Z")
+        self.assertEqual(chat["updated"], "2026-10-01T10:06:00Z")
+
+    def test_cli_last_active_uses_newest_event_or_file_mtime(self):
+        events_path = os.path.join(self.temp_dir, "session-state-test.jsonl")
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session.start", "timestamp": "2026-10-01T10:00:00Z",
+                                "data": {"sessionId": "session-time-test"}}) + "\n")
+            f.write(json.dumps({"type": "result", "timestamp": "2026-10-01T10:08:00Z",
+                                "sessionId": "session-time-test"}) + "\n")
+        meta = server._copilot_cli_meta(
+            events_path, {"session-time-test": {"updated_at": "2026-11-01T00:00:00Z"}}, {}, set()
+        )
+        self.assertEqual(meta["updated"], "2026-10-01T10:08:00Z")
+
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session.start", "data": {"sessionId": "session-time-test"}}) + "\n")
+        with patch("server.os.path.getmtime", return_value=1800000000):
+            meta = server._copilot_cli_meta(events_path, {}, {}, set())
+        self.assertEqual(meta["updated"], 1800000000)
 
     def test_alias_resolution_and_threads_api(self):
         with patch.object(server, "all_chats", return_value=server.copilot_list(include_subagents=True)):
@@ -1091,6 +1109,11 @@ class TestCopilotChatTransit(unittest.TestCase):
         self.assertNotIn("/v1/data", decisions_output)
         self.assertNotIn("Fetched data safely", decisions_output)
         self.assertIn("proceed with the verified payload", decisions_output)
+
+        recent_output = server.t_read_chat("copilot-gaps-sample", source="copilot", mode="recent")
+        self.assertIn("Last tool: fetch_api:", recent_output)
+        self.assertIn("[REDACTED]", recent_output)
+        self.assertNotIn("ghp_1234567890abcdef123456", recent_output)
 
 
 if __name__ == "__main__":

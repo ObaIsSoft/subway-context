@@ -1306,6 +1306,124 @@ class TestLocalAndRouting(SubwayTestCase):
         self.assertTrue(usage["limit_hit"]["recent"])
         self.assertIn("Rate limit exceeded", usage["limit_hit"]["message"])
 
+    def test_opencode_times_support_milliseconds_seconds_and_null(self):
+        db_path = os.path.join(self.opencode_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute(
+                "CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT, time_updated INTEGER, "
+                "cost REAL, agent TEXT, model TEXT, parent_id TEXT)"
+            )
+            con.execute(
+                "CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT, time_created INTEGER, seq INTEGER)"
+            )
+            for sid, updated in (("ms", 1700000000000), ("seconds", 1700000000), ("null", None)):
+                con.execute(
+                    "INSERT INTO session_v2 (id, title, time_updated) VALUES (?, ?, ?)",
+                    (sid, sid, updated),
+                )
+                con.execute(
+                    "INSERT INTO session_message (session_id, type, data, time_created, seq) VALUES (?, ?, ?, ?, ?)",
+                    (sid, "user", json.dumps({"text": sid}), updated, 1),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+        chats = {chat["id"]: chat for chat in server.opencode_list()}
+        self.assertEqual(chats["ms"]["updated"], 1700000000)
+        self.assertEqual(chats["seconds"]["updated"], 1700000000)
+        self.assertIsNone(chats["null"]["updated"])
+        expected_date = _dt.datetime.fromtimestamp(1700000000).strftime("%Y-%m-%d %H:%M")
+        self.assertEqual(server.fmt_ts(chats["ms"]["updated"]), expected_date)
+        self.assertEqual(server.fmt_ts(chats["seconds"]["updated"]), expected_date)
+        for sid in ("ms", "seconds", "null"):
+            turns = server.opencode_read(sid)
+            self.assertEqual(turns[0]["text"], sid)
+            self.assertEqual(turns[0]["ts"], chats[sid]["updated"])
+
+    def test_recent_tool_activity_for_antigravity_and_opencode(self):
+        agy_path = os.path.join(self.test_dir, "transcript.jsonl")
+        with open(agy_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "PLANNER_RESPONSE", "created_at": "2026-10-02T10:02:00Z",
+                "tool_calls": [{"name": "read_file", "args": {"Path": "notes.txt", "token": "private-value"}}],
+            }) + "\n")
+        agy_chat = {"id": "agy-tool-test", "source": "antigravity", "path": agy_path,
+                    "title": "Antigravity tool test"}
+        with mock.patch.object(server, "resolve", return_value=agy_chat):
+            agy_recent = server.t_read_chat("agy-tool-test", source="antigravity", mode="recent")
+        self.assertIn("Last tool: read_file:", agy_recent)
+        self.assertIn("[REDACTED]", agy_recent)
+        self.assertNotIn("private-value", agy_recent)
+
+        con = sqlite3.connect(os.path.join(self.opencode_dir, "opencode.db"))
+        try:
+            con.execute(
+                "CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT, time_created INTEGER, seq INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                ("opencode-tool-test", "assistant", json.dumps({
+                    "content": [{"type": "tool", "name": "read_file",
+                                 "input": {"path": "notes.txt", "token": "private-value"}}],
+                }), 1790935320000, 1),
+            )
+            con.commit()
+        finally:
+            con.close()
+        opencode_chat = {"id": "opencode-tool-test", "source": "opencode",
+                         "title": "OpenCode tool test"}
+        with mock.patch.object(server, "resolve", return_value=opencode_chat):
+            opencode_recent = server.t_read_chat("opencode-tool-test", source="opencode", mode="recent")
+        self.assertIn("Last tool: read_file:", opencode_recent)
+        self.assertIn("[REDACTED]", opencode_recent)
+        self.assertNotIn("private-value", opencode_recent)
+
+    def test_worktree_chats_hidden_from_default_threads_and_remain_resolvable(self):
+        worktree = os.path.join(server.SUBWAY_DIR, "worktrees", "worker_test123")
+        os.makedirs(worktree, exist_ok=True)
+        os.makedirs(server.WORKERS_DIR, exist_ok=True)
+        with open(os.path.join(server.WORKERS_DIR, "worker_test123.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "worker_test123", "session_id": "worker-session-id"}, f)
+
+        chats = {
+            "claude": {"source": "claude", "id": "claude-worktree", "title": "Claude worktree", "project": worktree},
+            "antigravity": {"source": "antigravity", "id": "agy-worktree", "title": "Agy worktree",
+                            "project": "worker_test123", "_project_path": [worktree]},
+            "opencode": {"source": "opencode", "id": "opencode-worktree", "title": "OpenCode worktree",
+                         "project": "worker_test123", "_project_path": worktree},
+            "copilot": {"source": "copilot", "id": "copilot-worktree", "title": "Copilot worktree",
+                        "project": worktree},
+        }
+        record_session = {"source": "copilot", "id": "worker-session-id", "title": "Worker session",
+                          "project": self.test_dir}
+        with mock.patch.object(server, "claude_files", return_value=["claude-file"]), \
+             mock.patch.object(server, "claude_meta", return_value=chats["claude"]), \
+             mock.patch.object(server, "agy_list", return_value=[chats["antigravity"]]), \
+             mock.patch.object(server, "opencode_list", return_value=[chats["opencode"]]), \
+             mock.patch.object(server, "copilot_list", return_value=[chats["copilot"], record_session]):
+            self.assertEqual(server.all_chats(), [])
+            self.assertEqual(server.t_list_chats(), "No chats found across Antigravity, Claude Code, OpenCode, or GitHub Copilot.")
+            visible = server.all_chats(include_subagents=True)
+            self.assertEqual(len(visible), 5)
+            self.assertEqual(server.resolve("worker-session-id")["id"], "worker-session-id")
+            self.assertEqual(server.resolve("agy-worktree")["id"], "agy-worktree")
+
+            class Handler(server.SubwayHUDHandler):
+                def __init__(self):
+                    self.path = "/api/chats"
+
+                def _gate(self, api=True):
+                    return True
+
+                def send_json(self, data, status=200):
+                    self.sent_data = data
+
+            handler = Handler()
+            handler.do_GET()
+            self.assertEqual(handler.sent_data["total"], 0)
+
     def test_opencode_ollama_error_or_retry_is_never_a_limit_hit(self):
         db_path = os.path.join(self.opencode_dir, "opencode.db")
         con = sqlite3.connect(db_path)

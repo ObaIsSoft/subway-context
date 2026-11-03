@@ -171,6 +171,21 @@ def sort_key_ts(ts: Any) -> float:
         return 0.0
 
 
+def _opencode_timestamp(value: Any) -> Any:
+    """OpenCode stores Unix timestamps in either seconds or milliseconds."""
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return value
+    if numeric > 1e11:
+        numeric /= 1000.0
+    if numeric.is_integer():
+        return int(numeric)
+    return numeric
+
+
 # --------------------------------------------------------------------------
 # File extraction & touch tracking
 # --------------------------------------------------------------------------
@@ -967,6 +982,7 @@ def opencode_read_segments(sid: str) -> List[List[Dict[str, Any]]]:
             "select type, data, time_created from session_message where session_id=? order by seq", (sid,)
         ).fetchall()
         for m_type, raw_data, ts in rows:
+            ts = _opencode_timestamp(ts)
             if m_type == "compaction":
                 segs.append([])
                 continue
@@ -993,7 +1009,13 @@ def opencode_read_segments(sid: str) -> List[List[Dict[str, Any]]]:
                             ast_text.append(txt)
                     elif bt == "tool":
                         call_name = b.get("name") or "tool"
-                        ast_text.append(f"[tool {call_name}]")
+                        tool_input = b.get("input") or b.get("arguments") or b.get("args")
+                        if tool_input is None and isinstance(b.get("state"), dict):
+                            tool_input = b["state"].get("input")
+                        segs[-1].append({
+                            "role": "assistant", "text": "", "tool": f"[tool {call_name}]",
+                            "tool_name": str(call_name), "tool_input": tool_input, "ts": ts,
+                        })
                 if ast_text:
                     segs[-1].append({"role": "assistant", "text": "\n".join(ast_text), "ts": ts})
     finally:
@@ -1045,10 +1067,17 @@ def agy_read_segments(chat: Dict[str, Any]) -> Tuple[List[List[Dict[str, Any]]],
                         if name == "invoke_subagent":
                             role = args.get("Role") or args.get("TypeName") or "subagent"
                             prompt = args.get("Prompt") or ""
-                            segs[-1].append({"role": "assistant", "text": "", "tool": f"invoke_subagent [{role}]: {one_line(str(prompt), 100)}", "ts": ts})
+                            segs[-1].append({
+                                "role": "assistant", "text": "",
+                                "tool": f"invoke_subagent [{role}]: {one_line(str(prompt), 100)}",
+                                "tool_name": str(name), "tool_input": args, "ts": ts,
+                            })
                         else:
                             cmd = args.get("CommandLine") or args.get("Path") or ""
-                            segs[-1].append({"role": "assistant", "text": "", "tool": f"{name} {one_line(str(cmd), 100)}", "ts": ts})
+                            segs[-1].append({
+                                "role": "assistant", "text": "", "tool": f"{name} {one_line(str(cmd), 100)}",
+                                "tool_name": str(name), "tool_input": args, "ts": ts,
+                            })
                     if o.get("content"):
                         segs[-1].append({"role": "assistant", "text": o["content"], "ts": ts})
         return (segs if segs else [[]]), has_markers
@@ -1166,6 +1195,24 @@ def _workspace_name(uris: str) -> str:
     return ", ".join(names)
 
 
+def _workspace_paths(uris: str) -> List[str]:
+    try:
+        values = json.loads(uris) if uris else []
+    except Exception:
+        values = [uris]
+    if not isinstance(values, list):
+        values = [values]
+    paths = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        parsed = urllib.parse.urlparse(value)
+        path = urllib.parse.unquote(parsed.path) if parsed.scheme == "file" else value
+        if path:
+            paths.append(path)
+    return paths
+
+
 def agy_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
     con = _agy_db()
     out: List[Dict[str, Any]] = []
@@ -1210,7 +1257,8 @@ def agy_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
             out.append({
                 "source": "antigravity", "id": cid,
                 "title": display_title,
-                "project": _workspace_name(ws), "updated": lmt, "steps": steps,
+                "project": _workspace_name(ws), "_project_path": _workspace_paths(ws),
+                "updated": lmt, "steps": steps,
                 "subagent": bool(parent), "parent": parent or "",
             })
     finally:
@@ -1323,7 +1371,8 @@ def opencode_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
         return out
     try:
         rows = con.execute(
-            "select id, title, directory, time_updated, cost, agent, model, parent_id from session_v2 order by time_updated desc"
+            "select id, title, directory, time_updated, cost, agent, model, parent_id from session_v2 "
+            "order by (case when time_updated > 100000000000 then time_updated / 1000.0 else time_updated end) desc"
         ).fetchall()
         for sid, title, dirpath, updated, cost, agent, model, parent_id in rows:
             if parent_id and not include_subagents:
@@ -1334,7 +1383,8 @@ def opencode_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
                 "id": sid,
                 "title": display_title,
                 "project": os.path.basename(dirpath or ""),
-                "updated": updated,
+                "_project_path": dirpath or "",
+                "updated": _opencode_timestamp(updated),
                 "cost": cost,
                 "subagent": bool(parent_id),
                 "parent": parent_id or "",
@@ -1356,6 +1406,7 @@ def opencode_read(sid: str) -> List[Dict[str, Any]]:
             "select type, data, time_created from session_message where session_id=? order by seq", (sid,)
         ).fetchall()
         for m_type, raw_data, ts in rows:
+            ts = _opencode_timestamp(ts)
             try:
                 d = json.loads(raw_data)
             except Exception:
@@ -1379,7 +1430,13 @@ def opencode_read(sid: str) -> List[Dict[str, Any]]:
                             ast_text.append(txt)
                     elif bt == "tool":
                         call_name = b.get("name") or "tool"
-                        ast_text.append(f"[tool {call_name}]")
+                        tool_input = b.get("input") or b.get("arguments") or b.get("args")
+                        if tool_input is None and isinstance(b.get("state"), dict):
+                            tool_input = b["state"].get("input")
+                        turns.append({
+                            "role": "assistant", "text": "", "tool": f"[tool {call_name}]",
+                            "tool_name": str(call_name), "tool_input": tool_input, "ts": ts,
+                        })
                 if ast_text:
                     turns.append({"role": "assistant", "text": "\n".join(ast_text), "ts": ts})
     finally:
@@ -1526,7 +1583,7 @@ def _copilot_cli_meta(path: str, index: Dict[str, Dict[str, Any]],
     folder_id = os.path.basename(os.path.dirname(path))
     sid = folder_id
     first_prompt = last_prompt = title = model = ""
-    updated: Any = os.path.getmtime(path)
+    updated: Any = None
     project = ""
     usage: Optional[Dict[str, Any]] = None
     try:
@@ -1561,14 +1618,18 @@ def _copilot_cli_meta(path: str, index: Dict[str, Dict[str, Any]],
                 elif typ == "session.usage_checkpoint":
                     usage = _copilot_usage_checkpoint(data)
                 ts = event.get("timestamp")
-                if ts:
+                if ts and (updated is None or sort_key_ts(ts) > sort_key_ts(updated)):
                     updated = ts
     except OSError:
         pass
 
     indexed = index.get(sid) or index.get(folder_id) or {}
     project = indexed.get("cwd") or project or indexed.get("repository") or ""
-    updated = indexed.get("updated_at") or updated
+    if updated is None:
+        try:
+            updated = os.path.getmtime(path)
+        except OSError:
+            updated = None
     worker = worker_index.get(sid) or worker_index.get(folder_id)
     if usage and usage.get("model"):
         model = usage["model"]
@@ -1901,6 +1962,18 @@ def _redact_secrets(val: Any) -> str:
     return _SECRET_PATTERN.sub("[REDACTED]", s)
 
 
+def _last_tool_line(turns: List[Dict[str, Any]]) -> str:
+    for turn in reversed(turns):
+        name = turn.get("tool_name")
+        if not name:
+            continue
+        raw_input = turn.get("tool_input")
+        tool_input = one_line(_redact_secrets(raw_input), 120) if raw_input not in (None, "") else "(no input)"
+        timestamp = fmt_ts(turn.get("ts")) or "time unavailable"
+        return f"Last tool: {name}: {tool_input} at {timestamp}"
+    return ""
+
+
 def copilot_read_segments(chat: Dict[str, Any], mode: str = "full") -> Tuple[List[List[Dict[str, Any]]], bool]:
     if chat.get("format") == "vscode-chat":
         _state, turns = _vscode_chat_data(chat.get("path", ""))
@@ -1966,7 +2039,11 @@ def copilot_read_segments(chat: Dict[str, Any], mode: str = "full") -> Tuple[Lis
                                     args_str = str(args) if args else ""
                                 red_input = one_line(_redact_secrets(args_str), 300)
                                 inp_line = f" input: {red_input}" if red_input else ""
-                                turn = {"role": "assistant", "text": f"[tool {name}]{inp_line}", "tool": f"[tool {name}]", "ts": ts}
+                                turn = {
+                                    "role": "assistant", "text": f"[tool {name}]{inp_line}",
+                                    "tool": f"[tool {name}]", "tool_name": str(name),
+                                    "tool_input": args, "ts": ts,
+                                }
                                 segs[-1].append(turn)
                                 if call_id:
                                     pending_tools[call_id] = turn
@@ -1987,7 +2064,11 @@ def copilot_read_segments(chat: Dict[str, Any], mode: str = "full") -> Tuple[Lis
                             args_str = str(args) if args else ""
                         red_input = one_line(_redact_secrets(args_str), 300)
                         inp_line = f" input: {red_input}" if red_input else ""
-                        turn = {"role": "assistant", "text": f"[tool {name}]{inp_line}", "tool": f"[tool {name}]", "ts": ts}
+                        turn = {
+                            "role": "assistant", "text": f"[tool {name}]{inp_line}",
+                            "tool": f"[tool {name}]", "tool_name": str(name),
+                            "tool_input": args, "ts": ts,
+                        }
                         segs[-1].append(turn)
                         if call_id:
                             pending_tools[call_id] = turn
@@ -2109,7 +2190,55 @@ def all_chats(source: str = "all", include_subagents: bool = False) -> List[Dict
         chats.extend(opencode_list(include_subagents))
     if source in ("all", "copilot"):
         chats.extend(copilot_list(include_subagents))
+    if not include_subagents:
+        worker_sessions = _worker_chat_session_ids()
+        chats = [chat for chat in chats
+                 if not _chat_is_in_worker_worktree(chat)
+                 and str(chat.get("id") or "") not in worker_sessions]
     return chats
+
+
+def _worker_chat_session_ids() -> Set[str]:
+    ids: Set[str] = set()
+    paths = glob.glob(os.path.join(WORKERS_DIR, "worker_*.json"))
+    paths.extend(glob.glob(os.path.join(_archive_dir(), "worker_*.json")))
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                worker = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(worker, dict):
+            continue
+        for field in ("session_id", "copilot_session_id", "conversation", "thread"):
+            session_id = worker.get(field)
+            if session_id:
+                ids.add(str(session_id))
+    return ids
+
+
+def _chat_is_in_worker_worktree(chat: Dict[str, Any]) -> bool:
+    root = os.path.realpath(os.path.abspath(os.path.expanduser(
+        os.path.join(SUBWAY_DIR, "worktrees")
+    )))
+    raw_paths = chat.get("_project_path") or []
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+    projects = chat.get("project")
+    if isinstance(projects, str):
+        raw_paths = list(raw_paths) + [part.strip() for part in projects.split(",") if part.strip()]
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw_path)
+            path = urllib.parse.unquote(parsed.path) if parsed.scheme == "file" else raw_path
+            candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+            if os.path.commonpath((root, candidate)) == root and candidate != root:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def _project_names(project: Any) -> List[str]:
@@ -2605,6 +2734,7 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
     info = chat_segments_info(c, segment)
     data, seg_label, total_segments = info[0], info[1], info[2]
     note = getattr(info, "note", None)
+    last_tool = _last_tool_line(data) if mode == "recent" else ""
     ex = to_exchanges(data)
     explicit_start = start is not None
     start_idx = max(0, int(start or 0))
@@ -2650,9 +2780,10 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
             advance = not bridge  # A look back through history must not rewind the live position.
             anchor_info = f"Transit delta since watermark ({fmt_ts(last_cp.get('ts'))}); boarding at station [{start_idx}]"
             if start_idx >= len(ex):
-                return (f"# subway-context: {c['source'].upper()} `{target_id}`\n"
-                        f"Segment: {seg_notice}\n"
-                        f"No new stations since your last transit ({len(ex)} stations, watermark {fmt_ts(last_cp.get('ts'))}).")
+                result = (f"# subway-context: {c['source'].upper()} `{target_id}`\n"
+                          f"Segment: {seg_notice}\n"
+                          f"No new stations since your last transit ({len(ex)} stations, watermark {fmt_ts(last_cp.get('ts'))}).")
+                return f"{result}\n{last_tool}" if last_tool else result
 
     anchor_info = f"[{seg_notice}] {anchor_info}" if anchor_info else f"[{seg_notice}]"
 
@@ -2660,6 +2791,8 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
     text = render_chat(c, data, mode, int(turns), start_idx, int(max_chars),
                        include_thoughts, include_tools, anchor_info,
                        explicit_start=explicit_start, delivery=delivery)
+    if last_tool:
+        text = f"{text}\n\n{last_tool}"
 
     # The watermark only moves on since='last' reads, and only as far as what was really delivered.
     last = delivery.get("last")
@@ -8178,12 +8311,14 @@ def _opencode_worker_session_activity(meta: Dict[str, Any], started_at: float) -
         try:
             con.execute("PRAGMA busy_timeout=100")
             session = con.execute(
-                "select id from session_v2 where directory in (?, ?) and time_created>=? "
-                "order by time_created desc limit 1",
-                (directory, real_directory, int(started_at * 1000)),
+                "select id, time_created from session_v2 where directory in (?, ?) "
+                "and (case when time_created > 100000000000 then time_created / 1000.0 else time_created end) >= ? "
+                "order by (case when time_created > 100000000000 then time_created / 1000.0 else time_created end) desc limit 1",
+                (directory, real_directory, started_at),
             ).fetchone()
             updated = con.execute(
-                "select max(time_updated) from session_message where session_id=?",
+                "select max(case when time_updated > 100000000000 then time_updated / 1000.0 else time_updated end) "
+                "from session_message where session_id=?",
                 (session[0],),
             ).fetchone() if session else None
         finally:
@@ -8278,9 +8413,10 @@ def _poll_opencode_worker_retry(
         try:
             con.execute("PRAGMA busy_timeout=100")
             session = con.execute(
-                "select id from session_v2 where directory in (?, ?) and time_created>=? "
-                "order by time_created desc limit 1",
-                (directory, real_directory, int(started_at * 1000)),
+                "select id from session_v2 where directory in (?, ?) "
+                "and (case when time_created > 100000000000 then time_created / 1000.0 else time_created end) >= ? "
+                "order by (case when time_created > 100000000000 then time_created / 1000.0 else time_created end) desc limit 1",
+                (directory, real_directory, started_at),
             ).fetchone()
             if not session:
                 return None
@@ -10283,7 +10419,10 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
     if con is None:
         raise RuntimeError("OpenCode has no database yet")
     try:
-        now_ms = int(time.time() * 1000)
+        now_s = time.time()
+        normalized_created = (
+            "case when time_created > 100000000000 then time_created / 1000.0 else time_created end"
+        )
         tokens: Dict[str, Dict[str, int]] = {}
         cost = {}
         for name, span in (("5h", FIVE_H), ("7d", SEVEN_D)):
@@ -10291,15 +10430,17 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
                 "select coalesce(sum(json_extract(data,'$.tokens.input')),0),"
                 " coalesce(sum(json_extract(data,'$.tokens.output')),0)+coalesce(sum(json_extract(data,'$.tokens.reasoning')),0),"
                 " coalesce(sum(json_extract(data,'$.tokens.cache.read')),0), coalesce(sum(json_extract(data,'$.cost')),0)"
-                " from session_message where type='assistant' and time_created>=?",
-                (now_ms - span * 1000,)).fetchone()
+                f" from session_message where type='assistant' and {normalized_created}>=?",
+                (now_s - span,)).fetchone()
             tokens[name] = {"input": int(row[0]), "output": int(row[1]), "cache_read": int(row[2])}
             cost[name] = round(float(row[3]), 4)
         hourly = [0] * 24
         for created, used in con.execute(
                 "select time_created, coalesce(json_extract(data,'$.tokens.input'),0)+coalesce(json_extract(data,'$.tokens.output'),0)"
-                " from session_message where type='assistant' and time_created>=?", (now_ms - 86400 * 1000,)):
-            age = int((now_ms - created) // 3600000)
+                f" from session_message where type='assistant' and {normalized_created}>=?",
+                (now_s - 86400,)):
+            created = _opencode_timestamp(created)
+            age = int((now_s - created) // 3600)
             if 0 <= age < 24:
                 hourly[23 - age] += int(used)
         tokens["hourly"] = hourly  # type: ignore[assignment]
@@ -10308,9 +10449,9 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
             for prov, mid, used in con.execute(
                     "select json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id'),"
                     " coalesce(sum(coalesce(json_extract(data,'$.tokens.input'),0)+coalesce(json_extract(data,'$.tokens.output'),0)),0)"
-                    " from session_message where type='assistant' and time_created>=?"
+                    f" from session_message where type='assistant' and {normalized_created}>=?"
                     " group by 1, 2",
-                    (now_ms - SEVEN_D * 1000,)):
+                    (now_s - SEVEN_D,)):
                 if mid:
                     cnt = int(used)
                     key = f"{prov}/{mid}".strip("/") if prov else str(mid)
@@ -10319,7 +10460,10 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
                         per_model[str(mid)] = cnt
         model = ""
         with contextlib.suppress(Exception):
-            raw = con.execute("select model from session_v2 order by time_updated desc limit 1").fetchone()
+            raw = con.execute(
+                "select model from session_v2 order by "
+                "(case when time_updated > 100000000000 then time_updated / 1000.0 else time_updated end) desc limit 1"
+            ).fetchone()
             if raw and raw[0]:
                 parsed = json.loads(raw[0])
                 model = f"{parsed.get('providerID', '')}/{parsed.get('id', '')}".strip("/")
@@ -10330,32 +10474,36 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
             for created, raw_retry, prov, mid in con.execute(
                     "select time_created, json_extract(data,'$.retry'), json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id')"
                     " from session_message where type='assistant'"
-                    " and json_extract(data,'$.retry') is not null and time_created>=? order by time_created desc limit 50",
-                    (now_ms - 86400 * 1000,)):
+                    f" and json_extract(data,'$.retry') is not null and {normalized_created}>=?"
+                    f" order by {normalized_created} desc limit 50",
+                    (now_s - 86400,)):
                 retry = json.loads(raw_retry)
                 error = retry.get("error") or {}
                 key = f"{prov}/{mid}"
                 if prov in _LOCAL_OPENCODE_PROVIDERS:
                     continue  # Local models have no free limit; their failures are memory or load problems.
                 if "rate-limit" in str(error.get("type")) and key not in limited:
-                    until = (retry.get("at") or 0) / 1000.0
-                    limited[key] = {"at": created / 1000.0, "retry_at": until, "model": key,
-                                    "message": one_line(str(error.get("message", "")), 160), "recent": time.time() < until + 3600}
+                    until = _opencode_timestamp(retry.get("at")) or 0
+                    created = _opencode_timestamp(created)
+                    limited[key] = {"at": created, "retry_at": until, "model": key,
+                                    "message": one_line(str(error.get("message", "")), 160), "recent": now_s < until + 3600}
             limit_hit = next((v for v in limited.values() if v["recent"]), None)
         with contextlib.suppress(Exception):
             for created, err, prov, mid in () if limit_hit else con.execute(
                     "select time_created, json_extract(data,'$.error'), json_extract(data,'$.model.providerID'), json_extract(data,'$.model.id')"
                     " from session_message where type='assistant'"
-                    " and json_extract(data,'$.finish')='error' and time_created>=? order by time_created desc limit 50",
-                    (now_ms - 86400 * 1000,)):
+                    f" and json_extract(data,'$.finish')='error' and {normalized_created}>=?"
+                    f" order by {normalized_created} desc limit 50",
+                    (now_s - 86400,)):
                 if prov in _LOCAL_OPENCODE_PROVIDERS:
                     continue
                 info = json.loads(err) if isinstance(err, str) and err.startswith("{") else {}
                 text = f"{info.get('type', '')} {info.get('message', '')}".lower()
                 if info.get("status") == 429 or re.search(r"rate.?limit|quota|free.*(limit|usage)|usage limit|too many requests|exceeded", text):
                     key = f"{prov}/{mid}" if prov and mid else ""
-                    hit = {"at": created / 1000.0, "message": one_line(str(info.get("message", "")), 160),
-                           "recent": now_ms - created < 3600 * 1000, "model": key}
+                    created = _opencode_timestamp(created)
+                    hit = {"at": created, "message": one_line(str(info.get("message", "")), 160),
+                           "recent": now_s - created < 3600, "model": key}
                     if key and key not in limited:
                         limited[key] = {**hit, "retry_at": 0}
                     limit_hit = limit_hit or hit
@@ -10956,11 +11104,13 @@ def _other_sessions_uncached(provider: str, now: float) -> Optional[Dict[str, An
         if con is None:
             return None
         try:
-            cutoff_ms = int(cutoff_5h * 1000)
+            normalized_updated = (
+                "case when time_updated > 100000000000 then time_updated / 1000.0 else time_updated end"
+            )
             rows = con.execute(
                 "select id, coalesce(tokens_input, 0) + coalesce(tokens_output, 0) "
-                "from session_v2 where time_updated >= ?",
-                (cutoff_ms,),
+                f"from session_v2 where {normalized_updated} >= ?",
+                (time.time() - cutoff_5h,),
             ).fetchall()
             for sid, tok in rows:
                 if str(sid) in worker_ids:

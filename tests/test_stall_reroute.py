@@ -337,13 +337,14 @@ class TestStallAndReroute(unittest.TestCase):
         worker_dir = os.path.join(self.temp_dir, "worktree")
         os.makedirs(worker_dir)
         started_at = time.time() - 2
+        message_updated_ms = int((started_at + 1) * 1000)
         meta = {"provider": "opencode", "project_dir": worker_dir}
         self._create_opencode_retry_db(
-            worker_dir, {"tokens": {"input": 1}}, int((started_at + 1) * 1000),
+            worker_dir, {"tokens": {"input": 1}}, message_updated_ms,
         )
         self.assertEqual(
             server._opencode_worker_session_activity(meta, started_at),
-            ("opencode-session", int((started_at + 1) * 1000)),
+            ("opencode-session", message_updated_ms / 1000),
         )
         db_path = os.path.join(server.OPENCODE_DIR, "opencode.db")
         con = sqlite3.connect(db_path)
@@ -354,7 +355,7 @@ class TestStallAndReroute(unittest.TestCase):
             con.close()
         self.assertEqual(
             server._opencode_worker_session_activity(meta, started_at),
-            ("opencode-session", int((started_at + 1) * 1000) + 1000),
+            ("opencode-session", (message_updated_ms + 1000) / 1000),
         )
 
     def test_opencode_activity_tolerates_corrupt_or_locked_database(self):
