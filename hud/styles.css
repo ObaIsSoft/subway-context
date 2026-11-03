@@ -251,6 +251,13 @@ details ul { list-style: none; padding-top: 4px; font-size: 11px; color: var(--m
 .term-empty { display: flex; flex-direction: column; gap: 10px; }
 .term-empty p { margin: 0; }
 .term-hint { display: block; padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--bg); color: var(--strong); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
+/* Closed terminals: one collapsed group, log-only rows, no switches. */
+.term-closed { min-width: 0; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--raised); padding: 0 14px; }
+.term-closed > summary { min-height: 44px; display: flex; align-items: center; font-size: 13px; color: var(--strong); }
+.term-closed > summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.term-closed-body { display: flex; flex-direction: column; gap: 10px; padding-bottom: 14px; min-width: 0; }
+.term-closed .btns .btn { min-height: 44px; margin: 0; }
+.term-closed-row .btns .btn { margin: 0; }
 .tgl-field { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; }
 .tgl-label { font-size: 13px; color: var(--strong); font-weight: 500; }
 .tgl-field.disabled .tgl-label { color: var(--muted); }

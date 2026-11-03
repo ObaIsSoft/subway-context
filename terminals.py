@@ -23,6 +23,10 @@ MAX_OUTPUT_BYTES = 64 * 1024
 MAX_COMMANDS_PER_TERMINAL = 500
 RETENTION_SECONDS = 7 * 86400
 TERMINAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+SHELL_ID_RE = re.compile(r"^shell-(\d+)-\d+$")
+ARCHIVE_SUBDIR = "archive"
+# Per-terminal control state: dropped from the record once the terminal is closed.
+CONTROL_KEYS = ("allow_commands", "capture_output", "share_enabled", "shell_integration", "tty")
 
 HOOK_BEGIN_MARKER = "# >>> subway-context terminal hook >>>"
 HOOK_END_MARKER = "# <<< subway-context terminal hook <<<"
@@ -88,8 +92,149 @@ def _terminal_path(base_dir: str, terminal_id: str) -> str:
     return os.path.join(base_dir, f"{_slug(terminal_id)}.json")
 
 
+def _archive_dir(base_dir: str) -> str:
+    return os.path.join(base_dir, ARCHIVE_SUBDIR)
+
+
+def _archived_path(base_dir: str, terminal_id: str) -> str:
+    return os.path.join(_archive_dir(base_dir), f"{_slug(terminal_id)}.json")
+
+
+def _find_record(base_dir: str, terminal_id: str) -> Optional[str]:
+    """Path of a terminal's record: the live one, else its archived log."""
+    path = _terminal_path(base_dir, terminal_id)
+    if os.path.exists(path):
+        return path
+    archived = _archived_path(base_dir, terminal_id)
+    return archived if os.path.exists(archived) else None
+
+
+def _is_closed(rec: Dict[str, Any]) -> bool:
+    return bool((rec or {}).get("closed"))
+
+
+def _drop_controls(rec: Dict[str, Any]) -> None:
+    for key in CONTROL_KEYS:
+        rec.pop(key, None)
+
+
+def shell_gone(rec: Dict[str, Any]) -> bool:
+    """True when a shell-hook terminal's process is gone. Unknown or editor terminals: never."""
+    rec = rec or {}
+    if terminal_source(rec) != "hook":
+        return False
+    if os.name == "nt":  # os.kill(pid, 0) would TERMINATE the process on Windows.
+        return False
+    m = SHELL_ID_RE.match(str(rec.get("id") or ""))
+    if not m:
+        return False
+    pid = int(m.group(1))
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:  # PermissionError and anything else: the process exists or we can't tell.
+        return False
+    return False
+
+
+def _set_closed(rec: Dict[str, Any], now: Optional[float] = None) -> None:
+    rec["closed"] = True
+    if rec.get("closed_at") is None:
+        rec["closed_at"] = time.time() if now is None else now
+    _drop_controls(rec)
+
+
+def mark_gone_closed(base_dir: str, now: Optional[float] = None) -> List[str]:
+    """Close every terminal whose shell process has exited. Returns the ids newly closed."""
+    closed_ids: List[str] = []
+    if not os.path.isdir(base_dir):
+        return closed_ids
+    for fp in glob.glob(os.path.join(base_dir, "*.json")):
+        with contextlib.suppress(OSError, ValueError):
+            rec = _load_json(fp)
+            if not rec or not rec.get("id") or _is_closed(rec):
+                continue
+            if not shell_gone(rec):
+                continue
+            _set_closed(rec, now)
+            value = time.time() if now is None else now
+            rec["closed_at"] = value
+            rec["updated_at"] = value
+            _write_json_atomic(_terminal_path(base_dir, rec["id"]), rec)
+            closed_ids.append(rec["id"])
+    return closed_ids
+
+
+def archive_closed(base_dir: str, older_than_s: float, now: Optional[float] = None) -> List[str]:
+    """Archive closed logs closed longer than older_than_s ago. A closed log with no closed_at
+    gets one and is kept."""
+    now = time.time() if now is None else now
+    archived: List[str] = []
+    if not os.path.isdir(base_dir):
+        return archived
+    for fp in glob.glob(os.path.join(base_dir, "*.json")):
+        with contextlib.suppress(OSError, ValueError):
+            rec = _load_json(fp)
+            if not rec or not rec.get("id") or not _is_closed(rec):
+                continue
+            closed_at = rec.get("closed_at")
+            if not isinstance(closed_at, (int, float)):
+                rec["closed_at"] = float(now)
+                _write_json_atomic(_terminal_path(base_dir, rec["id"]), rec)
+                continue
+            if now - float(closed_at) > older_than_s and _move_to_archive(base_dir, rec["id"]):
+                archived.append(rec["id"])
+    return archived
+
+
+def _move_to_archive(base_dir: str, terminal_id: str) -> bool:
+    d = _archive_dir(base_dir)
+    os.makedirs(d, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(d, 0o700)
+    os.replace(_terminal_path(base_dir, terminal_id), _archived_path(base_dir, terminal_id))
+    return True
+
+
+def _pick_record(base_dir: str, terminal_id: str) -> Optional[str]:
+    """Path of a live record, or of its archived log when the live one is gone."""
+    path = _terminal_path(base_dir, terminal_id)
+    if os.path.exists(path):
+        return path
+    return _find_record(base_dir, terminal_id)
+
+
+def _pick_closed(base_dir: str, terminal_id: str) -> Optional[Dict[str, Any]]:
+    rec = _load_json(_pick_record(base_dir, terminal_id) or "")
+    return rec if rec and _is_closed(rec) else None
+
+
+def close_log_action(base_dir: str, terminal_id: str, action: str) -> bool:
+    """Delete or archive the log of a closed terminal. False when it is missing or not closed."""
+    if action not in ("delete", "archive"):
+        raise ValueError(f"invalid action '{action}'")
+    rec = _pick_closed(base_dir, terminal_id)
+    if not rec:
+        return False
+    if action == "archive":
+        if os.path.exists(_archived_path(base_dir, terminal_id)):
+            return True
+        return _move_to_archive(base_dir, terminal_id)
+    path = _pick_record(base_dir, terminal_id)
+    if path:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+    return True
+
+
 def get_terminal(base_dir: str, terminal_id: str) -> Optional[Dict[str, Any]]:
-    rec = _load_json(_terminal_path(base_dir, terminal_id))
+    path = _find_record(base_dir, terminal_id)
+    if not path:
+        return None
+    rec = _load_json(path)
     return rec or None
 
 
@@ -103,6 +248,12 @@ def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_
     os.makedirs(base_dir, exist_ok=True)
     path = _terminal_path(base_dir, terminal_id)
     rec = _load_json(path)
+    if not rec and os.path.exists(_archived_path(base_dir, terminal_id)):
+        raise ValueError("terminal is closed")
+    if _is_closed(rec):
+        if closed is False or share_enabled is True or allow_commands is True or capture_output is True:
+            raise ValueError("terminal is closed")
+        return rec
     rec.setdefault("id", terminal_id)
     rec.setdefault("commands", [])
     rec.setdefault("since", {})
@@ -122,7 +273,10 @@ def set_terminal_opt_in(base_dir: str, terminal_id: str, name: str = "", window_
     if shell_integration is not None:
         rec["shell_integration"] = bool(shell_integration)
     if closed is not None:
-        rec["closed"] = bool(closed)
+        if closed:
+            _set_closed(rec)
+        else:
+            rec["closed"] = False
     if source:
         rec["source"] = source
     if app:
@@ -143,6 +297,10 @@ def record_command(base_dir: str, terminal_id: str, command: str, exit_code: Opt
     os.makedirs(base_dir, exist_ok=True)
     path = _terminal_path(base_dir, terminal_id)
     rec = _load_json(path)
+    if not rec and os.path.exists(_archived_path(base_dir, terminal_id)):
+        return None  # Archived logs are read-only: never recreate them.
+    if _is_closed(rec):
+        return None  # A closed log only keeps its history: no new commands.
     rec.setdefault("id", terminal_id)
     rec.setdefault("since", {})
     if name:
@@ -211,6 +369,7 @@ def list_terminals(base_dir: str) -> List[Dict[str, Any]]:
                 "capture_output": bool(rec.get("capture_output")),
                 "shell_integration": rec.get("shell_integration"), "closed": bool(rec.get("closed")),
                 "source": terminal_source(rec),
+                "closed_at": rec.get("closed_at") if isinstance(rec.get("closed_at"), (int, float)) else None,
                 "app": rec.get("app") or "",
                 "tty": rec.get("tty") or "",
                 "last_command": last.get("command") if last else "",
@@ -219,13 +378,16 @@ def list_terminals(base_dir: str) -> List[Dict[str, Any]]:
                 "command_count": len(commands), "failures": failures,
             })
     out.sort(key=lambda r: r.get("last_ts") or 0, reverse=True)
+    # Open terminals first (existing order within each group).
+    out.sort(key=lambda r: bool(r.get("closed")))
     return out
 
 
 def read_terminal(base_dir: str, terminal_id: str, caller_id: str = "", since: str = "last",
                   mode: str = "commands") -> Dict[str, Any]:
     """Read a terminal's command history. since='last' returns what this caller hasn't seen yet."""
-    rec = _load_json(_terminal_path(base_dir, terminal_id))
+    path = _find_record(base_dir, terminal_id)
+    rec = _load_json(path) if path else {}
     if not rec:
         return {"error": f"terminal '{terminal_id}' not found"}
     commands = rec.get("commands") or []
@@ -242,9 +404,8 @@ def read_terminal(base_dir: str, terminal_id: str, caller_id: str = "", since: s
         selected = [c for c in selected if c.get("exit_code") not in (0, None)]
     elif mode != "full":
         mode = "commands"
-    if caller_id:
+    if caller_id and os.path.dirname(path) == base_dir:  # Never write to an archived log.
         with contextlib.suppress(OSError):
-            path = _terminal_path(base_dir, terminal_id)
             fresh = _load_json(path)
             if fresh:
                 fresh_since = fresh.get("since") or {}
@@ -264,7 +425,8 @@ def search_terminal(base_dir: str, query: str, terminal_id: str = "", limit: int
     if not q:
         return out
     if terminal_id:
-        paths = [_terminal_path(base_dir, terminal_id)]
+        path = _find_record(base_dir, terminal_id)
+        paths = [path] if path else []
     elif os.path.isdir(base_dir):
         paths = glob.glob(os.path.join(base_dir, "*.json"))
     else:

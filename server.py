@@ -7671,17 +7671,32 @@ def set_terminal_sharing(enabled: bool) -> bool:
     return bool(enabled)
 
 
+def _tidy_terminals() -> None:
+    """Close terminals whose shell is gone and archive old closed logs. Never raises.
+    Call it inside an existing `with _state_lock("terminals"):` block (the lock is not re-entrant)."""
+    try:
+        d = _terminals_dir()
+        terminals.mark_gone_closed(d)
+        terminals.archive_closed(d, older_than_s=7 * 86400)
+    except (OSError, ValueError):
+        pass
+
+
 def t_list_terminals() -> str:
     """List every terminal that has opted in: name, folder, last command, failures."""
     with _state_lock("terminals"):
+        _tidy_terminals()
         rows = terminals.list_terminals(_terminals_dir())
+    closed_count = sum(1 for r in rows if r.get("closed"))
+    rows = [r for r in rows if not r.get("closed")]
     if not rows:
+        if closed_count:
+            return (f"No open terminals. {closed_count} closed terminal(s) hidden "
+                    "(the user can remove them in the HUD).")
         return "No terminals have been shared yet."
     lines = [f"{len(rows)} terminal(s):"]
     for r in rows:
         flags = []
-        if r.get("closed"):
-            flags.append("closed")
         if r.get("allow_commands"):
             flags.append("commands allowed")
         if r.get("shell_integration") is False:
@@ -7690,6 +7705,8 @@ def t_list_terminals() -> str:
         lines.append(f"- `{r['id']}` {r['name']} — {r['folder'] or 'unknown folder'}{flag_str}: "
                      f"last `{one_line(r.get('last_command') or '', 80)}` "
                      f"({r['failures']} failing of {r['command_count']})")
+    if closed_count:
+        lines.append(f"{closed_count} closed terminal(s) hidden (the user can remove them in the HUD).")
     return "\n".join(lines)
 
 
@@ -13247,6 +13264,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/terminals":
             with _state_lock("terminals"):
+                _tidy_terminals()
                 rows = terminals.list_terminals(_terminals_dir())
             self.send_json({"terminals": rows, "sharing": terminal_sharing_enabled()})
             return
@@ -13509,15 +13527,40 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             app = raw_app if raw_app in ("terminal", "iterm") else ""
             raw_tty = str(payload.get("tty", "") or "")
             tty = raw_tty if re.match(r"^/dev/ttys[0-9]+$", raw_tty) else ""
-            with _state_lock("terminals"):
-                rec = terminals.set_terminal_opt_in(
-                    _terminals_dir(), tid, name=str(payload.get("name", "")),
-                    window_id=str(payload.get("window_id", "")), folder=str(payload.get("folder", "")),
-                    share_enabled=payload.get("share_enabled"), allow_commands=payload.get("allow_commands"),
-                    capture_output=payload.get("capture_output"),
-                    shell_integration=payload.get("shell_integration"), closed=payload.get("closed"),
-                    source=source, app=app, tty=tty)
+            try:
+                with _state_lock("terminals"):
+                    rec = terminals.set_terminal_opt_in(
+                        _terminals_dir(), tid, name=str(payload.get("name", "")),
+                        window_id=str(payload.get("window_id", "")), folder=str(payload.get("folder", "")),
+                        share_enabled=payload.get("share_enabled"), allow_commands=payload.get("allow_commands"),
+                        capture_output=payload.get("capture_output"),
+                        shell_integration=payload.get("shell_integration"), closed=payload.get("closed"),
+                        source=source, app=app, tty=tty)
+            except ValueError:
+                self._deny(409, "terminal is closed")
+                return
             res = {"ok": True, "terminal": rec}
+        elif path == "/api/terminal_log":
+            action = str(payload.get("action", ""))
+            if action not in ("delete", "archive"):
+                self._deny(400, "action must be 'delete' or 'archive'")
+                return
+            done: List[str] = []
+            with _state_lock("terminals"):
+                if payload.get("all_closed") is True:
+                    for r in terminals.list_terminals(_terminals_dir()):
+                        if r.get("closed") and terminals.close_log_action(_terminals_dir(), r["id"], action):
+                            done.append(r["id"])
+                else:
+                    tid = str(payload.get("terminal_id", ""))
+                    if not tid:
+                        self._deny(400, "missing terminal_id")
+                        return
+                    if not terminals.close_log_action(_terminals_dir(), tid, action):
+                        self._deny(404, "terminal not found or not closed")
+                        return
+                    done.append(tid)
+            res = {"done": done, "action": action}
         elif path == "/api/terminal_event":
             if not terminal_sharing_enabled():
                 self._deny(403, "terminal sharing is off")

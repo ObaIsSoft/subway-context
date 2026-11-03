@@ -1203,6 +1203,102 @@ async function openTerminalDetail(t) {
 
 const terminalConfirm = new Set();
 const terminalCaptureConfirm = new Set();
+// Closed-log cleanup: which row(s) are asking for a delete confirmation. Survives re-renders.
+const terminalClosedConfirm = new Set();
+const CLOSED_ALL = "*all*";
+
+function terminalClosedStamp(t) {
+  if (typeof t.closed_at === "number" && t.closed_at > 0) return new Date(t.closed_at * 1000).toLocaleString();
+  return terminalStamp(t);
+}
+
+function terminalInlineConfirm(kind, key, label, danger, question, onYes) {
+  return h("div", { class: "term-confirm", role: "group", "aria-label": `${kind} ${label}` },
+    h("div", { class: "term-confirm-text" }, question),
+    h("div", { class: "btns" },
+      h("button", {
+        class: `btn ${danger ? "danger" : "primary"}`, type: "button",
+        "aria-label": `${danger ? "Yes, delete" : "Yes, archive"} ${label}`,
+        on: {
+          click: () => {
+            terminalClosedConfirm.delete(key);
+            onYes();
+          },
+        },
+      }, danger ? "Yes, delete" : "Yes, archive"),
+      h("button", {
+        class: "btn", type: "button", "aria-label": `Cancel ${kind.toLowerCase()} of ${label}`,
+        on: {
+          click: () => {
+            terminalClosedConfirm.delete(key);
+            rerenderTerminals();
+          },
+        },
+      }, "Cancel")));
+}
+
+/* Closed terminals keep only their log: no switches, no tags, just open/archive/delete. */
+function terminalClosedRow(t, onRefresh) {
+  const name = t.name || t.id;
+  const stamp = terminalClosedStamp(t);
+  const last = t.last_command ? String(t.last_command) : "";
+  const confirming = terminalClosedConfirm.has(t.id);
+  const openLog = () => openTerminalDetail(t);
+  return h("div", { class: "row term-row term-closed-row" },
+    h("div", {
+      class: "term-main", tabindex: "0", role: "button", "aria-label": `Open log for ${name}`,
+      on: {
+        click: openLog,
+        keydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openLog(); } },
+      },
+    },
+      h("b", { class: "row-title" }, name),
+      last ? h("div", { class: "row-sub mono" }, `$ ${last}`) : null,
+      h("div", { class: "row-sub" }, stamp ? `closed ${stamp}` : "closed")),
+    h("div", { class: "term-controls" },
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn", type: "button", "aria-label": `Archive ${name}`,
+          on: { click: () => postTerminal("/api/terminal_log", { terminal_id: t.id, action: "archive" }, onRefresh) },
+        }, "Archive"),
+        h("button", {
+          class: "btn danger", type: "button", "aria-label": `Delete ${name}`,
+          on: {
+            click: () => {
+              terminalClosedConfirm.add(t.id);
+              rerenderTerminals();
+            },
+          },
+        }, "Delete")),
+      confirming ? terminalInlineConfirm("Delete", t.id, name, true,
+        `Delete the closed log for ${name}? This can't be undone.`,
+        () => postTerminal("/api/terminal_log", { terminal_id: t.id, action: "delete" }, onRefresh)) : null));
+}
+
+function terminalClosedGroup(closed, onRefresh) {
+  const confirmingAll = terminalClosedConfirm.has(CLOSED_ALL);
+  return h("details", { class: "term-closed" },
+    h("summary", {}, `Closed (${closed.length})`),
+    h("div", { class: "term-closed-body" },
+      h("div", { class: "btns" },
+        h("button", {
+          class: "btn", type: "button", "aria-label": `Archive all ${closed.length} closed terminals`,
+          on: { click: () => postTerminal("/api/terminal_log", { all_closed: true, action: "archive" }, onRefresh) },
+        }, "Archive all"),
+        h("button", {
+          class: "btn danger", type: "button", "aria-label": `Delete all ${closed.length} closed terminals`,
+          on: {
+            click: () => {
+              terminalClosedConfirm.add(CLOSED_ALL);
+              rerenderTerminals();
+            },
+          },
+        }, "Delete all")),
+      confirmingAll ? terminalInlineConfirm("Delete", CLOSED_ALL, `all ${closed.length} closed logs`, true,
+        `Delete all ${closed.length} closed logs? This can't be undone.`,
+        () => postTerminal("/api/terminal_log", { all_closed: true, action: "delete" }, onRefresh)) : null,
+      h("div", { class: "rows" }, closed.map((t) => terminalClosedRow(t, onRefresh)))));
+}
 
 /* Switches are real buttons, so keyboard and screen readers get the same control as touch. */
 function terminalSwitch(label, checked, onToggle, disabled = false) {
@@ -1230,7 +1326,9 @@ function terminalStamp(t) {
 }
 
 export function terminalsPage(d, rows, onRefresh, error = "", loading = false, stale = false, sharing = false) {
-  const list = rows || [];
+  const all = rows || [];
+  const list = all.filter((t) => !t.closed);
+  const closed = all.filter((t) => Boolean(t.closed));
   const masterOn = Boolean(sharing);
   const sharingCard = h("section", { class: "card", "aria-labelledby": "terminal-sharing-title" },
     h("div", { class: "card-head" },
@@ -1243,6 +1341,7 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
         if (masterOn) {
           terminalConfirm.clear();
           terminalCaptureConfirm.clear();
+          terminalClosedConfirm.clear();
         }
         postTerminal("/api/terminal_sharing", { enabled: !masterOn }, onRefresh);
       })));
@@ -1360,12 +1459,14 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
           h("div", { class: "card-sub" }, "Commands run in terminals your user has shared. Nothing is captured until they opt in.")),
         h("button", { class: "btn", type: "button", on: { click: onRefresh } }, "Refresh")),
       error ? h("div", { class: "err" }, `Could not refresh terminals: ${error}`) : null,
+      closed.length && !bodyRows.length && !loading ? h("div", { class: "card-sub" }, "No open terminals; closed logs are under \"Closed\" below.") : null,
       h("div", { class: "rows" }, bodyRows.length ? bodyRows : h("div", { class: "empty" },
-        loading ? "Loading…" : h("div", { class: "term-empty" },
+        loading && !closed.length ? "Loading…" : h("div", { class: "term-empty" },
           h("p", {}, "No terminals have been shared yet."),
           h("p", {}, "To start sharing, either:"),
           h("code", { class: "term-hint" }, "VS Code: run 'Subway: Share Terminal' in a terminal"),
-          h("code", { class: "term-hint" }, "Shell: python3 server.py terminal hook install, then open a new terminal"))))),
+          h("code", { class: "term-hint" }, "Shell: python3 server.py terminal hook install, then open a new terminal")))),
+      closed.length ? terminalClosedGroup(closed, onRefresh) : null),
   ];
 }
 
