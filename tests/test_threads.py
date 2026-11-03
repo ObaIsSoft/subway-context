@@ -419,6 +419,39 @@ class ThreadServerCase(unittest.TestCase):
         self.assertEqual(data["exit_code"], 7)
         self.assertEqual(data["usage"], {"input": 10, "output": 2})
         self.assertGreaterEqual(data["duration_s"], 0)
+        self.assertEqual(len([r for r in self.reads("chat-root") if r["kind"] == "finished"]), 1)
+
+    def test_supervise_batch_records_one_finished(self):
+        worker_id = "worker_000008"
+        self.save(id=worker_id, kind="batch", thread_root="chat-batch", provider="local", model="m",
+                  status="running", cmd=["batch"])
+        with mock.patch.object(server, "run_batch", return_value={"status": "completed", "exit_code": 0}):
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+        finished = [r for r in self.reads("chat-batch") if r["kind"] == "finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["node"], worker_id)
+        self.assertEqual(finished[0]["data"]["status"], "completed")
+
+    def test_supervise_memory_wait_records_one_finished(self):
+        worker_id = "worker_000009"
+        self.save(id=worker_id, thread_root="chat-mem", provider="local", model="m",
+                  status="running", cmd=["acp"])
+        with mock.patch.object(server, "_wait_for_memory", return_value=False):
+            self.assertEqual(server.supervise_worker(worker_id), 0)
+        finished = [r for r in self.reads("chat-mem") if r["kind"] == "finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["node"], worker_id)
+        self.assertEqual(finished[0]["data"]["status"], "failed")
+
+    def test_read_thread_only_edge_kinds_make_edges(self):
+        server._thread_record("chat-edges", "permission_asked", "w1", peer="x")
+        server._thread_record("chat-edges", "note", "w1", peer="y")
+        found = threads.read_thread(server.SUBWAY_DIR, "chat-edges")
+        self.assertEqual(len(found["records"]), 2)
+        self.assertEqual([e["to"] for e in found["edges"]], ["y"])
+        self.assertNotIn("x", found["nodes"])
+        self.assertIn("y", found["nodes"])
+        self.assertIn("w1", found["nodes"])
 
     def test_launch_worker_records_started(self):
         worker_id = "worker_abcdef"

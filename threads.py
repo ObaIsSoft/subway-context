@@ -145,7 +145,7 @@ def read_thread(base_dir: str, thread_id: str, limit: int = 5000) -> Dict[str, A
             if kinds not in entry["kinds"]:
                 entry["kinds"].append(kinds)
         peer = str(r.get("peer") or "")
-        if peer:
+        if peer and kinds in EDGE_KINDS:
             nodes.setdefault(peer, {"first_at": at, "last_at": at, "kinds": []})
             edges.append({"kind": kinds, "from": node, "to": peer, "at": at, "data": r.get("data") or {}})
     return {"thread": str(thread_id), "records": recs, "nodes": nodes, "edges": edges}

@@ -6363,6 +6363,28 @@ def _thread_record(thread_id: str, kind: str, node: str, peer: str = "", data: O
         pass
 
 
+def _thread_finished(worker_id: str, meta: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Record a worker's finish once per run, using the freshest stored meta. Never breaks the caller."""
+    try:
+        finished_meta = _load_worker(worker_id) or meta or {}
+        finished_at = _dt.datetime.now().astimezone()
+        duration_s = None
+        started_at = str(finished_meta.get("started_at") or "")
+        if started_at:
+            with contextlib.suppress(ValueError, TypeError):
+                duration_s = round((finished_at - _dt.datetime.fromisoformat(started_at)).total_seconds(), 1)
+        _thread_record(finished_meta.get("thread_root") or _thread_root(finished_meta), "finished", worker_id, data={
+            "status": (result or {}).get("status"), "exit_code": (result or {}).get("exit_code"),
+            "reason": one_line(str((result or {}).get("reason") or ""), 300),
+            "rerouted_to": (result or {}).get("rerouted_to"),
+            "usage": dict(finished_meta.get("usage") or {}),
+            "model_used": finished_meta.get("model_used"),
+            "created_at": finished_meta.get("created_at"),
+            "completed_at": finished_at.isoformat(), "duration_s": duration_s})
+    except Exception:
+        pass
+
+
 def _thread_root(meta: Dict[str, Any], _depth: int = 0) -> str:
     """The initiator this worker belongs to: its stored root, else the first parent's root, else itself."""
     try:
@@ -9378,13 +9400,16 @@ def supervise_worker(worker_id: str) -> int:
     if meta.get("kind") == "batch":
         result = run_batch(meta, stopped, deadline, save_progress)
         _write_json_atomic(_exit_file(worker_id), result)
+        _thread_finished(worker_id, meta, result)
         stopped["flag"] = True
         budget_stop_event.set()
         budget_thread.join(timeout=2)
         return 0
     if is_local and not _wait_for_memory(meta["model"], stopped, min(remaining() or 900, 900)):
         reason = "Stopped on request." if stopped["flag"] else "Not enough free memory for this model within 15 minutes."
-        _write_json_atomic(_exit_file(worker_id), {"status": "stopped" if stopped["flag"] else "failed", "exit_code": None, "reason": reason})
+        memory_result = {"status": "stopped" if stopped["flag"] else "failed", "exit_code": None, "reason": reason}
+        _write_json_atomic(_exit_file(worker_id), memory_result)
+        _thread_finished(worker_id, meta, memory_result)
         stopped["flag"] = True
         budget_stop_event.set()
         budget_thread.join(timeout=2)
@@ -9800,24 +9825,7 @@ def supervise_worker(worker_id: str) -> int:
     if result.get("status") == "completed":
         _clear_model_stall_cooldown(str(fresh.get("model_used") or fresh.get("model") or ""))
     _write_json_atomic(_exit_file(worker_id), result)
-    try:
-        finished_meta = fresh or meta
-        finished_at = _dt.datetime.now().astimezone()
-        duration_s = None
-        started_at = str(finished_meta.get("started_at") or "")
-        if started_at:
-            with contextlib.suppress(ValueError, TypeError):
-                duration_s = round((finished_at - _dt.datetime.fromisoformat(started_at)).total_seconds(), 1)
-        _thread_record(finished_meta.get("thread_root") or _thread_root(finished_meta), "finished", worker_id, data={
-            "status": result.get("status"), "exit_code": result.get("exit_code"),
-            "reason": one_line(str(result.get("reason") or ""), 300),
-            "rerouted_to": result.get("rerouted_to"),
-            "usage": dict(finished_meta.get("usage") or {}),
-            "model_used": finished_meta.get("model_used"),
-            "created_at": finished_meta.get("created_at"),
-            "completed_at": finished_at.isoformat(), "duration_s": duration_s})
-    except Exception:
-        pass
+    _thread_finished(worker_id, meta, result)
     _update_worker_status(_load_worker(worker_id) or meta)
     with contextlib.suppress(Exception):
         _run_triggers(worker_id, result)
