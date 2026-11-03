@@ -10,6 +10,20 @@ const activeTerminals = new Set();
 const eventRetryBuffer = [];
 let eventPostChain = Promise.resolve();
 let pollInterval = null;
+let hudSharingEnabled = false;
+let sharingPollInterval = null;
+
+function isTerminalSharingActive() {
+  const vsSetting = vscode.workspace.getConfiguration('subway').get('terminalSharing.enabled', false);
+  return !!(hudSharingEnabled || vsSetting);
+}
+
+async function updateHudSharingStatus() {
+  const data = await getJson('/api/terminals');
+  if (data && typeof data.sharing === 'boolean') {
+    hudSharingEnabled = data.sharing;
+  }
+}
 
 function getHudPort() {
   try {
@@ -164,14 +178,25 @@ function bufferTerminalEvent(pathStr, body) {
 }
 
 function postTerminalEvent(body) {
+  if (!isTerminalSharingActive()) return;
   eventPostChain = eventPostChain.then(async () => {
+    if (!isTerminalSharingActive()) {
+      eventRetryBuffer.length = 0;
+      return;
+    }
     while (eventRetryBuffer.length) {
+      if (!isTerminalSharingActive()) {
+        eventRetryBuffer.length = 0;
+        return;
+      }
       const queued = eventRetryBuffer[0];
       if (!(await postJson(queued.path, queued.body))) break;
       eventRetryBuffer.shift();
     }
     if (!(await postJson('/api/terminal_event', body))) {
-      bufferTerminalEvent('/api/terminal_event', body);
+      if (isTerminalSharingActive()) {
+        bufferTerminalEvent('/api/terminal_event', body);
+      }
     }
   });
 }
@@ -310,57 +335,55 @@ function activate(context) {
   });
   context.subscriptions.push(allowTerminalCommandsCommand);
 
-  const terminalSharingEnabled = vscode.workspace.getConfiguration('subway').get('terminalSharing.enabled', false);
-  if (terminalSharingEnabled) {
-    const startExecutionListener = vscode.window.onDidStartTerminalShellExecution((e) => {
-      const entry = terminalStates.get(e.terminal);
-      if (!entry || !entry.sharing) return;
-      entry.pendingCommand = {
-        command: e.execution.commandLine.value,
-        startTs: Date.now() / 1000
-      };
-    });
-    const endExecutionListener = vscode.window.onDidEndTerminalShellExecution(async (e) => {
-      const entry = terminalStates.get(e.terminal);
-      if (!entry) return;
-      const pendingRun = entry.pendingRun && entry.pendingRun.execution === e.execution
-        ? entry.pendingRun
-        : null;
-      if (!entry.sharing && !pendingRun) return;
-      const pendingCommand = entry.sharing ? entry.pendingCommand : null;
-      if (!pendingCommand && !pendingRun) return;
-      entry.pendingCommand = null;
-      const output = await readExecutionOutput(e.execution);
-      if (terminalStates.get(e.terminal) !== entry) return;
-      if (pendingCommand) {
-        postTerminalEvent({
-          terminal_id: entry.id,
-          command: pendingCommand.command,
-          exit_code: (typeof e.exitCode === 'number' ? e.exitCode : null),
-          start_ts: pendingCommand.startTs,
-          end_ts: Date.now() / 1000,
-          output,
-          caller_id: 'editor',
-          name: e.terminal.name,
-          window_id: entry.windowId,
-          folder: (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '')
-        });
+  const startExecutionListener = vscode.window.onDidStartTerminalShellExecution((e) => {
+    if (!isTerminalSharingActive()) return;
+    const entry = terminalStates.get(e.terminal);
+    if (!entry || !entry.sharing) return;
+    entry.pendingCommand = {
+      command: e.execution.commandLine.value,
+      startTs: Date.now() / 1000
+    };
+  });
+  const endExecutionListener = vscode.window.onDidEndTerminalShellExecution(async (e) => {
+    const entry = terminalStates.get(e.terminal);
+    if (!entry) return;
+    const pendingRun = entry.pendingRun && entry.pendingRun.execution === e.execution
+      ? entry.pendingRun
+      : null;
+    if (!entry.sharing && !pendingRun) return;
+    const pendingCommand = (entry.sharing && isTerminalSharingActive()) ? entry.pendingCommand : null;
+    if (!pendingCommand && !pendingRun) return;
+    entry.pendingCommand = null;
+    const output = await readExecutionOutput(e.execution);
+    if (terminalStates.get(e.terminal) !== entry) return;
+    if (pendingCommand && isTerminalSharingActive()) {
+      postTerminalEvent({
+        terminal_id: entry.id,
+        command: pendingCommand.command,
+        exit_code: (typeof e.exitCode === 'number' ? e.exitCode : null),
+        start_ts: pendingCommand.startTs,
+        end_ts: Date.now() / 1000,
+        output,
+        caller_id: 'editor',
+        name: e.terminal.name,
+        window_id: entry.windowId,
+        folder: (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '')
+      });
+    }
+    if (pendingRun) {
+      await postJson('/api/run_result', {
+        run_id: pendingRun.runId,
+        output,
+        exit_code: (typeof e.exitCode === 'number' ? e.exitCode : null),
+        error: ''
+      });
+      if (entry.pendingRun === pendingRun) {
+        entry.pendingRun = null;
+        entry.runInFlight = false;
       }
-      if (pendingRun) {
-        await postJson('/api/run_result', {
-          run_id: pendingRun.runId,
-          output,
-          exit_code: (typeof e.exitCode === 'number' ? e.exitCode : null),
-          error: ''
-        });
-        if (entry.pendingRun === pendingRun) {
-          entry.pendingRun = null;
-          entry.runInFlight = false;
-        }
-      }
-    });
-    context.subscriptions.push(startExecutionListener, endExecutionListener);
-  }
+    }
+  });
+  context.subscriptions.push(startExecutionListener, endExecutionListener);
 
   const closeTerminalListener = vscode.window.onDidCloseTerminal((terminal) => {
     terminalStates.delete(terminal);
@@ -369,7 +392,7 @@ function activate(context) {
   context.subscriptions.push(closeTerminalListener);
 
   pollInterval = setInterval(() => {
-    if (!terminalSharingEnabled) return;
+    if (!isTerminalSharingActive()) return;
     for (const terminal of activeTerminals) {
       const entry = terminalStates.get(terminal);
       if (entry && entry.sharing && entry.allowCommands && !entry.runInFlight) {
@@ -377,6 +400,9 @@ function activate(context) {
       }
     }
   }, 3000);
+
+  void updateHudSharingStatus();
+  sharingPollInterval = setInterval(updateHudSharingStatus, 30000);
 
   // Activation onStartupFinished: if the HUD answers /healthz, do nothing more, never auto-open.
   const port = getHudPort();
@@ -391,6 +417,10 @@ function deactivate() {
   if (pollInterval) {
     clearInterval(pollInterval);
     pollInterval = null;
+  }
+  if (sharingPollInterval) {
+    clearInterval(sharingPollInterval);
+    sharingPollInterval = null;
   }
 }
 

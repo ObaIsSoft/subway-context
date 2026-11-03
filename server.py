@@ -7455,6 +7455,25 @@ def _terminals_dir() -> str:
     return os.path.join(SUBWAY_DIR, "terminals")
 
 
+def terminal_sharing_enabled() -> bool:
+    val = _load_json("config.json").get("terminal_sharing", False)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.lower() in ("true", "1", "on", "yes")
+    return False
+
+
+def set_terminal_sharing(enabled: bool) -> bool:
+    with _state_lock("config"):
+        cfg = _load_json("config.json")
+        cfg["terminal_sharing"] = bool(enabled)
+        _save_json("config.json", cfg)
+    return bool(enabled)
+
+
 def t_list_terminals() -> str:
     """List every terminal that has opted in: name, folder, last command, failures."""
     with _state_lock("terminals"):
@@ -7518,6 +7537,8 @@ def t_search_terminal(query: str, terminal: str = "") -> str:
 def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -> str:
     """Run a command in an opted-in editor terminal through the extension. Refuses terminals that
     haven't opted in to running commands, have no shell integration, or are closed."""
+    if not terminal_sharing_enabled():
+        return "[REFUSED] terminal sharing is off."
     caller = _self_id()
     with _state_lock("terminals"):
         term = terminals.get_terminal(_terminals_dir(), terminal_id)
@@ -7548,6 +7569,8 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
     while time.time() < deadline:
         rec = terminals.get_run_request(_terminals_dir(), run_id)
         if rec and rec.get("status") == "done":
+            if not terminal_sharing_enabled():
+                return "[REFUSED] terminal sharing was turned off while the command ran; its output was not kept."
             with _state_lock("terminals"):
                 terminals.record_command(
                     _terminals_dir(), terminal_id, command, exit_code=rec.get("exit_code"),
@@ -12775,7 +12798,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/terminals":
             with _state_lock("terminals"):
                 rows = terminals.list_terminals(_terminals_dir())
-            self.send_json({"terminals": rows})
+            self.send_json({"terminals": rows, "sharing": terminal_sharing_enabled()})
             return
 
         if path == "/api/terminal":
@@ -12904,9 +12927,23 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     cfg["hud_open_on_use"] = b_val
                     _save_json("config.json", cfg)
                 res["hud_open_on_use"] = b_val
+            if "terminal_sharing" in payload:
+                val = payload["terminal_sharing"]
+                if isinstance(val, bool):
+                    b_val = val
+                elif str(val).lower() in ("true", "1", "on"):
+                    b_val = True
+                elif str(val).lower() in ("false", "0", "off"):
+                    b_val = False
+                else:
+                    self._deny(400, "terminal_sharing must be a boolean")
+                    return
+                set_terminal_sharing(b_val)
+                res["terminal_sharing"] = b_val
             # The HUD shows the reply as text, so say what changed rather than returning an object.
             names = {"compaction": "Compaction", "hud_autostart": "Start the HUD with Subway",
-                     "hud_open_on_use": "Open the HUD when Subway is used"}
+                     "hud_open_on_use": "Open the HUD when Subway is used",
+                     "terminal_sharing": "Terminal sharing"}
             said = [res["permission_mode"]] if "permission_mode" in res else []
             said += [f"{names[k]}: {'on' if v is True else 'off' if v is False else v}" for k, v in res.items() if k in names]
             res = "Saved. " + "; ".join(said) if said else "Nothing to change."
@@ -12946,6 +12983,22 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 max_budget_usd=payload.get("max_budget_usd"))
         elif path == "/api/clear_history":
             res = archive_history()
+        elif path == "/api/terminal_sharing":
+            val = payload.get("enabled")
+            if val is None:
+                self._deny(400, "missing enabled")
+                return
+            if isinstance(val, bool):
+                b_val = val
+            elif str(val).lower() in ("true", "1", "on"):
+                b_val = True
+            elif str(val).lower() in ("false", "0", "off"):
+                b_val = False
+            else:
+                self._deny(400, "enabled must be a boolean")
+                return
+            set_terminal_sharing(b_val)
+            res = {"ok": True, "terminal_sharing": b_val}
         elif path == "/api/terminal_opt_in":
             tid = str(payload.get("terminal_id", ""))
             if not tid:
@@ -12959,6 +13012,9 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     shell_integration=payload.get("shell_integration"), closed=payload.get("closed"))
             res = {"ok": True, "terminal": rec}
         elif path == "/api/terminal_event":
+            if not terminal_sharing_enabled():
+                self._deny(403, "terminal sharing is off")
+                return
             tid = str(payload.get("terminal_id", ""))
             if not tid:
                 self._deny(400, "missing terminal_id")
@@ -12982,10 +13038,13 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 self._deny(400, "missing run_id")
                 return
             try:
+                # Sharing switched off while the command ran: close the request but keep none of its output.
+                sharing_on = terminal_sharing_enabled()
                 with _state_lock("terminals"):
                     rec = terminals.complete_run_request(
-                        _terminals_dir(), rid, output=str(payload.get("output", "")),
-                        exit_code=payload.get("exit_code"), error=str(payload.get("error", "")))
+                        _terminals_dir(), rid, output=str(payload.get("output", "")) if sharing_on else "",
+                        exit_code=payload.get("exit_code"),
+                        error=str(payload.get("error", "")) if sharing_on else "terminal sharing was turned off; output not kept")
             except ValueError:
                 self._deny(400, "invalid run_id")
                 return

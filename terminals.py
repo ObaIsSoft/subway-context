@@ -367,37 +367,69 @@ def _hud():
         pass
     return port, token
 
-def _post(path, body):
-    port, token = _hud()
-    req = urllib.request.Request(
-        "http://127.0.0.1:%s%s" % (port, path),
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "X-Subway-Token": token},
-        method="POST",
-    )
+def _is_sharing(port, token):
+    if not token:
+        return False
     try:
-        urllib.request.urlopen(req, timeout=2)
+        req = urllib.request.Request(
+            "http://127.0.0.1:%s/api/terminals" % port,
+            headers={"X-Subway-Token": token},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return bool(data.get("sharing"))
+    except Exception:
+        return False
+
+def _post(port, token, path, body):
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%s%s" % (port, path),
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Subway-Token": token},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            resp.read()
     except Exception:
         pass
 
+def _term_name(folder):
+    shell = os.path.basename(os.environ.get("SHELL", "shell")) or "shell"
+    bname = os.path.basename(os.path.normpath(folder)) if folder else ""
+    if not bname and folder:
+        bname = folder
+    return ("%s · %s" % (shell, bname)) if bname else shell
+
 def main():
-    args = sys.argv[1:]
-    kind = args[0] if args else ""
-    if kind == "optin" and len(args) >= 3:
-        tid, folder = args[1], args[2]
-        _post("/api/terminal_opt_in", {
-            "terminal_id": tid, "name": "shell", "window_id": "",
-            "folder": folder, "share_enabled": True, "allow_commands": False,
-            "shell_integration": True,
-        })
-    elif kind == "event" and len(args) >= 6:
-        tid, command, code, start, end, folder = args[1:7]
-        _post("/api/terminal_event", {
-            "terminal_id": tid, "command": command,
-            "exit_code": (int(code) if code not in ("", "None") else None),
-            "start_ts": float(start), "end_ts": float(end), "output": "",
-            "caller_id": "shell", "name": "shell", "window_id": "", "folder": folder,
-        })
+    try:
+        args = sys.argv[1:]
+        kind = args[0] if args else ""
+        if kind not in ("optin", "event"):
+            return
+        port, token = _hud()
+        if not _is_sharing(port, token):
+            return
+        if kind == "optin" and len(args) >= 3:
+            tid, folder = args[1], args[2]
+            name = _term_name(folder)
+            _post(port, token, "/api/terminal_opt_in", {
+                "terminal_id": tid, "name": name, "window_id": "",
+                "folder": folder, "share_enabled": True,
+                "shell_integration": True,
+            })
+        elif kind == "event" and len(args) >= 6:
+            tid, command, code, start, end, folder = args[1:7]
+            name = _term_name(folder)
+            _post(port, token, "/api/terminal_event", {
+                "terminal_id": tid, "command": command,
+                "exit_code": (int(code) if code not in ("", "None") else None),
+                "start_ts": float(start), "end_ts": float(end), "output": "",
+                "caller_id": "shell", "name": name, "window_id": "", "folder": folder,
+            })
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

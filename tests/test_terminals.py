@@ -168,6 +168,8 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="subway_terminals_srv_")
         self.subway_dir = os.path.join(self.test_dir, ".subway-context")
         os.makedirs(self.subway_dir, exist_ok=True)
+        self.home_patcher = mock.patch.dict(os.environ, {"HOME": self.test_dir})
+        self.home_patcher.start()
         self.orig_subway_dir = server.SUBWAY_DIR
         self.orig_workers_dir = server.WORKERS_DIR
         self.orig_tracks_dir = server.TRACKS_DIR
@@ -177,12 +179,15 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         server.TRACKS_DIR = os.path.join(self.subway_dir, "tracks")
         server._self_id = lambda: "chat_test"
         server._ensure_subway_dir()
+        # The master switch is off by default; these tests exercise the other run_terminal gates.
+        server.set_terminal_sharing(True)
 
     def tearDown(self):
         server.SUBWAY_DIR = self.orig_subway_dir
         server.WORKERS_DIR = self.orig_workers_dir
         server.TRACKS_DIR = self.orig_tracks_dir
         server._self_id = self.orig_self_id
+        self.home_patcher.stop()
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_list_read_search_empty(self):
@@ -299,6 +304,36 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         t.join(timeout=5)
         self.assertIn("exit 0", res)
 
+    def test_run_terminal_keeps_no_output_when_sharing_turned_off_mid_run(self):
+        with server._state_lock("terminals"):
+            terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
+        with server._state_lock("config"):
+            cfg = server._load_json("config.json")
+            cfg["permission_mode"] = "auto_safe"
+            server._save_json("config.json", cfg)
+
+        def fake_extension_then_switch_off():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with server._state_lock("terminals"):
+                    pending = terminals.list_pending_runs(server._terminals_dir(), terminal_id="t1")
+                if pending:
+                    server.set_terminal_sharing(False)
+                    with server._state_lock("terminals"):
+                        terminals.complete_run_request(server._terminals_dir(), pending[0]["id"],
+                                                        output="TOPSECRET", exit_code=0)
+                    return
+                time.sleep(0.05)
+
+        t = threading.Thread(target=fake_extension_then_switch_off)
+        t.start()
+        res = server.t_run_terminal("t1", "ls -la", timeout_seconds=5)
+        t.join(timeout=5)
+        self.assertIn("turned off", res)
+        self.assertNotIn("TOPSECRET", res)
+        rec = terminals.get_terminal(server._terminals_dir(), "t1") or {}
+        self.assertNotIn("TOPSECRET", str(rec.get("commands", [])))
+
     def test_run_terminal_ask_mode_denied(self):
         with server._state_lock("terminals"):
             terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
@@ -321,6 +356,111 @@ class ServerTerminalWrapperTests(unittest.TestCase):
         res = server.t_run_terminal("t1", "rm -rf something", timeout_seconds=5)
         t.join(timeout=5)
         self.assertIn("DENIED", res)
+
+
+class _HudPostHandler(server.SubwayHUDHandler):
+    """Runs do_POST in memory so the HUD routes can be tested without a socket."""
+
+    def __init__(self, path, payload, token=""):
+        self.path = path
+        self.headers = {"Host": "127.0.0.1"}
+        if token:
+            self.headers["X-Subway-Token"] = token
+        self._payload = payload
+        self.status = None
+        self.sent = None
+
+    def _read_payload(self):
+        return self._payload
+
+    def send_json(self, data, status=200):
+        self.status = status
+        self.sent = data
+
+
+class TerminalSharingTests(unittest.TestCase):
+    """Covers the terminal sharing master switch and the HUD routes that read it."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="subway_terminals_share_")
+        self.subway_dir = os.path.join(self.test_dir, ".subway-context")
+        os.makedirs(self.subway_dir, exist_ok=True)
+        self.home_patcher = mock.patch.dict(os.environ, {"HOME": self.test_dir})
+        self.home_patcher.start()
+        self.orig_subway_dir = server.SUBWAY_DIR
+        self.orig_workers_dir = server.WORKERS_DIR
+        self.orig_tracks_dir = server.TRACKS_DIR
+        self.orig_self_id = server._self_id
+        self.orig_hud_token_cache = dict(server._hud_token_cache)
+        server.SUBWAY_DIR = self.subway_dir
+        server.WORKERS_DIR = os.path.join(self.subway_dir, "workers")
+        server.TRACKS_DIR = os.path.join(self.subway_dir, "tracks")
+        server._self_id = lambda: "chat_test"
+        server._hud_token_cache.clear()
+        server._ensure_subway_dir()
+        self.event = {
+            "terminal_id": "t1", "command": "ls -la", "exit_code": 0,
+            "start_ts": time.time(), "end_ts": time.time() + 1, "output": "", "caller_id": "shell",
+            "name": "shell", "window_id": "", "folder": "/proj",
+        }
+
+    def tearDown(self):
+        server.SUBWAY_DIR = self.orig_subway_dir
+        server.WORKERS_DIR = self.orig_workers_dir
+        server.TRACKS_DIR = self.orig_tracks_dir
+        server._self_id = self.orig_self_id
+        server._hud_token_cache.clear()
+        server._hud_token_cache.update(self.orig_hud_token_cache)
+        self.home_patcher.stop()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_terminal_event_refused_when_sharing_off_and_nothing_stored(self):
+        server.set_terminal_sharing(False)
+        with server._state_lock("terminals"):
+            terminals.set_terminal_opt_in(server._terminals_dir(), "t1", name="Term", share_enabled=True)
+        handler = _HudPostHandler("/api/terminal_event", self.event, token=server.hud_token())
+        handler.do_POST()
+        self.assertEqual(handler.status, 403)
+        self.assertIn("terminal sharing is off", handler.sent.get("error", ""))
+        rec = terminals.get_terminal(server._terminals_dir(), "t1")
+        self.assertEqual(rec.get("commands"), [])
+
+    def test_terminal_event_stored_when_sharing_on(self):
+        server.set_terminal_sharing(True)
+        with server._state_lock("terminals"):
+            terminals.set_terminal_opt_in(server._terminals_dir(), "t1", name="Term", share_enabled=True)
+        handler = _HudPostHandler("/api/terminal_event", self.event, token=server.hud_token())
+        handler.do_POST()
+        self.assertEqual(handler.status, 200)
+        rec = terminals.get_terminal(server._terminals_dir(), "t1")
+        self.assertEqual(len(rec.get("commands") or []), 1)
+        self.assertEqual(rec["commands"][0]["command"], "ls -la")
+
+    def test_terminal_sharing_route_requires_hud_token_and_changes_setting(self):
+        server.set_terminal_sharing(False)
+        handler = _HudPostHandler("/api/terminal_sharing", {"enabled": True})
+        handler.do_POST()
+        self.assertEqual(handler.status, 401)
+        self.assertIn("token", handler.sent.get("error", ""))
+        self.assertFalse(server.terminal_sharing_enabled())
+
+        handler = _HudPostHandler("/api/terminal_sharing", {"enabled": True}, token=server.hud_token())
+        handler.do_POST()
+        self.assertEqual(handler.status, 200)
+        self.assertTrue(handler.sent["result"]["terminal_sharing"])
+        self.assertTrue(server.terminal_sharing_enabled())
+
+        handler = _HudPostHandler("/api/terminal_sharing", {"enabled": False}, token=server.hud_token())
+        handler.do_POST()
+        self.assertEqual(handler.status, 200)
+        self.assertFalse(server.terminal_sharing_enabled())
+
+    def test_run_terminal_refused_when_sharing_off(self):
+        server.set_terminal_sharing(False)
+        with server._state_lock("terminals"):
+            terminals.set_terminal_opt_in(server._terminals_dir(), "t1", allow_commands=True, shell_integration=True)
+        res = server.t_run_terminal("t1", "echo hi")
+        self.assertIn("terminal sharing is off", res)
 
 
 class TerminalHookTests(unittest.TestCase):
@@ -373,6 +513,22 @@ class TerminalHookTests(unittest.TestCase):
         with open(zsh_rc, "r", encoding="utf-8") as f:
             zsh_content = f.read()
             self.assertIn("preexec_functions+=(_subway_preexec)", zsh_content)
+
+    def test_hook_optin_payload_has_no_allow_commands(self):
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
+        with open(script_path, "r", encoding="utf-8") as f:
+            script = f.read()
+        self.assertIn('"optin"', script)
+        self.assertNotIn("allow_commands", script)
+
+    def test_installed_hook_text_checks_sharing(self):
+        terminals.install_hook(shell="bash", server_url="http://127.0.0.1:7890")
+        script_path = os.path.join(self.temp_home, ".subway-context", "terminal_hook.py")
+        with open(script_path, "r", encoding="utf-8") as f:
+            script = f.read()
+        self.assertIn("sharing", script)
+        self.assertIn('data.get("sharing")', script)
 
     def test_install_existing_content_preserved_and_backed_up(self):
         rc_path = os.path.join(self.temp_home, ".bashrc")
@@ -582,3 +738,4 @@ class TerminalHookTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
