@@ -1649,11 +1649,16 @@ def _vscode_user_dirs() -> List[str]:
     """Return only the VS Code user-data folders used by the supported operating systems."""
     candidates = [
         os.path.join(HOME, "Library", "Application Support", "Code", "User"),
+        os.path.join(HOME, "Library", "Application Support", "Code - Insiders", "User"),
         os.path.join(HOME, ".config", "Code", "User"),
+        os.path.join(HOME, ".config", "Code - Insiders", "User"),
     ]
     appdata = os.environ.get("APPDATA")
     if appdata:
-        candidates.insert(1, os.path.join(appdata, "Code", "User"))
+        candidates.extend([
+            os.path.join(appdata, "Code", "User"),
+            os.path.join(appdata, "Code - Insiders", "User"),
+        ])
     return list(dict.fromkeys(path for path in candidates if path and os.path.isdir(path)))
 
 
@@ -1825,6 +1830,42 @@ def _vscode_chat_data(path: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     return state, turns
 
 
+def _vscode_transcript_path(path: str, session_id: str) -> str:
+    workspace_dir = os.path.dirname(os.path.dirname(path))
+    return os.path.join(workspace_dir, "GitHub.copilot-chat", "transcripts", f"{session_id}.jsonl")
+
+
+def _timestamp_seconds(ts: Any) -> Optional[float]:
+    if ts is None or ts == "":
+        return None
+    try:
+        if isinstance(ts, (int, float)) or (isinstance(ts, str) and re.fullmatch(r"\d+(?:\.\d+)?", ts)):
+            value = float(ts)
+            return value / 1000.0 if value > 1e11 else value
+        value = sort_key_ts(ts)
+        return value if value else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _vscode_transcript_latest_timestamp(path: str) -> Optional[float]:
+    latest = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    ts = _timestamp_seconds(event.get("timestamp"))
+                    if ts is not None and (latest is None or ts > latest):
+                        latest = ts
+    except OSError:
+        return None
+    return latest
+
+
 def _vscode_chat_meta(path: str, project: str, surface: str,
                       worker_index: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     state, turns = _vscode_chat_data(path)
@@ -1850,6 +1891,25 @@ def _vscode_chat_meta(path: str, project: str, surface: str,
     }
     worker = worker_index.get(sid)
     updated = state.get("completedAt") or state.get("creationDate") or os.path.getmtime(path)
+    if isinstance(requests, list):
+        active_times = [
+            _timestamp_seconds(request.get("timestamp") or request.get("creationDate"))
+            for request in requests if isinstance(request, dict)
+        ]
+    else:
+        active_times = []
+    transcript_path = _vscode_transcript_path(path, sid)
+    transcript_event_time = _vscode_transcript_latest_timestamp(transcript_path)
+    if transcript_event_time is not None:
+        active_times.append(transcript_event_time)
+    try:
+        if os.path.isfile(transcript_path):
+            active_times.append(os.path.getmtime(transcript_path))
+    except OSError:
+        pass
+    active_times = [ts for ts in active_times if ts is not None]
+    if active_times:
+        updated = max(active_times)
     return {
         "source": "copilot", "id": sid, "path": path, "format": "vscode-chat",
         "title": state.get("customTitle") or (one_line(user_turns[0], 80) if user_turns else "(Copilot Chat session)"),
@@ -1976,8 +2036,37 @@ def _last_tool_line(turns: List[Dict[str, Any]]) -> str:
 
 def copilot_read_segments(chat: Dict[str, Any], mode: str = "full") -> Tuple[List[List[Dict[str, Any]]], bool]:
     if chat.get("format") == "vscode-chat":
-        _state, turns = _vscode_chat_data(chat.get("path", ""))
-        return [turns], False
+        path = str(chat.get("path") or "")
+        _state, chat_turns = _vscode_chat_data(path)
+        transcript_path = _vscode_transcript_path(path, str(chat.get("id") or ""))
+        if not os.path.isfile(transcript_path):
+            return [chat_turns], False
+        transcript_segments, has_markers = copilot_read_segments(
+            {"path": transcript_path, "format": "copilot-cli"}, mode
+        )
+        transcript_turns = [turn for segment in transcript_segments for turn in segment]
+        chat_counts: Dict[Tuple[str, str], int] = {}
+        for turn in chat_turns:
+            key = (str(turn.get("role") or ""), str(turn.get("text") or ""))
+            chat_counts[key] = chat_counts.get(key, 0) + 1
+        additional_turns = []
+        for turn in transcript_turns:
+            role = str(turn.get("role") or "")
+            if role in ("user", "assistant") and turn.get("text"):
+                key = (role, str(turn.get("text") or ""))
+                if chat_counts.get(key, 0):
+                    chat_counts[key] -= 1
+                    continue
+            if turn.get("tool_name"):
+                raw_input = turn.get("tool_input")
+                display_input = one_line(_redact_secrets(raw_input), 120) if raw_input not in (None, "") else "(no input)"
+                turn["text"] = f"[tool {turn['tool_name']}] input: {display_input}"
+            additional_turns.append(turn)
+        if not additional_turns:
+            return [chat_turns], has_markers
+        merged = [*chat_turns, *additional_turns]
+        merged.sort(key=lambda turn: _timestamp_seconds(turn.get("ts")) or 0)
+        return [merged], has_markers
 
     mode = str(chat.get("mode") or mode or "full").lower()
     path = str(chat.get("path") or "")
